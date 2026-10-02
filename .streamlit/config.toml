@@ -1,0 +1,35 @@
+# ==============================================================================
+# Configuracion de la interfaz web (Streamlit)
+# ==============================================================================
+
+[server]
+# Limite de subida del navegador, en MB. Solo afecta a la pestana de Calculo
+# Masivo: el dataset de biodiversidad NO se sube, se lee del disco por su ruta.
+maxUploadSize = 5120
+
+[browser]
+# Sin telemetria: no se envia nada a los servidores de Streamlit.
+gatherUsageStats = false
+
+[client]
+# Barra de herramientas de Streamlit (menu de tres puntos, esquina superior
+# derecha). Se usa "viewer" para quitar de en medio las opciones de desarrollo
+# SIN perder el selector de tema claro/oscuro.
+#
+#   QUE DESAPARECE            QUE SE CONSERVA
+#   ----------------------    -------------------------------
+#   Boton "Deploy"            Selector de tema System/Light/Dark
+#   Rerun                     Print
+#   Auto rerun                Record screen
+#   Clear cache               "Made with Streamlit"
+#
+# Los atajos de teclado siguen activos aunque las entradas ya no se vean:
+#     R = volver a ejecutar        C = limpiar la cache
+#
+# Valores posibles:
+#     "auto"      (por defecto) todo visible en local, reducido al publicar
+#     "developer" siempre todo visible
+#     "viewer"    oculta las opciones de desarrollo  <-- el que usamos
+#     "minimal"   oculta la barra ENTERA, incluido el selector de tema;
+#                 solo reaparece si la aplicacion lanza un error
+toolbarMode = "viewer"

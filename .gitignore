@@ -1,0 +1,43 @@
+# ==============================================================================
+# Archivos que NO deben versionarse
+# ==============================================================================
+
+# --- Secretos -----------------------------------------------------------------
+# El .env contiene la API Key. NUNCA debe subirse a un repositorio.
+# Use .env.example como plantilla para compartir la estructura sin la clave.
+.env
+
+# --- Entornos e intermedios de Python -----------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- Datos pesados y productos generados --------------------------------------
+# El dataset crudo de biodiversidad pesa decenas de GB.
+0*.csv
+*.zip
+
+# Productos que regenera la pestana "Area de Estudio" en cada corrida.
+biodiversidad_filtrada.csv
+municipios_filtrados.geojson
+cache_municipios_nacional.geojson
+cache_catalogo.json
+*.parcial
+
+# --- Temporales ---------------------------------------------------------------
+temp_uploads/
+*_resultado.csv
+*_resultado.xlsx
+
+# --- Sistema operativo --------------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- Capas propias del usuario ------------------------------------------------
+# El listado de rutas si se versiona; los archivos que se copien dentro, no
+# (suelen ser ortofotos y shapefiles pesados).
+capas_extra/*
+!capas_extra/rutas.txt

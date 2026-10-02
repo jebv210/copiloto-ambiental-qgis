@@ -1,0 +1,22 @@
+# ==============================================================================
+# Capas propias que se cargaran en QGIS junto con las del sistema
+# ==============================================================================
+# Escribe la ruta completa de cada archivo, una por linea.
+# Las lineas que empiezan por # se ignoran.
+#
+# Tambien puedes simplemente COPIAR los archivos dentro de esta carpeta: se
+# cargan igual, sin necesidad de apuntarlos aqui. Usa este listado cuando la
+# capa sea pesada (una ortofoto de cientos de MB) y prefieras no duplicarla.
+#
+# Formatos admitidos:
+#   vectorial : .shp .geojson .gpkg .kml .kmz .gml .gpx .tab .dxf
+#   imagenes  : .tif .tiff .img .jp2 .ecw .vrt .png .jpg
+#
+# Para conservar los colores que ya definiste en tu proyecto de QGIS, exporta
+# el estilo de la capa (clic derecho > Exportar > Guardar estilo) junto al
+# archivo y con el mismo nombre, terminado en .qml. QGIS lo aplicara solo.
+# ==============================================================================
+
+C:\Users\pc\Downloads\MONITOREO_MARIPOSAS_SAN CARLOS_FORMULARIO\MAPA_SANCARLOS_.tif
+C:\Users\pc\Downloads\MONITOREO_MARIPOSAS_SAN CARLOS_FORMULARIO\Poligono de monitoreo.shp
+C:\Users\pc\Downloads\MONITOREO_MARIPOSAS_SAN CARLOS_FORMULARIO\Formulario Mariposas San Carlos.shp

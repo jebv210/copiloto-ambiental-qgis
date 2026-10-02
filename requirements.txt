@@ -1,0 +1,39 @@
+# ==============================================================================
+# Dependencias del proyecto
+# ==============================================================================
+# La aplicacion se ejecuta con el interprete de Python que trae QGIS Desktop,
+# porque ese entorno ya incluye las librerias geoespaciales pesadas
+# (geopandas, shapely, pyogrio, fiona) compiladas y funcionando en Windows.
+#
+# Este archivo instala UNICAMENTE lo que QGIS no trae.
+# Se instala con: setup_project.ps1
+# ==============================================================================
+
+# --- Servidor API -------------------------------------------------------------
+fastapi==0.141.1
+uvicorn==0.52.1
+python-multipart==0.0.32       # necesario para recibir archivos en FastAPI
+
+# --- Interfaz web -------------------------------------------------------------
+streamlit==1.61.1
+
+# --- Utilidades ---------------------------------------------------------------
+requests==2.31.0
+python-dotenv==1.2.2           # lectura del archivo .env
+
+# --- Agente de IA -------------------------------------------------------------
+# OJO: el paquete correcto es 'google-genai' (SDK nuevo, import 'from google
+# import genai'), NO 'google-generativeai' (SDK antiguo, import
+# 'import google.generativeai as genai').
+# La version anterior de este archivo declaraba el antiguo mientras el codigo
+# usaba el nuevo, asi que el agente nunca podia arrancar en modo IA.
+google-genai>=1.0.0
+
+# ==============================================================================
+# DEPENDENCIAS QUE APORTA EL ENTORNO DE QGIS  (no se instalan aqui)
+# ==============================================================================
+# pandas, geopandas, shapely, pyogrio, fiona, numpy
+#
+# Si se ejecuta el proyecto FUERA de QGIS, hay que instalarlas aparte:
+#   pip install pandas geopandas shapely pyogrio
+# ==============================================================================

@@ -1,0 +1,9 @@
+id_valoracion,id_accion,nombre_accion,id_factor,nombre_factor,signo,i,EX,MO,PE,RV,SI,AC,EF,PR,MC
+1,1,Limpieza y descapote del terreno,501,Pérdida de cobertura vegetal,-,4,2,4,4,2,2,1,4,4,4
+2,1,Limpieza y descapote del terreno,502,Desplazamiento de fauna silvestre,-,2,2,4,2,1,2,1,4,2,2
+3,2,Construcción de infraestructura (domos y senderos),503,Alteración del paisaje,-,2,2,4,4,4,1,1,4,4,4
+4,2,Construcción de infraestructura (domos y senderos),504,Compactación del suelo,-,4,2,4,4,4,1,1,4,4,4
+5,3,Captura de pie de cría en el bosque,502,Presión sobre poblaciones silvestres,-,2,1,2,2,2,1,1,4,2,2
+6,4,Generación de residuos orgánicos de laboratorio,505,Contaminación de fuentes de agua,-,2,1,4,2,1,1,1,4,2,1
+7,5,Liberación y repoblación de mariposas,502,Incremento de biodiversidad nativa,+,4,4,4,4,2,2,4,4,4,1
+8,5,Liberación y repoblación de mariposas,506,Polinización de flora local,+,4,4,4,4,2,2,4,4,4,1
