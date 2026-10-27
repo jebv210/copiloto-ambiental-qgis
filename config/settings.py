@@ -148,7 +148,21 @@ def env(nombre: str, defecto=None):
 # ==============================================================================
 
 #: Capa municipal recortada al area de estudio. La lee QGIS. NO renombrar solo.
-ARCHIVO_MUNICIPIOS_SALIDA = "municipios_filtrados.geojson"
+#:
+#: VA DENTRO DE `data/` A PROPOSITO
+#: -------------------------------
+#: El NOMBRE no cambia: el contrato con `cargar_capas_qgis.py` es el nombre, y
+#: ese se respeta. Lo que cambia es la carpeta, y por una razon medida: la raiz
+#: del proyecto NO esta montada en los contenedores. Escrita ahi, la capa
+#: quedaba dentro del contenedor de la API y no la veia nadie mas -- ni la
+#: interfaz, que decia "no hay area de estudio fijada" con el archivo recien
+#: creado, ni QGIS, que corre en el equipo de la persona.
+#:
+#: `data/` si esta montada, asi que lo que se escriba ahi aparece en el equipo.
+#:
+#: OJO: `cargar_capas_qgis.py` busca este archivo en la raiz del proyecto. Hasta
+#: que se le indique la carpeta nueva, hay que copiarlo un nivel arriba.
+ARCHIVO_MUNICIPIOS_SALIDA = os.path.join("data", "municipios_filtrados.geojson")
 
 #: Registros de biodiversidad filtrados. Los lee QGIS. NO renombrar solo.
 ARCHIVO_BIODIVERSIDAD_SALIDA = "biodiversidad_filtrada.csv"
@@ -539,7 +553,7 @@ def pais_estudio() -> str:
 # ==============================================================================
 
 #: Modelo por defecto. Configurable con la variable `MODELO_LLM`.
-MODELO_LLM_DEFECTO = "gemini-2.5-flash"
+MODELO_LLM_DEFECTO = "gemini-3.5-flash"
 
 
 def modelo_llm() -> str:
@@ -566,6 +580,23 @@ def api_key_gemini():
         La clave, o None si no hay ninguna configurada.
     """
     return env("GEMINI_API_KEY")
+
+
+#: Cantidad de turnos previos que el agente recuerda en la conversacion.
+TURNOS_RECORDADOS_DEFECTO = 30
+
+
+def turnos_recordados() -> int:
+    """
+    Numero de turnos previos que el agente recuerda en la conversacion.
+
+    Returns:
+        Entero con el limite de turnos guardados en memoria (por defecto 30).
+    """
+    try:
+        return int(env("TURNOS_RECORDADOS", TURNOS_RECORDADOS_DEFECTO))
+    except (ValueError, TypeError):
+        return TURNOS_RECORDADOS_DEFECTO
 
 
 # ==============================================================================
@@ -612,6 +643,46 @@ def api_url() -> str:
     if explicita:
         return explicita.rstrip("/")
     return f"http://{api_host()}:{api_port()}"
+
+
+def api_url_navegador() -> str:
+    """
+    URL de la API tal como la ve el NAVEGADOR, no el servidor.
+
+    POR QUE SON DOS DIRECCIONES DISTINTAS
+    -------------------------------------
+    Dentro de Docker, Streamlit llama a la API por `http://api:8000`: "api" es
+    el nombre del servicio y solo existe dentro de la red de contenedores. El
+    navegador de quien usa la pagina esta FUERA de esa red, asi que ese nombre
+    no le resuelve a nada.
+
+    Hace falta cuando el codigo que llama a la API se ejecuta en el navegador,
+    como el JavaScript que pega imagenes con Ctrl+V. Usar ahi `api_url()`
+    produce un error de red que ademas no se ve: falla en la consola del
+    navegador, no en los registros del servidor.
+
+    Returns:
+        URL completa sin barra final. Se puede fijar con `API_URL_NAVEGADOR`;
+        si no, se deduce cambiando el nombre del servicio por `localhost`.
+    """
+    explicita = env("API_URL_NAVEGADOR")
+    if explicita:
+        return explicita.rstrip("/")
+
+    interna = api_url()
+    # Los nombres de servicio de compose no llevan punto. Si el anfitrion no
+    # tiene punto y no es ya localhost, es un nombre de la red de Docker y el
+    # navegador no lo va a resolver.
+    try:
+        from urllib.parse import urlparse
+        partes = urlparse(interna)
+        anfitrion = partes.hostname or ""
+        if anfitrion and "." not in anfitrion and anfitrion != "localhost":
+            puerto = f":{partes.port}" if partes.port else ""
+            return f"{partes.scheme}://localhost{puerto}"
+    except Exception:
+        pass
+    return interna
 
 
 def carpeta_temporal() -> str:
@@ -686,7 +757,146 @@ def diagnostico() -> dict:
         "API URL": api_url(),
         "Modelo LLM": modelo_llm(),
         "API Key Gemini": "definida" if api_key_gemini() else None,
+        "Fuente del corpus": fuente_corpus(),
+        "Qdrant": qdrant_url() or f"embebido en {qdrant_ruta_local()}",
+        "Modelo de embeddings": "gemini-embedding-001",
     }
+
+
+# ==============================================================================
+# 8 TER. FUENTE DOCUMENTAL Y BASE VECTORIAL
+# ==============================================================================
+# El agente estudia documentos. Hoy salen de la carpeta `corpus/`; manana, de
+# una carpeta compartida de Drive. Y para buscar por significado, ademas de por
+# palabras, los fragmentos viven tambien en una base vectorial (Qdrant).
+#
+# POR QUE QDRANT PUEDE IR SIN CONTENEDOR
+# --------------------------------------
+# `qdrant-client` trae un modo embebido que guarda en una carpeta del disco y
+# no necesita servidor. Asi el proyecto sigue arrancando con doble clic para la
+# practica, y en despliegue basta apuntar QDRANT_URL al contenedor.
+
+#: De donde salen los documentos: "local" (carpeta corpus/) o "drive".
+FUENTE_CORPUS_DEFECTO = "local"
+
+#: Coleccion de Qdrant donde viven los fragmentos del corpus.
+COLECCION_QDRANT_DEFECTO = "corpus_lepidopteros"
+
+#: Carpeta del modo embebido, relativa a la raiz del proyecto.
+#:
+#: VA FUERA DE corpus/ A PROPOSITO. Al principio se puso dentro, y el
+#: `meta.json` que Qdrant escribe ahi aparecio inventariado como un documento
+#: mas: el corpus paso de 134 a 135 y cambio su version, que es justo el numero
+#: con el que se sellan los informes para poder reproducirlos. El indice es
+#: estado interno y no tiene nada que hacer entre los documentos.
+QDRANT_RUTA_LOCAL_DEFECTO = os.path.join("data", "vectorial")
+
+#: Dimensiones del vector. `gemini-embedding-001` devuelve 3072 por defecto,
+#: pero admite recortarlas. Con 768 el indice ocupa la cuarta parte y la
+#: busqueda es mas rapida, con una perdida de calidad que no se nota en un
+#: corpus de 17.000 fragmentos.
+DIMENSIONES_EMBEDDING_DEFECTO = 768
+
+#: Fragmentos por peticion de embeddings.
+LOTE_EMBEDDINGS_DEFECTO = 32
+
+
+def fuente_corpus() -> str:
+    """
+    Indica de donde se leen los documentos del corpus.
+
+    Returns:
+        "local" o "drive", leido de `FUENTE_CORPUS`.
+    """
+    return str(env("FUENTE_CORPUS", FUENTE_CORPUS_DEFECTO)).strip().lower()
+
+
+def qdrant_url() -> str:
+    """
+    Direccion del servidor de Qdrant.
+
+    Returns:
+        La URL de `QDRANT_URL`, o cadena vacia para usar el modo embebido.
+    """
+    return str(env("QDRANT_URL", "")).strip()
+
+
+def qdrant_api_key() -> str:
+    """
+    Clave del servidor de Qdrant, si lo pide.
+
+    Returns:
+        El valor de `QDRANT_API_KEY`, o cadena vacia.
+    """
+    return str(env("QDRANT_API_KEY", "")).strip()
+
+
+def qdrant_ruta_local() -> str:
+    """
+    Carpeta del Qdrant embebido.
+
+    Returns:
+        Ruta absoluta de la carpeta donde se guarda el indice vectorial.
+    """
+    ruta = str(env("QDRANT_RUTA_LOCAL", QDRANT_RUTA_LOCAL_DEFECTO))
+    return ruta if os.path.isabs(ruta) else os.path.join(BASE_DIR, ruta)
+
+
+def coleccion_qdrant() -> str:
+    """
+    Nombre de la coleccion de Qdrant.
+
+    Returns:
+        El valor de `QDRANT_COLECCION`.
+    """
+    return str(env("QDRANT_COLECCION", COLECCION_QDRANT_DEFECTO)).strip()
+
+
+def dimensiones_embedding() -> int:
+    """
+    Tamano del vector de cada fragmento.
+
+    Returns:
+        Numero de dimensiones. Si `DIMENSIONES_EMBEDDING` trae algo que no es
+        un entero, se usa el valor por defecto en lugar de reventar.
+    """
+    try:
+        return int(env("DIMENSIONES_EMBEDDING", DIMENSIONES_EMBEDDING_DEFECTO))
+    except (TypeError, ValueError):
+        return DIMENSIONES_EMBEDDING_DEFECTO
+
+
+def lote_embeddings() -> int:
+    """
+    Cuantos fragmentos se envian juntos a la API de embeddings.
+
+    Returns:
+        Tamano del lote, con el valor por defecto si la variable no es valida.
+    """
+    try:
+        return max(1, int(env("LOTE_EMBEDDINGS", LOTE_EMBEDDINGS_DEFECTO)))
+    except (TypeError, ValueError):
+        return LOTE_EMBEDDINGS_DEFECTO
+
+
+def drive_carpeta_id() -> str:
+    """
+    Identificador de la carpeta compartida de Google Drive.
+
+    Returns:
+        El valor de `DRIVE_CARPETA_ID`, o cadena vacia mientras no haya acceso.
+    """
+    return str(env("DRIVE_CARPETA_ID", "")).strip()
+
+
+def google_credenciales() -> str:
+    """
+    Ruta al JSON de la cuenta de servicio de Google.
+
+    Returns:
+        La ruta indicada en `GOOGLE_CREDENCIALES`, o cadena vacia.
+    """
+    return str(env("GOOGLE_CREDENCIALES", "")).strip()
 
 
 if __name__ == "__main__":
@@ -696,3 +906,83 @@ if __name__ == "__main__":
     for concepto, valor in diagnostico().items():
         estado = "OK " if valor else "-- "
         print(f"[{estado}] {concepto}: {valor if valor else 'NO DISPONIBLE'}")
+
+
+# ==============================================================================
+# DONDE ESTA EL PROYECTO PARA QUIEN NO ESTA DENTRO DEL CONTENEDOR
+# ==============================================================================
+
+def _ruta_desde_los_montajes():
+    """
+    Deduce la carpeta del proyecto EN EL EQUIPO leyendo los montajes.
+
+    POR QUE HACE FALTA
+    ------------------
+    El script de QGIS pregunta a la API donde esta el proyecto, y la API
+    contestaba `/app`: su propia ruta DENTRO del contenedor. En el equipo de
+    la persona esa carpeta no existe, asi que QGIS no encontraba ni una capa
+    y decia "0 de 3 capas del sistema" con los archivos ahi al lado.
+
+    Docker deja la pista en `/proc/self/mountinfo`: para cada montaje apunta
+    su origen. De la linea de `/app/data` sale la ruta del equipo, y quitando
+    `data` del final queda la del proyecto.
+
+    Returns:
+        La ruta tal como la ve el equipo, o None si no se pudo deducir.
+    """
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as fh:
+            lineas = fh.readlines()
+    except OSError:
+        return None  # no es Linux, o no es un contenedor
+
+    for linea in lineas:
+        partes = linea.split()
+        if len(partes) < 5 or partes[4] != "/app/data":
+            continue
+
+        # Los espacios vienen escapados en octal: "PRACTICAS\040II".
+        origen = partes[3].replace(chr(92) + "040", " ")
+
+        # En Docker Desktop la unidad de Windows va en las opciones del
+        # sistema de archivos, separadas por punto y coma, no por comas:
+        #   aname=drvfs;path=C:\;uid=0;gid=0;metadata;...
+        # Buscarla separando por comas no encontraba nada y la ruta salia sin
+        # disco, que es tan inservible como la del contenedor.
+        unidad = ""
+        for trozo in linea.replace(",", ";").split(";"):
+            trozo = trozo.strip()
+            if trozo.startswith("path=") and ":" in trozo:
+                unidad = trozo[len("path="):].rstrip(chr(92) + "/")
+                break
+
+        if unidad:
+            completa = unidad + origen.replace("/", chr(92))
+        else:
+            completa = origen
+
+        # Se quita el `data` final: lo que interesa es la raiz del proyecto.
+        for separador in (chr(92), "/"):
+            if completa.lower().endswith(separador + "data"):
+                return completa[: -len(separador + "data")]
+        return completa
+    return None
+
+
+def ruta_proyecto_en_el_equipo() -> str:
+    """
+    Carpeta del proyecto tal como la ve quien NO esta dentro del contenedor.
+
+    Es lo que necesita el script de QGIS, que corre en el equipo de la
+    persona. Se puede fijar a mano con `RUTA_PROYECTO_EQUIPO` cuando el
+    despliegue no deje deducirla.
+
+    Returns:
+        La ruta en el equipo. Si no se pudo deducir, la de dentro del
+        contenedor, que al menos es cierta para quien corra ahi.
+    """
+    fijada = env("RUTA_PROYECTO_EQUIPO")
+    if fijada:
+        return fijada
+    deducida = _ruta_desde_los_montajes()
+    return deducida or BASE_DIR

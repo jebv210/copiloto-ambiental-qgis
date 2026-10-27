@@ -451,6 +451,60 @@ def explorar_valores(ruta: str, columnas, filas_max: int = 2000000,
     }
 
 
+def variantes_de_nombre(nombre: str) -> set:
+    """
+    Genera las grafias con las que un mismo lugar puede venir escrito.
+
+    POR QUE NO VALE UNA LISTA A MANO
+    --------------------------------
+    La version anterior de la interfaz llevaba escrito esto:
+
+        if dpto_select == "ANTIOQUIA":
+            variantes.update(["Antioquia", "Antioquia", "ANTIOQUIA"])
+        elif dpto_select == "BOYACA":
+            ...
+
+    Solo cubria tres departamentos de los treinta y tres. Elegir cualquier otro
+    con acento -- Narino, Choco, Cordoba, Bolivar, Atlantico... -- perdia en
+    silencio todos los registros escritos con la grafia que no estuviera en la
+    lista. Aqui las variantes se calculan, asi que valen para cualquier nombre
+    y para cualquier pais.
+
+    Args:
+        nombre: El nombre tal como se eligio.
+
+    Returns:
+        Conjunto con el nombre original y sus variantes de caja y de acentos.
+    """
+    import unicodedata
+
+    if not nombre:
+        return set()
+
+    def sin_tildes(texto):
+        """
+        Devuelve el texto sin marcas diacriticas.
+
+        Args:
+            texto: Texto de entrada.
+
+        Returns:
+            El mismo texto sin tildes ni dieresis.
+        """
+        descompuesto = unicodedata.normalize("NFD", texto)
+        return "".join(c for c in descompuesto
+                       if unicodedata.category(c) != "Mn")
+
+    semillas = {nombre.strip(), sin_tildes(nombre.strip())}
+    variantes = set()
+    for semilla in semillas:
+        if not semilla:
+            continue
+        variantes.update({semilla, semilla.upper(), semilla.lower(),
+                          semilla.title(), semilla.capitalize()})
+    return {v for v in variantes if v}
+
+
 def agrupar_variantes(conteos: dict):
     """
     Agrupa las distintas grafias de un mismo valor en una sola opcion de menu.
@@ -844,3 +898,151 @@ def cargar_cache(ruta_dataset: str):
         return None
 
     return contenido.get("datos")
+
+
+# ==============================================================================
+# 4. RESUMEN AGREGADO DE UNA TABLA GRANDE
+# ==============================================================================
+
+#: Cuantos valores distintos puede tener una columna para considerarla
+#: CATEGORICA. Por encima de esto es un identificador o un texto libre, y
+#: agrupar por el daria una linea por fila.
+MAXIMO_CATEGORIAS = 60
+
+#: Tope de lineas del resumen. Sin el, una tabla con muchas columnas
+#: categoricas produciria un resumen tan largo como el problema que resuelve.
+MAXIMO_LINEAS_RESUMEN = 400
+
+#: Nombres que suelen contener una magnitud que conviene sumar.
+COLUMNAS_SUMABLES = ("area_ha", "area", "superficie", "hectareas", "ha",
+                     "longitud", "length", "shape_area", "area_km2")
+
+
+def _es_numero(valor) -> bool:
+    """
+    Dice si un valor de texto se puede sumar.
+
+    Args:
+        valor: Lo leido de la celda.
+
+    Returns:
+        True si se puede convertir a numero.
+    """
+    try:
+        float(valor)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def resumir_tabla(ruta: str, maximo_filas: int = 2_000_000) -> dict:
+    """
+    Recorre una tabla entera y la resume agrupando por sus columnas.
+
+    POR QUE RESUMIR EN VEZ DE INDEXAR FILA A FILA
+    ---------------------------------------------
+    Se midio sobre la capa de ecosistemas del proyecto: 434 MB, 460.350 filas.
+    Indexarla entera darian 644.936 fichas, que son 97 horas de proceso y 3,5
+    anos de cuota gratuita del modelo. Es imposible, no caro.
+
+    Resumirla cuesta otra cosa: recorrer el archivo completo tarda 6 segundos
+    y no gasta NI UN embedding, porque agrupar y sumar es trabajo local. De
+    ahi salen unas pocas decenas de fichas que si responden lo que se le
+    pregunta a una capa: que ecosistemas hay, cuantas hectareas ocupa cada
+    uno, en que zonas hidrograficas.
+
+    Una fila suelta de esa tabla no significa nada para una busqueda por
+    significado; el agregado si.
+
+    Args:
+        ruta: Archivo tabular ya descargado.
+        maximo_filas: Tope de filas a recorrer, por prudencia.
+
+    Returns:
+        Diccionario con `lineas` (el resumen, listo para indexar), `filas`,
+        `columnas_resumidas` y `segundos`. Si no se pudo leer, `lineas` viene
+        vacia y `error` explica por que.
+    """
+    import csv
+    import time
+    from collections import Counter, defaultdict
+
+    arranque = time.time()
+    try:
+        columnas, delimitador = leer_encabezado(ruta)
+    except Exception as exc:
+        return {"lineas": [], "filas": 0, "columnas_resumidas": [],
+                "segundos": 0.0, "error": str(exc)[:160]}
+
+    # Se cuentan valores por columna y, si hay una magnitud sumable, se suma.
+    conteos = {c: Counter() for c in columnas}
+    sumas = {c: defaultdict(float) for c in columnas}
+    descartadas = set()
+    sumable = next((c for c in columnas
+                    if c.strip().lower() in COLUMNAS_SUMABLES), None)
+
+    filas = 0
+    try:
+        with open(ruta, encoding="utf-8-sig", errors="replace",
+                  newline="") as fh:
+            lector = csv.DictReader(fh, delimiter=delimitador)
+            for fila in lector:
+                filas += 1
+                if filas > maximo_filas:
+                    break
+                magnitud = 0.0
+                if sumable and _es_numero(fila.get(sumable)):
+                    magnitud = float(fila[sumable])
+                for columna in columnas:
+                    if columna in descartadas:
+                        continue
+                    valor = (fila.get(columna) or "").strip()
+                    if not valor:
+                        continue
+                    conteos[columna][valor] += 1
+                    if magnitud:
+                        sumas[columna][valor] += magnitud
+                    # En cuanto una columna se pasa de categorias deja de
+                    # mirarse: es un identificador, no una clasificacion.
+                    if len(conteos[columna]) > MAXIMO_CATEGORIAS:
+                        descartadas.add(columna)
+                        conteos[columna].clear()
+                        sumas[columna].clear()
+    except Exception as exc:
+        return {"lineas": [], "filas": filas, "columnas_resumidas": [],
+                "segundos": round(time.time() - arranque, 1),
+                "error": str(exc)[:160]}
+
+    utiles = [c for c in columnas
+              if c not in descartadas and 1 < len(conteos[c]) <= MAXIMO_CATEGORIAS]
+
+    # El nombre va sin el prefijo del temporal: la ficha la lee una persona y
+    # "_resumir_e_eccmc_100K_2024.csv" no es el nombre de su archivo.
+    visible = os.path.basename(ruta)
+    for marca in ("_resumir_", "_estimar_", "_muestra_"):
+        if visible.startswith(marca):
+            visible = visible[len(marca):]
+    lineas = [f"[Resumen de {visible}]",
+              f"Tabla de {filas:,} filas y {len(columnas)} columnas. "
+              f"No se indexa fila a fila: se resume agrupando.".replace(",", ".")]
+    if sumable:
+        lineas.append(f"Las cantidades se suman sobre la columna '{sumable}'.")
+
+    for columna in utiles:
+        if len(lineas) >= MAXIMO_LINEAS_RESUMEN:
+            break
+        lineas.append("")
+        lineas.append(f"Reparto por {columna}:")
+        for valor, cuantas in conteos[columna].most_common(MAXIMO_CATEGORIAS):
+            if len(lineas) >= MAXIMO_LINEAS_RESUMEN:
+                break
+            total = sumas[columna].get(valor, 0.0)
+            if total:
+                lineas.append(f"  {valor}: {cuantas:,} registros, "
+                              f"{total:,.0f} {sumable}".replace(",", "."))
+            else:
+                lineas.append(f"  {valor}: {cuantas:,} registros"
+                              .replace(",", "."))
+
+    return {"lineas": lineas, "filas": filas, "columnas_resumidas": utiles,
+            "segundos": round(time.time() - arranque, 1), "error": ""}

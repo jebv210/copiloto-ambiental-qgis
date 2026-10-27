@@ -1,0 +1,229 @@
+{
+  "id": "copiloto-chat-agente",
+  "name": "Copiloto · Chat del Agente (con memoria en Qdrant)",
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "pinData": {},
+  "meta": {},
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "copiloto-chat",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-chat",
+      "name": "Pregunta del sistema",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -760,
+        300
+      ],
+      "webhookId": "copiloto-chat",
+      "notes": "Entra la pregunta desde la interfaz.\nPOST /webhook/copiloto-chat con {pregunta, session_id, api_key?}\nresponseMode=responseNode: contestan los nodos 'Responder' y 'Falta la pregunta', no el ultimo nodo. Mezclar las dos formas hace que n8n rechace el flujo con 'Webhook node not correctly configured'.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "hay-pregunta",
+              "leftValue": "={{ $json.body.pregunta }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "si-hay-pregunta",
+      "name": "¿Trae pregunta?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -540,
+        300
+      ],
+      "notes": "Sin pregunta no se molesta al modelo: se devuelve un 400."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.COPILOTO_API }}/agente/chat",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({pregunta: $json.body.pregunta,session_id: $json.body.session_id || 'default',api_key: $json.body.api_key || null,guardar_memoria: false}) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "id": "preguntar-agente",
+      "name": "Preguntar al agente",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -300,
+        220
+      ],
+      "notes": "POST /agente/chat\nEl agente razona y consulta el corpus.\nVa con guardar_memoria=false A PROPOSITO: la escritura en Qdrant la hace el nodo siguiente, para que se vea en el flujo. Si guardara aqui tambien, el mismo intercambio entraria dos veces.\nLas imagenes pegadas las recoge la API por session_id: no viajan por n8n.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.COPILOTO_API }}/agente/memoria",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({pregunta: $('Pregunta del sistema').item.json.body.pregunta,respuesta: $json.respuesta || '',session_id: $json.session_id || 'default',tipo: 'intercambio'}) }}",
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "guardar-qdrant",
+      "name": "Guardar en Qdrant",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -60,
+        220
+      ],
+      "notes": "AQUI SE ESCRIBE EN QDRANT.\nPOST /agente/memoria -> coleccion 'memoria_usuario'.\nCada recuerdo entra con su fecha en ISO 8601 (UTC), igual que las fichas del corpus, para poder ordenarlos juntos.\nneverError: si la memoria falla, la respuesta se entrega igual. Perder un recuerdo no debe tumbar la conversacion.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Se junta la respuesta del agente con el resultado del guardado,\n// para que quien pregunto sepa si quedo registrado y cuando.\nconst guardado = $input.first().json || {};\nconst agente = $('Preguntar al agente').first().json || {};\nreturn [{ json: {\n  respuesta: agente.respuesta || '',\n  session_id: agente.session_id || 'default',\n  turnos_en_memoria: agente.turnos_en_memoria || 0,\n  modo: agente.modo || '',\n  memoria_guardada: guardado.guardado === true,\n  memoria_coleccion: guardado.coleccion || '',\n  memoria_fecha: guardado.fecha || '',\n  memoria_motivo: guardado.motivo || '',\n  memoria_en_indice: guardado.en_indice === true,\n  memoria_en_espera: guardado.guardado === true && guardado.en_indice !== true,\n  orquestado_por: 'n8n',\n  ejecucion_id: String($execution.id),\n  timestamp: new Date().toISOString()\n}}];"
+      },
+      "id": "armar-respuesta",
+      "name": "Armar respuesta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        180,
+        220
+      ],
+      "notes": "Devuelve la respuesta del agente mas el acuse del guardado: si entro en Qdrant, en que coleccion y con que fecha."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({error: 'Falta la pregunta', codigo: 400}) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "error-400",
+      "name": "Falta la pregunta",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -300,
+        420
+      ],
+      "notes": "Respuesta de error cuando llega una peticion sin pregunta."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      },
+      "id": "responder-ok",
+      "name": "Responder",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        420,
+        220
+      ],
+      "notes": "Devuelve al sistema la respuesta del agente junto con el acuse de lo guardado en Qdrant."
+    }
+  ],
+  "connections": {
+    "Pregunta del sistema": {
+      "main": [
+        [
+          {
+            "node": "¿Trae pregunta?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Trae pregunta?": {
+      "main": [
+        [
+          {
+            "node": "Preguntar al agente",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Falta la pregunta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preguntar al agente": {
+      "main": [
+        [
+          {
+            "node": "Guardar en Qdrant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardar en Qdrant": {
+      "main": [
+        [
+          {
+            "node": "Armar respuesta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Armar respuesta": {
+      "main": [
+        [
+          {
+            "node": "Responder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

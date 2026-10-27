@@ -33,6 +33,8 @@ from core.validator import ConesaValidator
 from database.excel_connector import ExcelConnector
 from database.gdb_connector import GDBConnector
 from core import catalogo
+from core import corpus
+from core import informes
 
 
 # ==============================================================================
@@ -373,14 +375,47 @@ def describir_area_de_estudio() -> str:
 
     lineas = ["--- Area de estudio cargada actualmente ---"]
 
-    if info["municipios_existe"]:
+    # El area la fija ahora la pestana de Area de Estudio a partir de un
+    # poligono concreto, no del filtrado de un departamento. Se pregunta
+    # primero por ahi: `resumen_area_generada` describe la capa buscando
+    # campos del DANE (`DPTO_CNMBR`) que un poligono de un KMZ no trae, y
+    # salia "municipios del departamento de sin identificar", que no dice
+    # nada util a quien pregunta que area esta cargada.
+    try:
+        from core import area_estudio as _ae
+
+        vigente = _ae.actual()
+    except Exception:
+        vigente = {"hay": False}
+
+    if vigente.get("hay"):
+        lineas.append(
+            f"Area de estudio: {vigente['nombre']}, "
+            f"{vigente.get('km2', '?')} km2 "
+            f"({vigente.get('vertices', '?')} vertices). "
+            f"Salio de {vigente.get('origen') or 'un archivo cargado'}."
+        )
+        # La ruta que se dice es la DEL EQUIPO. Quien lee esto va a abrir QGIS
+        # en su maquina, y "/app/data/..." ahi no existe.
+        from config import settings as _ajustes
+
+        _equipo = _ajustes.ruta_proyecto_en_el_equipo()
+        _relativa = vigente["archivo"].replace(_ajustes.BASE_DIR, "").lstrip("/\\")
+        lineas.append(
+            f"La capa esta en {os.path.join(_equipo, _relativa)} y es la que "
+            f"lee QGIS."
+        )
+    elif info["municipios_existe"]:
         departamentos = ", ".join(info["departamentos"]) or "sin identificar"
         lineas.append(
             f"Cartografia: {info['municipios_total']} municipios del "
             f"departamento de {departamentos}."
         )
     else:
-        lineas.append("Cartografia: no hay capa municipal generada.")
+        lineas.append(
+            "Area de estudio: no hay ninguna fijada. Se fija en la pestana "
+            "'Area de Estudio' subiendo el archivo que la delimita."
+        )
 
     if info["biodiversidad_existe"] and info["registros"] is not None:
         lineas.append(
@@ -403,6 +438,423 @@ def describir_area_de_estudio() -> str:
     return "\n".join(lineas)
 
 
+# ==============================================================================
+# CORPUS DOCUMENTAL
+# ==============================================================================
+# Estas seis herramientas le dan al agente acceso a la bibliografia: catalogos
+# de mariposas, listas de chequeo, plantas hospederas, ciclos de vida y riesgo
+# climatico. Todas devuelven texto YA CITADO.
+#
+# El reparto de responsabilidades es deliberado: la evidencia y su procedencia
+# las pone `core/corpus.py`, la estructura del informe la pone
+# `core/informes.py`, y el modelo solo conversa sobre ese material. El modelo no
+# redacta afirmaciones de su memoria, porque entonces no habria forma de
+# distinguir lo que el corpus documenta de lo que el modelo supone.
+
+
+def _panorama() -> dict:
+    """
+    Describe de donde sale lo que el agente sabe, ahora mismo.
+
+    POR QUE NO VALE `corpus.resumen()`
+    ----------------------------------
+    Esa funcion describe la CARPETA LOCAL. Cuando la fuente es Drive, los
+    documentos se borran del equipo en cuanto se leen, asi que esa carpeta
+    esta vacia por diseno y describirla es describir un sitio donde ya no hay
+    nada.
+
+    Se midio el dano. Preguntado "que aprendiste de nuevo", el agente
+    contestaba: "el corpus sigue contando con 1 documento, version
+    1docs-753b56cc, sin texto extraible" -- el zip suelto que quedaba en la
+    carpeta -- mientras el indice tenia 268 fichas de cuatro documentos de
+    Drive. Peor: si ese zip se borra, `disponible` pasa a False y las
+    herramientas de busqueda se niegan a buscar, con el indice entero
+    delante.
+
+    Lo que manda es: que ve la FUENTE, y que hay en el INDICE.
+
+    Returns:
+        Diccionario con `fuente`, `documentos`, `capas`, `fichas_indice`,
+        `se_puede_buscar`, `motivo` y `local`.
+    """
+    from core import fuentes, vectorial
+
+    try:
+        fuente = fuentes.estado()
+    except Exception as exc:
+        fuente = {"fuente": "?", "listo": False, "motivo": str(exc)[:160],
+                  "documentos": 0, "descartados": [], "por_categoria": []}
+
+    try:
+        se_puede, motivo = vectorial.disponible()
+        fichas = vectorial.contar_fichas()
+    except Exception as exc:
+        se_puede, motivo, fichas = False, str(exc)[:160], 0
+
+    return {
+        "fuente": fuente.get("fuente", "?"),
+        "listo": bool(fuente.get("listo")),
+        "motivo_fuente": fuente.get("motivo", ""),
+        "documentos": fuente.get("documentos", 0),
+        "por_categoria": fuente.get("por_categoria", []),
+        "capas": list(fuente.get("descartados") or []),
+        "fichas_indice": fichas,
+        "se_puede_buscar": bool(se_puede),
+        "motivo": motivo,
+        "local": fuente.get("en_el_equipo", True),
+    }
+
+def estado_del_corpus() -> str:
+    """
+    Informa de que bibliografia tiene cargada el sistema.
+
+    Usala cuando el usuario pregunte que documentos conoces, de que fuentes
+    dispones, o cuando una consulta al corpus no devuelva nada y convenga
+    explicar por que.
+
+    Returns:
+        Resumen con la carpeta, la version del corpus, el numero de documentos
+        y fichas, y el reparto por categoria tematica.
+    """
+    vista = _panorama()
+
+    if not vista["listo"] and not vista["fichas_indice"]:
+        return (
+            "No hay nada estudiado todavia.\n\n"
+            f"Fuente configurada: {vista['fuente']}. "
+            f"{vista['motivo_fuente']}\n\n"
+            "Cuando la fuente tenga documentos y se lance un estudio, "
+            "apareceran aqui."
+        )
+
+    lineas = [
+        "LO QUE TENGO ESTUDIADO",
+        f"  Fuente      : {vista['fuente']}",
+        f"  Documentos  : {vista['documentos']} leidos enteros",
+        f"  Fichas      : {vista['fichas_indice']} en el indice, que es lo "
+        f"que puedo consultar",
+    ]
+    if not vista["local"]:
+        lineas.append("  Los documentos se leen de la fuente y se borran del "
+                      "equipo; lo que queda aqui es el indice.")
+    if vista["por_categoria"]:
+        lineas.append("")
+        lineas.append("  Por categoria:")
+        for nombre, cuantos in vista["por_categoria"]:
+            lineas.append(f"    {cuantos:4d}  {nombre}")
+
+    # Lo que existe pero NO se leyo entero. Omitirlo hacia que el agente
+    # negara archivos que estan ahi delante: contestaba "no tengo informacion
+    # sobre e_eccmc_100K_2024" de un archivo de 434 MB que esta en la fuente.
+    if vista["capas"]:
+        lineas.append("")
+        lineas.append(f"  Capas de datos ({len(vista['capas'])}), demasiado "
+                      f"grandes para leerlas enteras. De cada una conozco su "
+                      f"cabecera, no su contenido:")
+        for capa in vista["capas"]:
+            lineas.append(f"    {capa.get('mb', '?')} MB  {capa.get('nombre')}")
+
+    if not vista["se_puede_buscar"]:
+        lineas.append("")
+        lineas.append(f"  AVISO: ahora mismo no puedo buscar. {vista['motivo']}")
+    return "\n".join(lineas)
+
+
+#: Marca que la interfaz busca en la respuesta para ofrecer la descarga del
+#: script. Va en una linea aparte y se quita antes de mostrar el texto, asi
+#: que quien lee la conversacion no la ve.
+MARCA_SCRIPT_QGIS = "[[DESCARGAR_SCRIPT_QGIS]]"
+
+
+def entregar_script_qgis() -> str:
+    """
+    Entrega el script que dibuja las capas en QGIS, y dice si hay con que.
+
+    Usala cuando el usuario pida un mapa, un grafico en QGIS, el script, las
+    capas, o pregunte como llevar los datos a QGIS. Devuelve el script y, muy
+    importante, el estado REAL de los archivos que necesita: no sirve de nada
+    entregar un script si todavia no hay datos que dibujar, y decirlo por
+    adelantado evita que el usuario lo ejecute y vea un mapa vacio sin saber
+    por que.
+
+    No generes tu el codigo del script ni lo copies en la respuesta: es un
+    archivo del proyecto, se mantiene aparte y la interfaz lo ofrece en un
+    boton de descarga.
+
+    Returns:
+        Instrucciones de uso y el estado de los archivos que el script espera.
+    """
+    import os
+
+    raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ruta = os.path.join(raiz, "cargar_capas_qgis.py")
+    if not os.path.exists(ruta):
+        return ("No encuentro el script `cargar_capas_qgis.py` en el "
+                "proyecto. Sin el no puedo entregar nada.")
+
+    lineas = [
+        "He preparado el script de QGIS. Debajo tienes el boton para "
+        "descargarlo.",
+        "",
+        "COMO SE USA",
+        "  1. Abre QGIS y ve a Complementos > Consola de Python "
+        "(Ctrl + Alt + P).",
+        "  2. Pulsa el boton de la carpeta y elige el archivo descargado.",
+        "  3. Dale al boton verde de Play.",
+        "",
+        "No hay que configurar nada: el script encuentra solo la carpeta del "
+        "proyecto y los archivos generados.",
+        "",
+        "QUE VA A DIBUJAR, SEGUN LO QUE HAY AHORA MISMO",
+    ]
+
+    # El estado se consulta de verdad, no se da por supuesto: es la diferencia
+    # entre avisar de que falta un archivo y que el usuario vea un mapa vacio.
+    try:
+        lineas.append(describir_area_de_estudio())
+    except Exception as exc:
+        lineas.append(f"  (no se pudo comprobar el estado: {exc})")
+
+    lineas.append("")
+    lineas.append(
+        "Si falta la capa de municipios o el archivo de biodiversidad, "
+        "generalos antes en la pestana 'Area de Estudio': el script los lee "
+        "de ahi."
+    )
+    lineas.append("")
+    lineas.append(
+        "INSTRUCCION PARA TI, NO PARA EL USUARIO: copia la linea siguiente "
+        "tal cual, al final de tu respuesta y en una linea aparte. Es una "
+        "marca que la interfaz sustituye por un boton de descarga. NO la "
+        "menciones, NO la expliques y NO la pongas entre comillas ni entre "
+        "acentos graves: si la nombras, al usuario le aparece un hueco vacio "
+        "en mitad del texto."
+    )
+    lineas.append(MARCA_SCRIPT_QGIS)
+    return "\n".join(lineas)
+
+
+def datos_para_qgis() -> str:
+    """
+    Dice que hay en la bibliografia cargada que sirva para hacer un mapa.
+
+    Usala cuando el usuario pregunte si hay datos para QGIS, si hay
+    coordenadas, cuencas, veredas o quebradas con las que dibujar algo, o que
+    cartografia hace falta conseguir. Tambien antes de proponer un script de
+    QGIS: evita ofrecer un mapa que no se puede hacer porque no hay con que.
+
+    Separa tres cosas que no son lo mismo, y conviene no mezclar al responder:
+
+      - COORDENADAS: lo unico que situa algo en un mapa por si solo.
+      - TOPONIMOS (cuencas, drenajes, veredas): no situan nada, pero se pueden
+        enganchar por nombre a una capa que ya tenga geometria.
+      - SISTEMA DE REFERENCIA Y SUPERFICIES: hacen falta para que las cifras y
+        las reproyecciones salgan bien.
+
+    Cuidado al interpretar el resultado: que existan coordenadas NO significa
+    que sean del area de estudio. Suelen venir de los antecedentes
+    bibliograficos, que citan campanas de campo de otros lugares. El informe lo
+    comprueba cuando hay capa del area de estudio generada, y lo advierte
+    cuando no.
+
+    Returns:
+        Informe con lo que hay de cada clase, el documento de donde sale cada
+        dato, y un veredicto explicito sobre si se puede dibujar un mapa.
+    """
+    from core import geografia
+    return geografia.informe()
+
+
+def consultar_corpus(pregunta: str) -> str:
+    """
+    Busca en la bibliografia cargada y devuelve los fragmentos pertinentes.
+
+    Usala para CUALQUIER pregunta cuya respuesta deba salir de la bibliografia
+    cargada, sea cual sea su tema: el corpus se cambia sin tocar el codigo, asi
+    que no des por hecho de que trata. Si no sabes que contiene, consulta antes
+    el estado del corpus. Cada fragmento viene con el documento y la pagina:
+    cita siempre esa procedencia en tu respuesta y no anadas afirmaciones que no
+    aparezcan en los fragmentos.
+
+    Args:
+        pregunta: La consulta en lenguaje natural, tal como la hizo el usuario.
+
+    Returns:
+        Los fragmentos encontrados con su fuente, o una explicacion de por que
+        no se encontro nada.
+    """
+    if not pregunta or not pregunta.strip():
+        return "Indique que desea consultar en la bibliografia."
+
+    # Lo que decide si se puede buscar es el INDICE, no la carpeta local.
+    # Antes se miraba `corpus.resumen()["disponible"]`, y con Drive esa
+    # carpeta queda vacia a proposito: bastaba borrar el ultimo archivo suelto
+    # para que el agente se negara a buscar con 268 fichas indexadas delante.
+    vista = _panorama()
+    if not vista["se_puede_buscar"]:
+        return estado_del_corpus()
+
+    # Busqueda hibrida: palabras (BM25) mezcladas con significado (Qdrant).
+    # Si el indice vectorial no esta construido o Qdrant no responde, la
+    # funcion devuelve exactamente lo que daria `corpus.buscar`, de modo que
+    # el agente sigue contestando sin base vectorial.
+    #
+    # OJO: esto NO afecta a `buscar_especie_exacta`, que sigue siendo literal.
+    # Un vector no distingue `Polites otho` de `Polites vibex`, y ese fue el
+    # fallo que obligo a crear la busqueda por binomio.
+    from core import vectorial
+    fichas = vectorial.buscar_hibrido(pregunta, limite=6)
+    if not fichas:
+        aviso = ""
+        if vista["capas"]:
+            # Puede estar en una de las capas que no se leyeron enteras. Decir
+            # "no hay nada" sin mencionarlas seria negar algo que esta ahi.
+            aviso = (
+                "\n\nAdemas hay "
+                f"{len(vista['capas'])} capa(s) de datos demasiado grandes "
+                "para leerlas enteras, de las que solo conozco la cabecera: "
+                + ", ".join(c.get("nombre", "?") for c in vista["capas"])
+                + ". Si lo que busca esta dentro de una de ellas, no puedo "
+                "verlo desde aqui."
+            )
+        return (
+            f"No se encontro nada sobre esa consulta en lo estudiado "
+            f"({vista['documentos']} documentos de {vista['fuente']}, "
+            f"{vista['fichas_indice']} fichas).\n\n"
+            "No se trata de que el dato no exista: es que los documentos "
+            "estudiados no lo tratan. Puede consultarse otra formulacion o "
+            "anadir la fuente que falte." + aviso
+        )
+
+    lineas = [f"Encontrado en lo estudiado ({vista['fuente']}):", ""]
+    for numero, ficha in enumerate(fichas, start=1):
+        lineas.append(f"[{numero}] {informes.recortar(ficha['texto'])}")
+        lineas.append(f"    Fuente: {informes.cita(ficha)}")
+        lineas.append("")
+    return "\n".join(lineas)
+
+
+def buscar_especie_exacta(nombre_cientifico: str) -> str:
+    """
+    Comprueba si un nombre cientifico aparece literalmente en la bibliografia.
+
+    Usala antes de afirmar que una especie esta documentada. La busqueda es
+    EXACTA a proposito: no devuelve nombres parecidos. Si no encuentra nada,
+    significa que el corpus no nombra esa especie, y debes decirlo asi en lugar
+    de ofrecer una especie de nombre similar.
+
+    Args:
+        nombre_cientifico: Binomio, por ejemplo "Polites otho". Tambien se
+            admite solo el genero.
+
+    Returns:
+        Las menciones literales con su fuente, o la constancia de que no hay
+        ninguna.
+    """
+    if not nombre_cientifico or not nombre_cientifico.strip():
+        return "Indique el nombre cientifico que desea comprobar."
+
+    vista = _panorama()
+
+    # Esta busqueda es LITERAL y lee las fichas de la carpeta local. Con una
+    # fuente remota esas fichas no existen: los documentos se borran al
+    # leerlos. Entonces la busqueda devuelve cero por falta de texto donde
+    # buscar, no por ausencia del nombre.
+    #
+    # Afirmar "NO aparece" en ese caso es la peor respuesta posible: es
+    # exactamente la clase de certeza que esta herramienta existe para dar, y
+    # darla sin haber mirado nada la vuelve peligrosa. Mejor decir que no se
+    # pudo comprobar.
+    hay_texto_local = corpus.resumen().get("fichas", 0) > 0
+    if not hay_texto_local:
+        return (
+            f"No puedo comprobar literalmente '{nombre_cientifico}'.\n\n"
+            f"La comprobacion literal necesita el texto de los documentos en "
+            f"el equipo, y con la fuente '{vista['fuente']}' los documentos se "
+            f"borran en cuanto se leen: aqui solo queda el indice, que compara "
+            f"por significado y NO sirve para afirmar que un binomio aparece "
+            f"tal cual.\n\n"
+            f"Puedo buscarlo por significado con la consulta normal al corpus, "
+            f"pero el resultado no valdria como comprobacion literal."
+        )
+
+    fichas = corpus.buscar_binomio(nombre_cientifico, limite=8)
+    if not fichas:
+        return (
+            f"'{nombre_cientifico}' NO aparece literalmente en ninguno de los "
+            f"{vista['documentos']} documentos estudiados.\n\n"
+            "No se ha buscado ningun nombre aproximado: entre nombres "
+            "cientificos, el parecido no es indicio de identidad. Generos como "
+            "Magneuptychia y Megeuptychia se diferencian en dos letras y no "
+            "tienen relacion directa."
+        )
+
+    lineas = [f"'{nombre_cientifico}' aparece en {len(fichas)} fichas:", ""]
+    for numero, ficha in enumerate(fichas, start=1):
+        lineas.append(f"[{numero}] {informes.recortar(ficha['texto'], 300)}")
+        lineas.append(f"    Fuente: {informes.cita(ficha)}")
+        lineas.append("")
+    return "\n".join(lineas)
+
+
+def reporte_taxonomico_especie(nombre_cientifico: str) -> str:
+    """
+    Emite el Reporte Tecnico Taxonomico completo de una especie.
+
+    Usala cuando el usuario pida un informe, un reporte o una caracterizacion
+    taxonomica de una especie. Devuelve el documento ya estructurado en seis
+    secciones; presentalo tal cual, sin reescribirlo ni resumirlo, porque su
+    valor esta en que cada afirmacion conserva su fuente.
+
+    Args:
+        nombre_cientifico: Binomio de la especie, por ejemplo "Polites otho".
+
+    Returns:
+        El informe completo en texto plano.
+    """
+    if not nombre_cientifico or not nombre_cientifico.strip():
+        return "Indique la especie de la que desea el reporte taxonomico."
+    return informes.reporte_taxonomico(nombre_cientifico.strip())
+
+
+def ficha_de_campo(nombre_cientifico: str) -> str:
+    """
+    Emite una ficha breve de una especie para llevar al trabajo de campo.
+
+    Usala cuando el usuario pida algo corto y practico sobre una especie: de que
+    planta depende, en que fase del ciclo esta, que necesita para criarse. Es
+    mas breve que el reporte taxonomico y esta pensada para imprimirse.
+
+    Args:
+        nombre_cientifico: Binomio de la especie.
+
+    Returns:
+        La ficha en texto plano.
+    """
+    if not nombre_cientifico or not nombre_cientifico.strip():
+        return "Indique la especie de la que desea la ficha de campo."
+    return informes.ficha_de_especie(nombre_cientifico.strip())
+
+
+def informe_cientifico_tema(tema: str) -> str:
+    """
+    Emite el Informe Cientifico de seis secciones sobre un tema.
+
+    Usala cuando el usuario pida un informe sobre un asunto amplio y no sobre
+    una especie concreta: el fenomeno del Nino, la conservacion del bosque seco,
+    las plantas hospederas de una region. Presentalo tal cual.
+
+    Args:
+        tema: El asunto del informe.
+
+    Returns:
+        El informe completo en texto plano.
+    """
+    if not tema or not tema.strip():
+        return "Indique el tema del informe cientifico."
+    return informes.informe_cientifico(tema.strip())
+
+
 #: Lista de herramientas que se le entregan al modelo. Tenerla aqui evita que
 #: `chatbot.py` y `test_gemini.py` mantengan copias distintas del conjunto.
 HERRAMIENTAS = [
@@ -411,4 +863,12 @@ HERRAMIENTAS = [
     procesar_lote_excel_csv,
     consultar_biodiversidad_local,
     describir_area_de_estudio,
+    estado_del_corpus,
+    datos_para_qgis,
+    entregar_script_qgis,
+    consultar_corpus,
+    buscar_especie_exacta,
+    reporte_taxonomico_especie,
+    ficha_de_campo,
+    informe_cientifico_tema,
 ]

@@ -1,0 +1,157 @@
+# Despliegue del Copiloto Ambiental.
+# ==============================================================================
+#
+# Cuatro servicios y un reparto de responsabilidades que conviene tener claro:
+#
+#   qdrant  -> guarda los vectores del corpus. Es el unico que necesita disco
+#              de verdad entre reinicios.
+#   api     -> FastAPI. Hace el trabajo pesado: Conesa, filtrado por bloques,
+#              intersecciones espaciales, troceado y embeddings del corpus.
+#   app     -> Streamlit. Solo presenta; no calcula nada por su cuenta.
+#   n8n     -> orquesta. Decide CUANDO se sincroniza el corpus y a quien se
+#              avisa. No procesa documentos ni toca geometrias: para eso llama
+#              a la API.
+#
+# ARRANQUE
+#   docker compose up -d
+#   Interfaz : http://localhost:8501
+#   API      : http://localhost:8000/docs
+#   n8n      : http://localhost:5678
+#   Qdrant   : http://localhost:6333/dashboard
+#
+# El archivo .env de la raiz se carga en api y app: ahi va GEMINI_API_KEY.
+
+services:
+
+  qdrant:
+    # La version del servidor debe ir a la par del cliente que instala
+    # requirements.txt (qdrant-client 1.19.x). Con v1.12.4 el cliente
+    # avisaba de incompatibilidad en cada llamada.
+    image: qdrant/qdrant:v1.19.0
+    container_name: copiloto-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"   # API REST y panel web
+      - "6334:6334"   # gRPC, mas rapido para cargas grandes
+    volumes:
+      - qdrant_datos:/qdrant/storage
+    healthcheck:
+      # La imagen de Qdrant no trae curl, wget ni nc, pero si bash. Se usa su
+      # redireccion de red para abrir el puerto, y se invoca bash EXPLICITAMENTE
+      # porque /dev/tcp no existe en el `sh` de la imagen: con CMD-SHELL a secas
+      # el chequeo fallaba aunque el servicio estuviera perfecto.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  api:
+    build: .
+    # Nombre fijo para que `app` reutilice ESTA imagen en vez de construirse
+    # otra. Con `build: .` en los dos servicios, compose creaba dos imagenes
+    # distintas y `docker compose build api` dejaba la de la interfaz atras:
+    # la web siguio mostrando textos y un modelo que ya se habian cambiado.
+    image: copiloto-ambiental:latest
+    container_name: copiloto-api
+    restart: unless-stopped
+    command: python -m uvicorn api.server:app --host 0.0.0.0 --port 8000
+    env_file:
+      - .env
+    environment:
+      # Dentro de la red de compose, Qdrant responde por su nombre de servicio.
+      QDRANT_URL: http://qdrant:6333
+      FUENTE_CORPUS: ${FUENTE_CORPUS:-local}
+
+      # DRIVE_CARPETA_ID y GOOGLE_CREDENCIALES no hace falta declararlas aqui:
+      # el `env_file: .env` de arriba ya mete en el contenedor todo lo que haya
+      # en el .env. Se mencionan para que quien lea este archivo sepa que
+      # existen.
+      #
+      # OJO con GOOGLE_CREDENCIALES: es una ruta DE DENTRO del contenedor, no
+      # del PC. La carpeta config/ se monta en /app/config, asi que dejando el
+      # JSON de la cuenta de servicio ahi, el valor correcto es
+      #   GOOGLE_CREDENCIALES=/app/config/credenciales_drive.json
+      # Poner la ruta de Windows (C:\...) hace que el contenedor no lo
+      # encuentre. Ver documentos/Credenciales_Drive.md
+      # Los embeddings los genera Gemini. OJO: la capa gratuita permite 1.000
+      # al dia y el corpus necesita ~14.989, asi que el indice inicial se
+      # construye en varios dias o con la API de pago.
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./corpus:/app/corpus
+      - ./data:/app/data
+      - ./api:/app/api
+      - ./agent:/app/agent
+      - ./core:/app/core
+      - ./config:/app/config
+      - ./database:/app/database
+    depends_on:
+      qdrant:
+        condition: service_healthy
+
+  app:
+    image: copiloto-ambiental:latest
+    container_name: copiloto-app
+    restart: unless-stopped
+    command: >
+      python -m streamlit run app.py
+      --server.port 8501
+      --server.address 0.0.0.0
+      --browser.gatherUsageStats false
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      API_URL: http://api:8000
+      # La direccion que usa el NAVEGADOR, no Streamlit. "api" solo existe
+      # dentro de la red de contenedores; el JavaScript que pega imagenes con
+      # Ctrl+V corre en el navegador y tiene que ir a localhost.
+      API_URL_NAVEGADOR: ${API_URL_NAVEGADOR:-http://localhost:8000}
+      N8N_URL: http://n8n:5678
+    ports:
+      - "8501:8501"
+    volumes:
+      # La configuracion de Streamlit se MONTA, no se cocina en la imagen.
+      # Estaba dentro del contenedor desde que se construyo, asi que cambiar
+      # .streamlit/config.toml en el equipo no surtia ningun efecto hasta
+      # reconstruir, y el cambio parecia no funcionar. Es la misma trampa que
+      # con el .env.
+      - ./.streamlit:/app/.streamlit
+      - ./corpus:/app/corpus
+      - ./data:/app/data
+      - ./api:/app/api
+      - ./agent:/app/agent
+      - ./core:/app/core
+      - ./config:/app/config
+      - ./database:/app/database
+      - ./app.py:/app/app.py
+    depends_on:
+      - api
+
+  n8n:
+    image: n8nio/n8n:1.68.0
+    container_name: copiloto-n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      GENERIC_TIMEZONE: America/Bogota
+      TZ: America/Bogota
+      # Sin autenticacion para desarrollo local. ANTES DE EXPONERLO A INTERNET
+      # hay que activar N8N_BASIC_AUTH_ACTIVE y poner usuario y clave.
+      N8N_SECURE_COOKIE: "false"
+      # Direccion de la API dentro de la red de compose. Es la que usan los
+      # flujos; si cambia, se cambia aqui y no en cada nodo.
+      COPILOTO_API: http://api:8000
+    volumes:
+      - n8n_datos:/home/node/.n8n
+      # Los flujos versionados del proyecto, para importarlos desde el panel.
+      - ./n8n/flujos:/flujos:ro
+    depends_on:
+      - api
+
+volumes:
+  qdrant_datos:
+  n8n_datos:

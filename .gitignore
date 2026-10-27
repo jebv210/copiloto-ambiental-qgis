@@ -24,6 +24,8 @@ biodiversidad_filtrada.csv
 municipios_filtrados.geojson
 cache_municipios_nacional.geojson
 cache_catalogo.json
+cache_corpus.json
+cache_vectores.npy
 *.parcial
 
 # --- Temporales ---------------------------------------------------------------
@@ -32,6 +34,7 @@ temp_uploads/
 *_resultado.xlsx
 
 # --- Sistema operativo --------------------------------------------------------
+~$*          # archivos de bloqueo que deja Word abierto
 Thumbs.db
 desktop.ini
 .DS_Store
@@ -41,3 +44,87 @@ desktop.ini
 # (suelen ser ortofotos y shapefiles pesados).
 capas_extra/*
 !capas_extra/rutas.txt
+
+# --- Corpus documental --------------------------------------------------------
+# Los documentos tienen autor y editorial, y pesan. Se versiona la estructura
+# y las instrucciones, nunca las fuentes.
+corpus/*
+!corpus/LEEME.md
+
+# --- Material que no es codigo --------------------------------------------
+# Entregables de la practica (informes, planes, el Excel de diccionarios) y
+# material retirado. No los lee ningun programa del sistema, pesan y algunos
+# tienen autor y editorial. Se conservan en disco, no en el repositorio.
+documentos/*
+!documentos/LEEME.md
+_archivo/*
+!_archivo/LEEME.md
+
+# ------------------------------------------------------------------------------
+# CREDENCIALES DE GOOGLE DRIVE
+# ------------------------------------------------------------------------------
+# El JSON de la cuenta de servicio es una contrasena: quien lo tenga puede leer
+# todo lo que esa cuenta tenga compartido. NUNCA debe subirse a un repositorio.
+# Ver documentos/Credenciales_Drive.md
+credenciales_drive.json
+config/credenciales_drive.json
+*-service-account*.json
+*service_account*.json
+
+# ------------------------------------------------------------------------------
+# CUALQUIER VARIANTE DEL .env
+# ------------------------------------------------------------------------------
+# Solo estaba ignorado el `.env` exacto. Se descubrio al hacer una copia de
+# seguridad antes de corregir una clave: el archivo `.env.respaldo` quedaba
+# fuera del ignorado y habria subido la credencial al repositorio.
+#
+# Hacer una copia del .env antes de tocarlo es lo normal y lo prudente. Lo que
+# no puede pasar es que esa prudencia publique la clave.
+.env.*
+!.env.example
+*.env
+
+# Ajustes que el usuario elige en la interfaz (de donde estudia el agente, que
+# carpeta de Drive). Son de ESTA instalacion, no del proyecto: versionarlos
+# haria que al clonar el repositorio se heredara la configuracion de otro.
+data/ajustes.json
+
+# Autorizaciones de Google a medias. Guardan el secreto del cliente mientras
+# el navegador esta en la pantalla de permiso, y se borran al volver.
+data/oauth_pendiente.json
+
+
+# ==============================================================================
+# LA CARPETA data/
+# ==============================================================================
+# Aqui conviven dos cosas muy distintas y hay que separarlas con cuidado:
+#
+#   - Lo que ES el proyecto: el archivo que delimita el area de estudio, las
+#     capas que se generan de el y el ejemplo de salida de campo con el que se
+#     prueba la validacion. Son pequenos y tienen que viajar con el codigo.
+#
+#   - Lo que solo existe en ESTA maquina: la cache de vectores (86 MB), las
+#     conversaciones, las credenciales pendientes, los resumenes calculados y
+#     las capas nacionales descargadas (una de ellas, 417 MB).
+#
+# Se midio por que importa: sin estas reglas, `git add` metia el CSV de 417 MB
+# y GitHub rechaza cualquier archivo de mas de 100 MB. El empuje habria
+# fallado despues de subir medio giga.
+#
+# La regla es al reves de lo habitual: se ignora todo y se rescata lo poco que
+# debe subir. Asi, un archivo nuevo en data/ no se cuela por olvido.
+data/*
+!data/capas_fuente/
+!data/ejemplos_campo/
+# El ejemplo de campo es un .zip, y mas arriba se ignoran todos. Sin
+# esta excepcion, la bateria de pruebas se queda sin su dato real y
+# tres comprobaciones se omiten solas en una maquina recien clonada.
+!data/ejemplos_campo/*.zip
+!data/municipios_filtrados.geojson
+!data/puntos_area_estudio.geojson
+!data/hidrografia_area_estudio.geojson
+
+# De las capas de origen solo sube la del proyecto. Las nacionales se bajan.
+data/capas_fuente/*
+!data/capas_fuente/LEEME.md
+!data/capas_fuente/area_proyecto_san_carlos.kmz

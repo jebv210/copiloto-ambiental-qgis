@@ -1,0 +1,312 @@
+{
+  "id": "copiloto-sincronizar-corpus",
+  "name": "Copiloto · Sincronizar corpus cada 24h",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 10,
+              "triggerAtMinute": 30
+            }
+          ]
+        }
+      },
+      "id": "disparador-horario",
+      "name": "Sincronizacion programada",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -640,
+        300
+      ],
+      "notes": "Hora de la carga diaria desde Drive. Se cambia AQUI, en 'Trigger at Hour' y 'Trigger at Minute'.\nEl nombre del nodo no dice la hora a proposito: antes decia 'las 10:30' mientras disparaba a las 10:50, y el nombre no se actualiza solo al cambiar la regla.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.COPILOTO_API }}/corpus/sincronizar",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\"forzar\": false, \"origen\": \"cron de las 10:30\"}",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "arrancar",
+      "name": "Arrancar sincronización",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -420,
+        300
+      ],
+      "notes": "AQUI EMPIEZA LA ESCRITURA EN QDRANT.\nn8n NO escribe en Qdrant: no tiene conexion con la base vectorial.\nEste nodo solo llama a POST /corpus/sincronizar y la API hace el trabajo:\n  core/vectorial.py -> indexar() -> _indexar_documento() -> upsert()\nAhi es donde cada punto recibe su 'fecha_indexado' (UTC, ISO 8601) y su 'indexado_unix'.\nResponde al instante: la indexacion sigue en segundo plano.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "amount": 30
+      },
+      "id": "esperar",
+      "name": "Esperar 30 s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -200,
+        300
+      ],
+      "webhookId": "espera-corpus",
+      "notes": "Pausa entre consultas de estado. La indexacion puede durar horas, asi que no se puede esperar en una sola llamada sin que se agote el tiempo.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.COPILOTO_API }}/corpus/estado",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "consultar-estado",
+      "name": "Consultar estado",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        20,
+        300
+      ],
+      "notes": "GET /corpus/estado. Solo LEE: no escribe nada en Qdrant.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "sigue-corriendo",
+              "leftValue": "={{ $json.sincronizacion.ejecutando }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "sigue",
+      "name": "¿Sigue indexando?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        240,
+        300
+      ],
+      "notes": "Si la API dice que sigue trabajando, vuelve a esperar. Si no, pasa al resumen.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "resumen",
+              "name": "resumen",
+              "value": "={{ $json.sincronizacion.mensaje }}",
+              "type": "string"
+            },
+            {
+              "id": "fichas",
+              "name": "fichas_indexadas",
+              "value": "={{ $json.vectorial.fichas }}",
+              "type": "number"
+            },
+            {
+              "id": "documentos",
+              "name": "documentos_en_fuente",
+              "value": "={{ $json.fuente.documentos }}",
+              "type": "number"
+            },
+            {
+              "id": "fuente",
+              "name": "fuente",
+              "value": "={{ $json.fuente.fuente }}",
+              "type": "string"
+            },
+            {
+              "id": "hubo_error",
+              "name": "hubo_error",
+              "value": "={{ $json.sincronizacion.error !== null }}",
+              "type": "boolean"
+            },
+            {
+              "id": "detalle_error",
+              "name": "detalle_error",
+              "value": "={{ $json.sincronizacion.error || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "version",
+              "name": "version_corpus",
+              "value": "={{ $json.corpus.version }}",
+              "type": "string"
+            },
+            {
+              "id": "categorias",
+              "name": "reparto_por_categoria",
+              "value": "={{ ($json.corpus.categorias || []).map(c => c[0] + ': ' + c[1]).join(' | ') }}",
+              "type": "string"
+            },
+            {
+              "id": "ncat",
+              "name": "cuantas_categorias",
+              "value": "={{ ($json.corpus.categorias || []).length }}",
+              "type": "number"
+            },
+            {
+              "id": "fuente_lista",
+              "name": "fuente_lista",
+              "value": "={{ $json.fuente.listo }}",
+              "type": "boolean"
+            },
+            {
+              "id": "fuente_motivo",
+              "name": "fuente_motivo",
+              "value": "={{ $json.fuente.motivo || '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "resumir",
+      "name": "Resumir resultado",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        460,
+        420
+      ],
+      "notes": "Recoge el resultado para dejarlo en el historial de ejecuciones de n8n: cuantos documentos nuevos, el reparto por categoria y la version del corpus.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sincronizar-ahora",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "disparo-manual",
+      "name": "Disparar a mano",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -640,
+        480
+      ],
+      "webhookId": "sincronizar-ahora",
+      "notes": "Mismo trabajo que el cron, pero cuando uno quiera:\ncurl -X POST http://localhost:5678/webhook/sincronizar-ahora\nExiste para poder PROBAR la sincronizacion sin esperar a las 10:30 ni reiniciar nada.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Sincronizacion programada": {
+      "main": [
+        [
+          {
+            "node": "Arrancar sincronización",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Arrancar sincronización": {
+      "main": [
+        [
+          {
+            "node": "Esperar 30 s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Esperar 30 s": {
+      "main": [
+        [
+          {
+            "node": "Consultar estado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consultar estado": {
+      "main": [
+        [
+          {
+            "node": "¿Sigue indexando?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Sigue indexando?": {
+      "main": [
+        [
+          {
+            "node": "Esperar 30 s",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resumir resultado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Disparar a mano": {
+      "main": [
+        [
+          {
+            "node": "Arrancar sincronización",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": true,
+  "pinData": {},
+  "staticData": null,
+  "meta": {}
+}

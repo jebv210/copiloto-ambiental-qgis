@@ -33,3 +33,40 @@ gatherUsageStats = false
 #     "minimal"   oculta la barra ENTERA, incluido el selector de tema;
 #                 solo reaparece si la aplicacion lanza un error
 toolbarMode = "viewer"
+
+[theme]
+# ==============================================================================
+# COLOR PRIMARIO DE STREAMLIT
+# ==============================================================================
+# Streamlit usa su propio color primario (un rojo coral) para el foco del
+# teclado, el borde del campo activo, la pestana seleccionada, las casillas y
+# los deslizadores. Eso NO se arregla con CSS: son colores que Streamlit
+# calcula por dentro y aplica en decenas de sitios.
+#
+# Se veia sobre todo en tema claro: al pinchar un desplegable o una pestana
+# aparecia un recuadro rojo, que en una aplicacion verde parece un error en vez
+# de "esto es lo que tienes seleccionado".
+#
+# Poniendolo al verde del proyecto, todos esos estados quedan coherentes de una
+# sola vez y sin pelear contra el framework.
+primaryColor = "#2e7d32"
+
+# El resto de colores NO se fijan a proposito: sin ellos, Streamlit sigue al
+# tema del sistema y la aplicacion funciona igual de bien en claro y en oscuro.
+# Fijar un fondo aqui obligaria a mantener dos paletas a mano.
+
+[theme.sidebar]
+# El verde tambien en la barra lateral, para que el foco y lo seleccionado
+# sean coherentes en toda la aplicacion.
+#
+# SOBRE LA ADVERTENCIA "Invalid color passed for textColor in theme.sidebar"
+# --------------------------------------------------------------------------
+# Aparece en la consola del navegador y NO es de esta configuracion: se
+# comprobo quitando el bloque [theme] entero y sigue saliendo igual. Es un
+# defecto interno de Streamlit 1.61.1, que se pasa a si mismo una cadena vacia
+# como color de texto de la barra. No afecta a nada: la barra se ve bien.
+#
+# No se "arregla" fijando textColor a mano porque eso congelaria el color y la
+# aplicacion dejaria de seguir al tema claro/oscuro del sistema. Se deja
+# documentado para no volver a investigarlo.
+primaryColor = "#2e7d32"

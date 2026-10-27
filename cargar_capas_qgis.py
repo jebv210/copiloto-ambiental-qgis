@@ -127,6 +127,22 @@ ESTILO_PUNTOS = {
     "outline_width": "0.15",
 }
 
+#: Azul de agua para quebradas y rios. Mas fino que un limite administrativo:
+#: una red hidrica con lineas gruesas tapa el territorio que describe.
+ESTILO_HIDROGRAFIA = {
+    "color": "33,113,181",
+    "width": "0.5",
+}
+
+#: Los sitios del proyecto: veredas, casco urbano, instituciones. Van en un
+#: tono distinto al de los registros de biodiversidad para no confundirlos.
+ESTILO_PUNTOS_AREA = {
+    "color": "106,61,154",
+    "size": "2.2",
+    "outline_color": "255,255,255",
+    "outline_width": "0.4",
+}
+
 #: Nombres probables de las columnas de coordenadas, en orden de preferencia.
 COLUMNAS_LATITUD = ["decimalLatitude", "latitude", "lat", "latitud"]
 COLUMNAS_LONGITUD = ["decimalLongitude", "longitude", "lon", "lng", "longitud"]
@@ -136,6 +152,53 @@ COLUMNAS_LONGITUD = ["decimalLongitude", "longitude", "lon", "lng", "longitud"]
 ARCHIVO_DEPARTAMENTOS = "colombia_departamentos.geojson"
 ARCHIVO_MUNICIPIOS = "municipios_filtrados.geojson"
 ARCHIVO_BIODIVERSIDAD = "biodiversidad_filtrada.csv"
+
+#: Referencias que salen del mismo archivo del que sale el area: las veredas,
+#: el casco urbano, los sitios del proyecto y la red hidrica.
+#:
+#: Sin ellas el mapa sale con el contorno del municipio y nada dentro, que es
+#: justo lo que pasaba: el indice documental no tiene ni una coordenada -- las
+#: tablas nombran veredas y quebradas con sus areas y longitudes, pero sin
+#: geometria --, asi que estas capas son las unicas coordenadas del proyecto.
+ARCHIVO_PUNTOS_AREA = "puntos_area_estudio.geojson"
+ARCHIVO_HIDROGRAFIA = "hidrografia_area_estudio.geojson"
+
+#: Subcarpeta donde el sistema deja ahora lo que genera.
+#:
+#: POR QUE HAY QUE MIRAR EN DOS SITIOS
+#: -----------------------------------
+#: La interfaz corre en un contenedor, y de ese contenedor solo salen al
+#: equipo las carpetas montadas. La raiz del proyecto NO lo esta, asi que una
+#: capa escrita ahi quedaba encerrada: ni la interfaz la veia, ni QGIS, que
+#: corre en el equipo de la persona. `data/` si esta montada.
+#:
+#: Se buscan las DOS ubicaciones a proposito. Los nombres de archivo no han
+#: cambiado -- ese contrato se respeta --, solo la carpeta; y quien tenga una
+#: capa generada antes, en la raiz, debe seguir pudiendo cargarla sin mover
+#: nada.
+SUBCARPETA_SALIDA = "data"
+
+
+def localizar(carpeta, nombre):
+    """
+    Devuelve la ruta del archivo, lo tenga el proyecto en `data/` o en la raiz.
+
+    Args:
+        carpeta: Carpeta del proyecto.
+        nombre: Nombre del archivo buscado.
+
+    Returns:
+        La ruta que exista. Si no existe en ninguna de las dos, se devuelve
+        la de `data/`, que es donde el sistema lo genera hoy: asi el mensaje
+        de error apunta al sitio correcto en vez de al antiguo.
+    """
+    en_data = os.path.join(carpeta, SUBCARPETA_SALIDA, nombre)
+    if os.path.exists(en_data):
+        return en_data
+    en_raiz = os.path.join(carpeta, nombre)
+    if os.path.exists(en_raiz):
+        return en_raiz
+    return en_data
 
 # ------------------------------------------------------------------------------
 # CAPAS PROPIAS DEL USUARIO
@@ -207,6 +270,7 @@ def detectar_carpeta_proyecto():
         2. La carpeta donde se guardo este mismo script.
         3. La carpeta del proyecto .qgz que este abierto en QGIS.
         4. La carpeta de trabajo actual.
+        5. La ruta que informa el servidor de la aplicacion.
 
     Asi funciona tanto si el script se ejecuta desde la carpeta del proyecto
     como si se descargo a "Descargas" y se abrio desde ahi.
@@ -219,19 +283,17 @@ def detectar_carpeta_proyecto():
     """
     candidatos = []
 
-    # Pista 1: el servidor API conoce la ruta exacta del proyecto.
-    try:
-        import urllib.request
-        import json
-        with urllib.request.urlopen(
-            "http://127.0.0.1:8000/base-path", timeout=1
-        ) as respuesta:
-            datos = json.loads(respuesta.read().decode("utf-8"))
-            if datos.get("base_path"):
-                candidatos.append(datos["base_path"])
-    except Exception:
-        # El servidor apagado no es un problema: quedan otras tres pistas.
-        pass
+    # EL ORDEN IMPORTA, Y ES ESTE A PROPOSITO
+    # ---------------------------------------
+    # Primero lo que esta al lado del script, y solo al final se pregunta al
+    # servidor. Antes era al reves, y el servidor ganaba siempre: un script
+    # colocado junto a sus propias capas cargaba las de OTRO proyecto, el que
+    # tuviera la aplicacion abierta. Se midio en la bateria de pruebas, que
+    # monta su juego de datos en una carpeta aparte y de pronto empezo a
+    # cargar las capas reales del proyecto.
+    #
+    # La API sigue haciendo falta: es la unica pista cuando el script se
+    # descargo a "Descargas" y ahi no hay ninguna capa al lado.
 
     # Pista 2: la ubicacion de este archivo.
     try:
@@ -248,9 +310,32 @@ def detectar_carpeta_proyecto():
     # Pista 4: el directorio de trabajo.
     candidatos.append(os.getcwd())
 
+    # Pista 5, la ultima: el servidor sabe donde esta el proyecto. Responde
+    # con la ruta DEL EQUIPO, no con la suya de dentro del contenedor.
+    try:
+        import json
+        import urllib.request
+        with urllib.request.urlopen(
+            "http://127.0.0.1:8000/base-path", timeout=1
+        ) as respuesta:
+            datos = json.loads(respuesta.read().decode("utf-8"))
+            if datos.get("base_path"):
+                candidatos.append(datos["base_path"])
+    except Exception:
+        # El servidor apagado no es un problema: quedan las otras pistas.
+        pass
+
+    # Se reconoce la carpeta por CUALQUIERA de los archivos del sistema, y en
+    # las dos ubicaciones posibles. Antes se exigia `biodiversidad_filtrada.csv`,
+    # que dejo de generarse cuando la pestana de area de estudio paso a
+    # delimitar la cuenca en vez de filtrar registros por departamento: la
+    # deteccion fallaba siempre y el script avisaba de que no encontraba la
+    # carpeta aunque estuviera dentro de ella.
     for carpeta in candidatos:
-        if os.path.exists(os.path.join(carpeta, ARCHIVO_BIODIVERSIDAD)):
-            return carpeta, True
+        for nombre in (ARCHIVO_MUNICIPIOS, ARCHIVO_BIODIVERSIDAD,
+                       ARCHIVO_DEPARTAMENTOS):
+            if os.path.exists(localizar(carpeta, nombre)):
+                return carpeta, True
 
     return (candidatos[0] if candidatos else os.getcwd()), False
 
@@ -390,6 +475,48 @@ def cargar_capa_poligonos(proyecto, ruta, nombre, estilo, descripcion):
     return capa
 
 
+def cargar_capa_vectorial(proyecto, ruta, nombre, estilo, descripcion,
+                          simbolo):
+    """
+    Carga un GeoJSON de lineas o de puntos y le aplica su estilo.
+
+    Es la hermana de `cargar_capa_poligonos` para las otras dos geometrias.
+    Se separa en vez de anadir un parametro a aquella porque el simbolo que
+    hay que construir es distinto, y meter un `if` dentro la haria hacer dos
+    cosas a la vez.
+
+    Args:
+        proyecto: Instancia de `QgsProject`.
+        ruta: Ruta del archivo GeoJSON.
+        nombre: Nombre con el que aparecera en el panel de capas.
+        estilo: Propiedades del simbolo.
+        descripcion: Texto para el mensaje de resultado.
+        simbolo: La clase de simbolo a usar (`QgsLineSymbol` o
+            `QgsMarkerSymbol`).
+
+    Returns:
+        La capa cargada, o None si el archivo no existe o no es valido.
+    """
+    if not os.path.exists(ruta):
+        # Estas capas son opcionales: no todo archivo de area trae veredas ni
+        # red hidrica. Se informa sin alarmar.
+        return None
+
+    capa = QgsVectorLayer(ruta, nombre, "ogr")
+    if not capa.isValid():
+        print(f"  [!!] {descripcion}: el archivo existe pero QGIS no lo pudo "
+              f"interpretar.")
+        return None
+
+    capa.setCrs(QgsCoordinateReferenceSystem("EPSG:4326"))
+    proyecto.addMapLayer(capa)
+    capa.setRenderer(QgsSingleSymbolRenderer(simbolo.createSimple(estilo)))
+    capa.triggerRepaint()
+
+    print(f"  [OK] {descripcion}: {capa.featureCount()} elementos.")
+    return capa
+
+
 def cargar_capa_puntos(proyecto, ruta_csv):
     """
     Convierte el CSV de biodiversidad en una capa de puntos.
@@ -406,8 +533,11 @@ def cargar_capa_puntos(proyecto, ruta_csv):
         reconocibles.
     """
     if not os.path.exists(ruta_csv):
-        print(f"  [--] Biodiversidad: no existe '{os.path.basename(ruta_csv)}'. "
-              f"Genera el area de estudio en la interfaz web.")
+        # No se manda a "generar el area de estudio": son dos cosas distintas,
+        # y decirlo asi hacia rehacer un area que ya estaba generada. Esta capa
+        # es una tabla de registros con coordenadas, opcional.
+        print(f"  [--] Biodiversidad: no hay '{os.path.basename(ruta_csv)}'. "
+              f"Es opcional: una tabla con coordenadas para dibujar puntos.")
         return None
 
     columna_lat, columna_lon, delimitador = detectar_columnas_coordenadas(ruta_csv)
@@ -683,8 +813,8 @@ def cargar_capas_area_de_estudio():
     if comprobada:
         print(f"Carpeta del proyecto: {carpeta}")
     else:
-        print(f"AVISO: no se encontro '{ARCHIVO_BIODIVERSIDAD}' en ninguna "
-              f"ubicacion conocida.")
+        print(f"AVISO: no se encontro '{ARCHIVO_MUNICIPIOS}' ni "
+              f"'{ARCHIVO_BIODIVERSIDAD}' en ninguna ubicacion conocida.")
         print(f"       Se probara con: {carpeta}")
     print()
 
@@ -703,7 +833,7 @@ def cargar_capas_area_de_estudio():
 
     capas["departamentos"] = cargar_capa_poligonos(
         proyecto,
-        os.path.join(carpeta, ARCHIVO_DEPARTAMENTOS),
+        localizar(carpeta, ARCHIVO_DEPARTAMENTOS),
         "Departamentos de Colombia",
         ESTILO_DEPARTAMENTOS,
         "Departamentos de Colombia",
@@ -711,14 +841,34 @@ def cargar_capas_area_de_estudio():
 
     capas["municipios"] = cargar_capa_poligonos(
         proyecto,
-        os.path.join(carpeta, ARCHIVO_MUNICIPIOS),
+        localizar(carpeta, ARCHIVO_MUNICIPIOS),
         "Municipios del area de estudio",
         ESTILO_MUNICIPIOS,
         "Municipios del area de estudio",
     )
 
+    # La red hidrica va bajo los puntos: son quebradas y rios, el soporte
+    # sobre el que se leen los sitios, no al reves.
+    capas["hidrografia"] = cargar_capa_vectorial(
+        proyecto,
+        localizar(carpeta, ARCHIVO_HIDROGRAFIA),
+        "Red hidrica del area de estudio",
+        ESTILO_HIDROGRAFIA,
+        "Red hidrica",
+        QgsLineSymbol,
+    )
+
+    capas["sitios"] = cargar_capa_vectorial(
+        proyecto,
+        localizar(carpeta, ARCHIVO_PUNTOS_AREA),
+        "Veredas y sitios del proyecto",
+        ESTILO_PUNTOS_AREA,
+        "Veredas y sitios",
+        QgsMarkerSymbol,
+    )
+
     capas["puntos"] = cargar_capa_puntos(
-        proyecto, os.path.join(carpeta, ARCHIVO_BIODIVERSIDAD)
+        proyecto, localizar(carpeta, ARCHIVO_BIODIVERSIDAD)
     )
 
     # Tus poligonos y puntos, encima de todo lo demas.
@@ -743,24 +893,42 @@ def cargar_capas_area_de_estudio():
     if propias:
         encuadrar(propias[0], propias[0])
     else:
-        encuadrar(capas["puntos"] or capas["municipios"], capas["departamentos"])
+        encuadrar(capas["puntos"] or capas["sitios"] or capas["municipios"],
+                  capas["departamentos"])
 
     print()
     print("=" * 70)
     # El mapa base solo cuenta si se pidio: con MOSTRAR_MAPA_BASE en False no
     # es una capa que falte, es una capa que no se queria.
-    esperadas = 3 + (1 if MOSTRAR_MAPA_BASE else 0)
+    # Se cuentan tambien la red hidrica y los sitios. Sin ellas, el resumen
+    # decia "2 de 3 capas" despues de haber cargado cinco, y quien leyera eso
+    # pensaria que le falta la mitad del mapa.
+    esperadas = 5 + (1 if MOSTRAR_MAPA_BASE else 0)
     del_sistema = [capas["base"], capas["departamentos"],
-                   capas["municipios"], capas["puntos"]]
+                   capas["municipios"], capas.get("hidrografia"),
+                   capas.get("sitios"), capas["puntos"]]
     cargadas = len([c for c in del_sistema if c is not None])
     propias = len(capas["capas_propias"]) + len(capas["imagenes_propias"])
 
     print(f"  Carga finalizada: {cargadas} de {esperadas} capas del sistema"
           + (f" + {propias} capas propias." if propias else "."))
 
-    if capas["municipios"] is None or capas["puntos"] is None:
-        print("  Faltan capas del area de estudio. Generala en la interfaz")
-        print("  web (pestana 'Area de Estudio') y vuelve a ejecutar.")
+    # Se distingue QUE falta. Antes, con el area ya generada pero sin CSV de
+    # biodiversidad, el script decia "falta el area de estudio, generala" --
+    # mandando a rehacer algo que estaba hecho. Y el CSV dejo de generarse
+    # cuando esa pestana paso a delimitar la cuenca en vez de filtrar
+    # registros por departamento, asi que ese aviso saltaba siempre.
+    if capas["municipios"] is None:
+        print("  Falta el area de estudio. Generala en la interfaz web")
+        print("  (pestana 'Area de Estudio') y vuelve a ejecutar.")
+    elif capas["puntos"] is None and not capas.get("sitios"):
+        print(f"  No hay '{ARCHIVO_BIODIVERSIDAD}' ni veredas, asi que el mapa")
+        print("  sale con el contorno y nada dentro. Las veredas y la red")
+        print("  hidrica se extraen del mismo archivo que delimita el area,")
+        print("  en la pestana 'Area de Estudio'.")
+    elif capas["puntos"] is None:
+        print(f"  Sin '{ARCHIVO_BIODIVERSIDAD}': no se dibujaron registros de")
+        print("  biodiversidad. Es opcional, y el resto del mapa esta completo.")
 
     if not propias:
         print(f"  Para anadir tus propias capas (poligonos, formularios de")

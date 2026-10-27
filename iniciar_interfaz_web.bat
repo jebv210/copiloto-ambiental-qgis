@@ -33,6 +33,25 @@ if not defined PY (
 
 echo Interprete detectado: %PY%
 echo.
+echo Comprobando la clave de Gemini...
+
+if exist "%~dp0.env" (
+    findstr /B /C:"GEMINI_API_KEY=" "%~dp0.env" >nul 2>&1
+    if errorlevel 1 (
+        echo   AVISO: no hay GEMINI_API_KEY en el archivo .env.
+        echo          El agente respondera con el motor de reglas, sin bibliografia.
+        echo          Consigue una clave gratuita en https://aistudio.google.com/
+    ) else (
+        echo   Clave encontrada.
+    )
+) else (
+    echo   AVISO: no existe el archivo .env.
+    echo          Copia .env.example a .env y pon tu GEMINI_API_KEY.
+)
+echo.
+
+:arrancar
+echo.
 echo La aplicacion se abrira en: http://localhost:%STREAMLIT_PORT%
 echo Presiona Ctrl+C en esta ventana para cerrarla.
 echo.

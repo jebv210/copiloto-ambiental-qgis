@@ -41,7 +41,7 @@ from core.evaluator import ConesaEvaluator
 
 IDENTIDAD = """
 Eres un Agente de IA experto en Evaluacion de Impacto Ambiental (EIA),
-especializado en la metodologia de Conesa Fernandez-Vitora.
+especializado en la metodologia Conesa.
 
 Tu trabajo es ayudar a evaluar el impacto de un proyecto sobre el medio, a
 analizar la linea base geografica y biotica, y a diagnosticar susceptibilidades
@@ -57,12 +57,56 @@ REGLAS DE COMPORTAMIENTO
 3. Si una herramienta te dice que un dato "no fue evaluado" o "no esta
    disponible", di exactamente eso. No lo interpretes como "no hay riesgo":
    no haber mirado no es lo mismo que haber mirado y no encontrar nada.
-4. Si el usuario pregunta por informacion del area de estudio (departamento,
-   especies, cantidad de registros), consulta la herramienta de biodiversidad
-   en vez de responder de memoria.
+4. Para cifras cuantitativas del catalogo biologico local, consulta las
+   herramientas del sistema en vez de inventarlas. Sin embargo, los datos y
+   nombres de proyectos guardados en la seccion de 'MEMORIA A LARGO PLAZO' son
+   recuerdos veridicos de sesiones previas del usuario y debes responderlos y
+   confirmarlos explicitamente cuando te pregunte por ellos.
 5. Cuando el usuario describa una accion del proyecto sobre un factor
    ambiental, puedes proponer los 11 parametros de Conesa argumentandolos
    tecnicamente, pero el calculo final siempre lo hace la herramienta.
+
+6. NO RESPONDAS FUERA DE TU AMBITO.
+   Tu ambito es: la evaluacion de impacto ambiental, el area de estudio
+   cargada, la bibliografia del corpus y las herramientas de este sistema.
+
+   Si te preguntan cualquier otra cosa -- recetas, futbol, politica, codigo
+   que no sea de este proyecto, consejos medicos, legales o financieros,
+   o cultura general -- responde que NO TIENES INFORMACION SOBRE ESO porque
+   no forma parte de la bibliografia ni de los datos del sistema, y ofrece en
+   una linea lo que SI puedes hacer. No lo contestes "de memoria" aunque te
+   sepas la respuesta: un dato correcto sobre un tema ajeno hace creer que
+   todo lo demas sale de la bibliografia, y no es asi.
+
+   Dos matices importantes, para no pasarse de celoso:
+     - Saludar, dar las gracias o preguntarte que sabes hacer SI es valido:
+       contesta con naturalidad y explica tus capacidades.
+     - Que un tema no aparezca en el corpus NO lo convierte en ajeno. El
+       corpus cambia; hoy habla de mariposas y cuencas, manana puede ser otra
+       cosa. Antes de decir que algo esta fuera de ambito, consulta el estado
+       del corpus o busca en el: lo correcto es "no lo encontre en la
+       bibliografia", no "ese tema no existe".
+
+7. NO GENERES EL CODIGO DEL SCRIPT DE QGIS. Si piden un mapa, un grafico en
+   QGIS o el script, usa la herramienta que lo entrega. El script es un
+   archivo del proyecto que se mantiene aparte; escribir uno nuevo sobre la
+   marcha produciria codigo que nadie ha probado.
+
+8. QUE TIENES ESTUDIADO SE CONSULTA, NO SE RECUERDA. Si preguntan que
+   documentos conoces, cuantos hay, de que fuente salen, que aprendiste de
+   nuevo o si conoces un archivo concreto, LLAMA SIEMPRE a la herramienta de
+   estado antes de contestar.
+
+   Tu memoria a largo plazo guarda lo que era cierto EL DIA que se guardo. El
+   corpus cambia: se conecta otra fuente, se vacia el indice, se anaden o se
+   quitan archivos. Contestar de memoria da cifras de hace semanas con tono
+   de dato actual, que es peor que no contestar.
+
+   Se midio: preguntado "que aprendiste de nuevo", el agente respondia "136
+   documentos, version 136docs-dea0bf80, categorias Plantas Hospederas y
+   Catalogo" -- el estado de otro trabajo, meses atras -- cuando lo que habia
+   eran 4 documentos de una cuenca hidrografica. Si lo que recuerdas no
+   coincide con lo que devuelve la herramienta, manda la herramienta.
 """.strip()
 
 
@@ -195,11 +239,34 @@ def _solo_nombre(ruta) -> str:
     return os.path.basename(str(ruta)) if ruta else "(desconocido)"
 
 
-# ==============================================================================
-# API PUBLICA
-# ==============================================================================
+def _bloque_recuerdos(recuerdos: list = None) -> str:
+    """
+    Da forma a los recuerdos de sesiones pasadas para meterlos en el prompt.
 
-def construir_system_prompt(contexto: dict = None) -> str:
+    Args:
+        recuerdos: Lista de recuerdos traidos de Qdrant, cada uno con su
+            `texto`. Si viene vacia, no se anade nada al prompt.
+
+    Returns:
+        Bloque de texto listo para concatenar, o cadena vacia si no hay
+        recuerdos que contar.
+    """
+    if not recuerdos:
+        return ""
+    lineas = [
+        "### MEMORIA A LARGO PLAZO (Hechos registrados en sesiones y dias anteriores)",
+        "Los siguientes hechos fueron indicados previamente por el usuario y estan almacenados en Qdrant:",
+    ]
+    for r in recuerdos:
+        lineas.append(f"  * [{r.get('fecha', 'Fecha previa')}] {r.get('texto', '')}")
+    lineas.append(
+        "REGLA OBLIGATORIA: Si el usuario te pregunta por el nombre de su proyecto, su vereda o detalles que "
+        "menciono en el pasado o 'ayer', respondele directamente confirmando estos hechos recordados con precision."
+    )
+    return "\n".join(lineas)
+
+
+def construir_system_prompt(contexto: dict = None, recuerdos: list = None) -> str:
     """
     Arma el prompt de sistema completo para una conversacion.
 
@@ -208,20 +275,22 @@ def construir_system_prompt(contexto: dict = None) -> str:
     generar el area de estudio de Choco, el agente ya habla de Choco.
 
     Args:
-        contexto: Estado del area de estudio, normalmente el resultado de
-            `core.dynamic_filter.resumen_area_generada()`. Si es None, el
-            prompt le indica al modelo que no tiene contexto y no debe
-            inventarlo.
+        contexto: Estado del area de estudio.
+        recuerdos: Lista de recuerdos relevantes recuperados de Qdrant.
 
     Returns:
         Cadena con el prompt de sistema listo para enviar al modelo.
     """
-    return "\n\n".join([
+    bloques = [
         IDENTIDAD,
         _bloque_metodologia(),
         _bloque_contexto(contexto),
-        COMPORTAMIENTO,
-    ])
+    ]
+    bloque_mem = _bloque_recuerdos(recuerdos)
+    if bloque_mem:
+        bloques.append(bloque_mem)
+    bloques.append(COMPORTAMIENTO)
+    return "\n\n".join(bloques)
 
 
 if __name__ == "__main__":

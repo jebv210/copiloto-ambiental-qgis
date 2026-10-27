@@ -1,0 +1,21 @@
+# Lo que NO debe entrar en la imagen.
+.git
+.gitignore
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# El corpus se MONTA como volumen, no se copia: anadir un documento no debe
+# obligar a reconstruir la imagen.
+corpus/
+data/
+
+# Material pesado o que no se despliega.
+_archivo/
+documentos/
+*.docx
+*.xlsx
+*.gdb/
+*.zip

@@ -20,6 +20,23 @@ streamlit==1.61.1
 # --- Utilidades ---------------------------------------------------------------
 requests==2.31.0
 python-dotenv==1.2.2           # lectura del archivo .env
+pypdf>=5.0.0                   # lectura de los PDF del corpus.
+                               # El entorno de QGIS trae PyPDF2, que ya no
+                               # se mantiene; core/corpus.py prefiere pypdf
+                               # y cae a PyPDF2 si este no esta instalado.
+
+# --- Lectores del corpus que FALTABAN en el contenedor ------------------------
+# Estos tres estaban en el Python de QGIS, asi que todo funcionaba al probar en
+# el equipo, pero NO en la imagen de Docker, que es donde corre la indexacion.
+#
+# El efecto era invisible y caro: `leer_documento` devolvia una lista vacia en
+# vez de avisar, de modo que cada .xlsx y cada .docx del corpus se trataba como
+# "documento sin texto" y se saltaba. Se midio: los dos Excel de San Carlos
+# llevaban dias con 0 fichas en el indice mientras la sincronizacion informaba
+# de "2 nuevos" y terminaba sin errores.
+openpyxl>=3.1.0                # .xlsx  (lo usa pandas.ExcelFile por debajo)
+xlrd>=2.0.1                    # .xls   (formato antiguo de Excel)
+python-docx>=1.1.0             # .docx  (se importa como 'docx')
 
 # --- Agente de IA -------------------------------------------------------------
 # OJO: el paquete correcto es 'google-genai' (SDK nuevo, import 'from google
@@ -29,6 +46,13 @@ python-dotenv==1.2.2           # lectura del archivo .env
 # usaba el nuevo, asi que el agente nunca podia arrancar en modo IA.
 google-genai>=1.0.0
 
+# --- Lectura del corpus alojado en Google Drive -------------------------------
+# core/fuentes.py (FuenteDrive) importa 'googleapiclient.discovery' y
+# 'google.oauth2.service_account'. El segundo llega de rebote con google-genai
+# (depende de google-auth), pero el primero NO: sin esta linea el contenedor
+# arranca bien y solo falla el dia que se apunta el corpus a Drive.
+google-api-python-client>=2.100.0
+
 # ==============================================================================
 # DEPENDENCIAS QUE APORTA EL ENTORNO DE QGIS  (no se instalan aqui)
 # ==============================================================================
@@ -37,3 +61,12 @@ google-genai>=1.0.0
 # Si se ejecuta el proyecto FUERA de QGIS, hay que instalarlas aparte:
 #   pip install pandas geopandas shapely pyogrio
 # ==============================================================================
+
+# ------------------------------------------------------------------------------
+# BASE VECTORIAL
+# ------------------------------------------------------------------------------
+# Guarda los fragmentos del corpus como vectores para poder buscar por
+# significado ademas de por palabras. Trae un modo EMBEBIDO que escribe en una
+# carpeta del disco, asi que el proyecto arranca sin Docker; en despliegue
+# basta apuntar QDRANT_URL al contenedor.
+qdrant-client>=1.12

@@ -10,6 +10,13 @@ Desktop**.
 
 ---
 
+> **Sobre el origen de los datos.** El sistema habla de «descargas de GBIF»
+> porque ese es el **formato** del archivo de ocurrencias (las columnas
+> `scientificName`, `countryCode`, `decimalLatitude`…). Una descarga del
+> **SiB Colombia** llega en ese mismo formato, porque el SiB publica a través
+> de GBIF. Los informes de la práctica citan el SiB como fuente; el sistema
+> nombra a GBIF como formato. No es una contradicción.
+
 ## 1. Principio de diseño: nada está escrito a mano
 
 El sistema **no trae datos precargados**. No sabe de antemano en qué
@@ -47,7 +54,9 @@ proyecto/
 │   ├── evaluator.py            Fórmula de Conesa y umbrales de severidad
 │   ├── textos.py               Normalización de nombres para comparar
 │   ├── catalogo.py             Descubre columnas y valores del archivo cargado
-│   └── dynamic_filter.py       Genera el área de estudio (capas para QGIS)
+│   ├── dynamic_filter.py       Genera el área de estudio (capas para QGIS)
+│   ├── corpus.py               Bibliografía: ingesta, fichas e índice de búsqueda
+│   └── informes.py             Plantillas de reporte taxonómico e informe científico
 │
 ├── database/
 │   ├── gdb_connector.py        Consultas espaciales (municipio, RUNAP, páramo)
@@ -78,6 +87,13 @@ proyecto/
 │   ├── .gitignore              Excluye secretos, datos pesados y generados
 │   └── .streamlit/config.toml  Límite de subida y telemetría de Streamlit
 │
+├── corpus/                      Bibliografía del agente (no se versiona)
+│   └── LEEME.md                 Cómo organizarla por categorías
+│
+├── documentos/                  Entregables: informes, planes, el Excel
+│   └── LEEME.md                 Qué hay y en qué se diferencia de corpus/
+│   └── LEEME.md                 Cómo organizarla por categorías
+│
 ├── Datos incluidos ──────────────────────────────────────────────────────
 │   ├── colombia_departamentos.geojson  Departamentos (fondo + nombres oficiales)
 │   └── matriz_impactos.csv     Matriz de ejemplo para el cálculo masivo
@@ -103,7 +119,7 @@ control de versiones. Su `LEEME.md` explica de dónde salió cada archivo.
 lo que hay dentro.
 
 El único documento heredado que se quedó en la raíz es
-`informe_impacto_ambiental.md`, por ser un entregable de la práctica. Ojo: sus
+`documentos/informe_impacto_ambiental.md`, por ser un entregable de la práctica. Ojo: sus
 cifras de biodiversidad son de una corrida anterior y no coinciden con los
 datos actuales.
 
@@ -273,6 +289,77 @@ Pestaña **📊 Cálculo Masivo**. Sube tu matriz (hay una plantilla descargable
 `matriz_impactos.csv` sirve de ejemplo). Las filas con errores se reportan una a
 una en lugar de tumbar el archivo completo.
 
+### Paso 2 bis — Conexión a la IA (Gemini en la Nube)
+
+El agente razona con **Gemini** (`gemini-3.5-flash`) en la nube, optimizado para respuestas en 2-4 segundos con cuota amplia, y necesita conexión y una clave gratuita de [Google AI Studio](https://aistudio.google.com/).
+
+```bash
+python test_gemini.py          # comprobar que la clave funciona
+```
+
+| Variable del `.env` | Valor por defecto | Para qué |
+|---|---|---|
+| `GEMINI_API_KEY` | — | Clave de Google AI Studio. Sin ella solo responde el motor de reglas |
+| `MODELO_LLM` | `gemini-3.5-flash` | Modelo de conversación en la nube |
+| `TURNOS_RECORDADOS` | `30` | Capacidad de memoria conversacional previa |
+| `DIMENSIONES_EMBEDDING` | `768` | Tamaño del vector de cada ficha |
+
+**Cuidado con la cuota de embeddings.** La capa gratuita permite **1.000 al
+día** y el corpus necesita unas 14.989 fichas, así que construir el índice
+vectorial desde cero lleva varios días repartidos, o una tarde con la API de
+pago. Las reindexaciones posteriores son baratas porque solo se toca lo que
+cambió. Y mientras el índice no esté, **el sistema funciona igual**: la
+búsqueda cae a BM25 sola.
+
+---
+
+### Paso 7 — Preguntar a la bibliografía
+
+El agente no solo sabe de la Geodatabase y del área de estudio: también puede
+consultar una **bibliografía propia** (catálogos de mariposas, listas de
+chequeo, plantas hospederas y nectaríferas, ciclos de vida, cría, riesgo
+climático).
+
+Los documentos se depositan en `corpus/`, **una subcarpeta por categoría
+temática**. El nombre de la subcarpeta *es* la categoría: igual que con los
+departamentos y las especies, no hay ninguna lista escrita en el código. Se
+admiten PDF, DOCX, TXT, MD y CSV. Las instrucciones completas están en
+[`corpus/LEEME.md`](corpus/LEEME.md).
+
+Con eso cargado, el agente gana seis herramientas:
+
+| Herramienta | Qué hace |
+|---|---|
+| `estado_del_corpus` | Qué documentos hay, en qué categorías y con qué versión |
+| `consultar_corpus` | Busca y responde **citando documento y página** |
+| `buscar_especie_exacta` | Comprueba si un binomio aparece **literalmente** |
+| `reporte_taxonomico_especie` | Reporte Técnico Taxonómico de 6 secciones |
+| `ficha_de_campo` | Ficha breve de una especie, para imprimir |
+| `informe_cientifico_tema` | Informe Científico de 6 secciones sobre un tema |
+
+**Tres reglas que gobiernan este módulo**, y conviene entenderlas antes de
+tocarlo:
+
+1. **La plantilla manda sobre el modelo.** El agente no decide la estructura de
+   un informe ni redacta sus afirmaciones de memoria: `core/informes.py`
+   recupera la evidencia, la coloca en su sección y la entrega ya citada. Si el
+   modelo pudiera rellenar las secciones por su cuenta, no habría forma de
+   distinguir lo documentado de lo supuesto.
+
+2. **Los nombres científicos no admiten aproximación.** `buscar_especie_exacta`
+   exige que las palabras del binomio aparezcan *juntas y en ese orden*.
+   `Magneuptychia` y `Megeuptychia` se diferencian en dos letras y no tienen
+   relación; devolver uno por el otro produce un informe equivocado con
+   apariencia de correcto. Es la misma lección que dejó el filtro geográfico
+   cuando resolvía «Coahuila» a «HUILA».
+
+3. **La ausencia de dato es un resultado.** Una sección sin evidencia lo declara
+   y dice *qué se buscó*. No se rellena ni se omite.
+
+Cada informe lleva estampada la **versión del corpus** (`168docs-a1b2c3d4`).
+Dos informes con el mismo título hechos sobre corpus distintos no son
+comparables, y sin esa marca no se pueden reproducir.
+
 ---
 
 ## 5. Uso desde la línea de comandos
@@ -283,7 +370,13 @@ prefieres dejarlo corriendo.
 
 ```bash
 python -m config.settings                      # ver qué encontró el sistema
+python -m core.corpus                          # estado de la bibliografía cargada
+python -m core.importar                        # fuentes importadas y de dónde salieron
+python -m core.sanear                          # revisa el corpus (duplicados, vacíos)
+python -m core.sanear --aplicar                # y lo sanea
+python -m core.informes "Polites otho"         # reporte taxonómico de una especie
 python -m database.gdb_connector               # qué capa usa para cada consulta
+python probar_corpus.py                        # pruebas del corpus (20 comprobaciones)
 python test_gemini.py                          # probar la conexión con la IA
 python buscar_rutas.py                         # auditar rutas quemadas
 python auditar_documentacion.py                # auditar la documentación
@@ -332,11 +425,11 @@ solo lo que necesites; lo que dejes vacío se descubre automáticamente.
 | Variable | Para qué |
 | :--- | :--- |
 | `GEMINI_API_KEY` | Clave del agente de IA |
-| `MODELO_LLM` | Modelo a usar (por defecto `gemini-2.5-flash`) |
+| `MODELO_LLM` | Modelo a usar (por defecto `gemini-3.5-flash`) |
 | `DATASET_BIODIVERSIDAD` | Ruta del archivo crudo de GBIF |
 | `GDB_PATH` | Ruta de la Geodatabase |
 | `RUTA_MUNICIPIOS_NACIONAL` | Cartografía municipal local (modo sin internet) |
-| `CAPA_PARAMO`, `CAPA_RUNAP`… | Forzar una capa concreta de la Geodatabase |
+| `CAPA_PARAMO`, `CAPA_AREAS_PROTEGIDAS`… | Forzar una capa concreta de la Geodatabase |
 | `API_HOST`, `API_PORT` | Dirección del servidor |
 | `QGIS_PYTHON` | Ruta del intérprete de QGIS |
 
@@ -399,11 +492,14 @@ el sistema guarda una copia local y ya no vuelve a necesitar red.
 
 **"No se pudo actualizar `municipios_filtrados.geojson` porque otro programa lo
 tiene abierto"**
-Tienes QGIS Desktop abierto con esa capa cargada, y Windows no deja
-sobrescribir un archivo en uso. Cierra QGIS —o quita esa capa del panel de
-capas— y vuelve a generar. **No pierdes nada**: el resultado queda guardado
-junto al original con el sufijo `.nuevo`, listo para renombrar si prefieres
-hacerlo a mano.
+Ya no debería ocurrir. Windows no deja *reemplazar* un archivo que otro programa
+tiene abierto, pero sí deja **sobrescribir su contenido**, y eso es lo que hace
+`publicar_archivo`: primero intenta el reemplazo atómico y, si el destino está
+bloqueado, reescribe el archivo en el sitio. **Puedes generar un área nueva con
+QGIS abierto**; basta refrescar la capa para ver el resultado.
+
+Si aun así fallan los dos intentos, el sistema lo dice con un error explícito en
+lugar de dejar un archivo a medias.
 
 **El campo del archivo aparece vacío al abrir la pestaña**
 No se encontró ningún dataset en el disco. El sistema solo propone un archivo
