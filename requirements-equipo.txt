@@ -1,0 +1,44 @@
+# Dependencias para el PYTHON DEL EQUIPO, no para el contenedor.
+# ==============================================================================
+#
+# QUE ES ESTO Y POR QUE ESTA SEPARADO
+# -----------------------------------
+# `requirements.txt` instala lo que necesita la imagen de Docker. Pero hay dos
+# cosas del proyecto que se ejecutan FUERA de los contenedores, en la maquina
+# de quien trabaja:
+#
+#   probar_despliegue.py   comprueba los contenedores desde afuera; por dentro
+#                          no probaria lo mismo
+#   probar_qgis.py         usa el interprete que trae QGIS, no este
+#
+# `probar_despliegue.py` importa `core.memoria`, que importa `core.vectorial`,
+# que importa `qdrant_client`. Y qdrant-client arrastra httpx, que arrastra
+# idna, urllib3, certifi y charset-normalizer.
+#
+# QUE PASA SI FALTAN
+# ------------------
+# Se midio: faltaba `idna` y la comprobacion de Qdrant fallaba con
+# "Qdrant no respondio: se avisa en vez de callar". El mensaje es correcto --
+# Qdrant de verdad no respondio -- pero la causa no era Qdrant ni el sistema:
+# era que la libreria no se podia ni importar en esa maquina. La bateria
+# marcaba 124 de 125 por una razon ajena al proyecto, y eso ensucia la unica
+# senal que dice si el despliegue esta bien.
+#
+# Los cuatro paquetes se descubrieron de uno en uno, cada uno al resolver el
+# anterior. Por eso van escritos aqui: para que nadie repita esa cadena.
+#
+# COMO SE USA
+# -----------
+#   pip install -r requirements-equipo.txt
+#
+# No hace falta en el servidor de produccion salvo que se vayan a pasar ahi
+# las baterias, que es justo lo que recomienda DESPLIEGUE.md.
+
+qdrant-client>=1.9
+requests>=2.31
+
+# Las arrastra httpx, pero se nombran porque fueron las que faltaron.
+idna>=3.4
+urllib3>=2.0
+certifi>=2023.5.7
+charset-normalizer>=3.0

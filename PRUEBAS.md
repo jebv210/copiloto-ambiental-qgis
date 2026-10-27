@@ -61,9 +61,21 @@ Necesita la clave de Gemini en el `.env` (para los embeddings). Comprueba:
 
 ### 3. `probar_despliegue.py` — necesita la pila levantada
 
+Esta batería se ejecuta **desde el equipo, no dentro del contenedor**:
+comprueba los contenedores desde afuera, por HTTP y por Docker. Correrla por
+dentro no prueba lo mismo.
+
 ```bash
 docker compose up -d
+pip install -r requirements-equipo.txt   # solo la primera vez
+python probar_despliegue.py
 ```
+
+Sin esas bibliotecas, la comprobación de Qdrant falla con «Qdrant no
+respondió». El mensaje es correcto —no respondió— pero la causa no es Qdrant
+ni el sistema: es que `qdrant-client` no se puede ni importar en esa máquina.
+Un fallo ajeno al proyecto ensucia la única señal que dice si el despliegue
+está bien.
 
 Comprueba que los contenedores se hablen de verdad:
 

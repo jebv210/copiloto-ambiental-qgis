@@ -364,12 +364,18 @@ algo falló de esa manera.
 contenedor**: comprueba los contenedores desde afuera, por HTTP y por Docker.
 Correrla por dentro no prueba lo mismo.
 
-Necesita `idna` instalado en el Python del servidor; sin él, la comprobación de
-Qdrant falla por una razón que no tiene que ver con el sistema:
+Necesita algunas bibliotecas en el Python del servidor, las que arrastra
+`qdrant-client`. Sin ellas la comprobación de Qdrant falla por una razón que
+no tiene nada que ver con el sistema, y ensucia la única señal que dice si el
+despliegue está bien:
 
 ```bash
-pip install idna
+pip install -r requirements-equipo.txt
 ```
+
+Son cuatro paquetes —`idna`, `urllib3`, `certifi` y `charset-normalizer`— que
+se descubrieron de uno en uno, cada uno al resolver el anterior. Están
+escritos en ese archivo para que nadie repita la cadena.
 
 ### 5.5. Fijar el área de estudio
 
