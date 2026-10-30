@@ -127,6 +127,44 @@ datos actuales.
 
 ## 3. Instalación
 
+### Con Docker (recomendado)
+
+Es como corre el sistema hoy: cuatro contenedores que se levantan juntos. Lo
+único que hace falta instalado es **Docker Desktop**.
+
+```bash
+git clone https://github.com/jebv210/copiloto-ambiental-qgis.git
+cd copiloto-ambiental-qgis
+
+cp .env.example .env          # y escribe dentro tu GEMINI_API_KEY
+docker compose up -d --build  # construye y levanta los cuatro servicios
+sh n8n/importar_flujos.sh     # importa y activa el estudio programado
+```
+
+La interfaz queda en <http://localhost:8501>.
+
+> **`docker compose build api` no basta.** Construye, pero no levanta nada, y
+> solo mira el servicio `api`. `up -d --build` hace las dos cosas y levanta
+> también Qdrant, n8n y la interfaz.
+
+**Tres cosas que el repositorio no puede traer, y hay que poner a mano:**
+
+| Qué | Por qué no viene | Dónde se pone |
+| :--- | :--- | :--- |
+| `GEMINI_API_KEY` | Es un secreto | En el `.env` |
+| Acceso a Google Drive | Cada persona usa su propia cuenta | Pestaña **Drive y Estudio**: ID de cliente y secreto de OAuth |
+| Los documentos a estudiar | Viven en Drive, no en el repositorio | La carpeta de Drive debe estar compartida con esa cuenta |
+
+Sin la clave de Gemini el sistema arranca igual, pero **toda búsqueda devuelve
+cero** y el estado lo dice con todas las letras: *«Hay N fichas indexadas, pero
+falta GEMINI_API_KEY»*.
+
+El área de estudio **sí viene** en el repositorio (`data/`), junto con el
+archivo del que salió, así que QGIS funciona desde el primer momento sin
+configurar nada.
+
+### Sin Docker, con el Python de QGIS
+
 La aplicación usa el intérprete de Python de **QGIS Desktop**, que ya trae
 GeoPandas, Shapely y Pyogrio compilados y funcionando en Windows.
 
