@@ -911,11 +911,46 @@ MAXIMO_CATEGORIAS = 60
 
 #: Tope de lineas del resumen. Sin el, una tabla con muchas columnas
 #: categoricas produciria un resumen tan largo como el problema que resuelve.
-MAXIMO_LINEAS_RESUMEN = 400
+#:
+#: POR QUE 1.200 Y NO 400
+#: ----------------------
+#: Con 400 se medio lo que costaba: la capa de ecosistemas tiene 31 columnas
+#: que merecen reparto y solo entraban 26. Las cinco que se quedaban fuera
+#: eran no_anfibio, no_aves, no_magnoli, no_mamifer y no_reptile: en un
+#: proyecto ambiental, justo las que mas importan. Y se caian sin decirlo.
+#:
+#: 1.200 cubre esa capa entera con holgura y sigue acotando el caso malo.
+#: Cuando aun asi no quepa, el resumen NOMBRA las columnas que faltan en
+#: vez de recortarlas en silencio.
+MAXIMO_LINEAS_RESUMEN = 1200
 
 #: Nombres que suelen contener una magnitud que conviene sumar.
 COLUMNAS_SUMABLES = ("area_ha", "area", "superficie", "hectareas", "ha",
                      "longitud", "length", "shape_area", "area_km2")
+
+
+def _miles(numero) -> str:
+    """
+    Escribe un numero con punto de millar, como se usa en Colombia.
+
+    POR QUE UNA FUNCION Y NO UN `.replace`
+    --------------------------------------
+    Antes el separador se arreglaba aplicando `.replace(",", ".")` a la linea
+    entera. Pero los literales de texto adyacentes se pegan ANTES de llamar al
+    metodo, asi que el reemplazo alcanzaba tambien las comas de la frase y
+    salian resumenes que decian "no se indexa fila a fila. se resume" y
+    "24.187 registros. 488.818 area_ha". Formatear solo el numero deja la
+    prosa en paz.
+
+    Args:
+        numero: Entero o decimal a escribir.
+
+    Returns:
+        El numero en texto, con punto cada tres cifras.
+    """
+    if isinstance(numero, float):
+        return f"{numero:,.0f}".replace(",", ".")
+    return f"{numero:,}".replace(",", ".")
 
 
 def _es_numero(valor) -> bool:
@@ -935,7 +970,387 @@ def _es_numero(valor) -> bool:
         return False
 
 
-def resumir_tabla(ruta: str, maximo_filas: int = 2_000_000) -> dict:
+#: Formatos que se pueden recorrer ENTEROS y resumir agregando, sin gastar
+#: cuota del modelo. Es la lista que decide si un archivo grande "entra
+#: resumido" o se queda sin analizar.
+#:
+#: Que un formato este aqui significa que existe un lector que lo recorre
+#: fila a fila SIN cargarlo en memoria. Para los de texto es el lector de
+#: CSV; para Excel es openpyxl en modo `read_only`, que va devolviendo filas
+#: segun las lee del ZIP en vez de construir el libro completo.
+FORMATOS_RESUMIBLES = {".csv", ".tsv", ".txt", ".xlsx", ".xlsm", ".xls"}
+
+#: Media maxima de palabras por celda para considerar que algo es una tabla.
+#:
+#: Se midio sobre los archivos del proyecto: la capa de POMCAS da 1,45
+#: palabras por celda (23 columnas) y la de ecosistemas, 418 MB, da 2,01 (48
+#: columnas). Un informe de prosa partido por sus comas da 8,00. El 4 queda
+#: justo en medio: deja sitio a una columna de observaciones corta y no deja
+#: pasar un texto corrido.
+MAXIMO_PALABRAS_POR_CELDA = 4.0
+
+#: Version del formato del resumen. Se sube cuando cambia lo que escribe
+#: `resumir_tabla`.
+#:
+#: POR QUE HACE FALTA
+#: ------------------
+#: El resumen de una capa de 418 MB se guarda en disco para no volver a
+#: bajarla cada noche. Pero ese archivo guardado no sabia de que version
+#: era, asi que sobrevivia a cualquier arreglo del resumidor. Se vio: tres
+#: correcciones -- decir "COMPLETA" solo cuando se leyo completa, avisar al
+#: cortar por el tope, y no romper las comas de la frase al poner los
+#: puntos de millar -- no llegaban a las cuatro capas del proyecto porque
+#: sus resumenes eran del 25 de octubre y nadie los volvia a calcular.
+#:
+#: Con la version dentro, un resumen viejo se descarta solo y se rehace.
+VERSION_RESUMEN = 6
+
+#: Cuantas filas como mucho se recorren de una tabla.
+#:
+#: POR QUE EXISTE UN TOPE SI LA PROMESA ES "COMPLETO"
+#: --------------------------------------------------
+#: Porque recorrer cuesta tiempo, no cuota. Se midio sobre la capa real de
+#: ecosistemas, de 417,8 MB: 460.350 filas en 27,7 segundos, o sea 16.619
+#: filas por segundo y 15 MB/s, con el pico de memoria subiendo solo 67 MB.
+#: Un tope existe para que un archivo corrupto o absurdamente grande no deje
+#: la sincronizacion nocturna colgada hasta el amanecer.
+#:
+#: Pero el tope NO miente. Si se alcanza, el resumen lo dice con todas las
+#: letras y deja de afirmar que recorrio la tabla entera. Antes decia
+#: "COMPLETA" pasara lo que pasara, que es la clase de afirmacion que luego
+#: el agente repite como verdad.
+#:
+#: Se sube con `MAXIMO_FILAS_RESUMEN` en el .env, sin tocar codigo. A la
+#: velocidad medida, veinte millones de filas son unos 20 minutos de
+#: lectura, que un cron de las 2 de la manana se puede permitir; la capa mas
+#: grande del proyecto tiene 460.350 filas, asi que el margen es de
+#: cuarenta veces.
+MAXIMO_FILAS_RESUMEN = int(os.environ.get("MAXIMO_FILAS_RESUMEN")
+                           or 20_000_000)
+
+
+def parece_tabla(ruta: str) -> bool:
+    """
+    Dice si un archivo es de verdad una tabla, mirando su contenido.
+
+    POR QUE NO BASTA LA EXTENSION
+    -----------------------------
+    `.txt` esta en `FORMATOS_RESUMIBLES` porque muchas capas de datos llegan
+    con esa extension. Pero un informe de prosa tambien es `.txt`, y
+    resumirlo "agrupando por columnas" no tiene ningun sentido: saldria un
+    recuento de valores sobre una cabecera que no existe, y el informe
+    quedaria descrito como una tabla de una columna. Se vio en la bateria:
+    un .txt de 3 MB de prosa se colaba por el desvio de tablas grandes.
+
+    Lo que distingue una tabla no es la extension, es la REGULARIDAD: el
+    mismo separador repetido el mismo numero de veces, fila tras fila. Eso
+    es lo que se comprueba aqui, sobre el principio del archivo.
+
+    Un libro de Excel se da por tabla sin mirar: es una rejilla de celdas por
+    construccion.
+
+    Args:
+        ruta: Archivo ya descargado.
+
+    Returns:
+        True si sus primeras lineas comparten estructura de columnas.
+    """
+    extension = os.path.splitext(ruta)[1].lower()
+    if extension in (".xlsx", ".xlsm", ".xls"):
+        return True
+
+    try:
+        with open(ruta, encoding="utf-8-sig", errors="replace") as fh:
+            principio = fh.read(64 * 1024)
+    except OSError:
+        return False
+
+    filas = [f for f in principio.splitlines() if f.strip()][:200]
+    # La ultima puede venir cortada por la mitad del bloque leido.
+    if len(filas) > 3:
+        filas = filas[:-1]
+    if len(filas) < 3:
+        return False
+
+    for separador in (",", ";", chr(9), "|"):
+        cuentas = [f.count(separador) for f in filas]
+        con_columnas = [c for c in cuentas if c >= 1]
+        if len(con_columnas) < 3:
+            continue
+        mas_comun = max(set(con_columnas), key=con_columnas.count)
+        if con_columnas.count(mas_comun) < max(3, len(filas) * 0.6):
+            continue
+
+        # LA REGULARIDAD DEL SEPARADOR NO BASTA
+        # -------------------------------------
+        # Se midio: un informe de prosa con la misma frase repetida tiene el
+        # MISMO numero de comas en cada linea, asi que pasaba este filtro y
+        # se resumia como si fuera una tabla.
+        #
+        # Lo que de verdad separa una celda de una frase es cuanto cabe
+        # dentro. Una celda trae un dato -- "El Jordan", "Bosque denso",
+        # "12.5" --, entre una y tres palabras. Una oracion partida por sus
+        # comas deja trozos de siete u ocho. Se mide eso.
+        palabras, campos = 0, 0
+        for fila in filas:
+            if fila.count(separador) != mas_comun:
+                continue
+            for campo in fila.split(separador):
+                campos += 1
+                palabras += len(campo.split())
+        if campos and palabras / campos <= MAXIMO_PALABRAS_POR_CELDA:
+            return True
+    return False
+
+
+def _filas_de_texto(ruta: str):
+    """
+    Abre una tabla de texto y devuelve sus columnas y un generador de filas.
+
+    Args:
+        ruta: Archivo .csv, .tsv o .txt ya descargado.
+
+    Returns:
+        Tupla `(columnas, generador_de_filas, nota)`. Cada fila es un
+        diccionario columna -> valor.
+    """
+    import csv
+
+    columnas, delimitador = leer_encabezado(ruta)
+
+    def filas():
+        with open(ruta, encoding="utf-8-sig", errors="replace",
+                  newline="") as fh:
+            for fila in csv.DictReader(fh, delimiter=delimitador):
+                yield fila
+
+    return columnas, filas(), ""
+
+
+#: Cuantas filas se miran como mucho buscando la cabecera de una hoja.
+FILAS_PARA_BUSCAR_CABECERA = 12
+
+#: Celdas con contenido que debe tener una fila para ser cabecera.
+#:
+#: Una fila de titulo trae UNA celda -- "DISTRIBUCION DE POBLACION Y AREA
+#: POR VEREDAS - SAN CARLOS" -- y a veces una segunda de subtitulo. Una
+#: cabecera de verdad nombra varias columnas.
+MINIMO_CELDAS_CABECERA = 2
+
+
+def _buscar_cabecera(hoja) -> tuple:
+    """
+    Localiza en que fila empieza de verdad la tabla de una hoja.
+
+    POR QUE NO VALE LA PRIMERA FILA
+    -------------------------------
+    Una hoja hecha por una persona casi nunca empieza por la cabecera.
+    Se midio en las tablas consolidadas de la cuenca del proyecto:
+
+        fila 1: DISTRIBUCION DE POBLACION Y AREA POR VEREDAS - SAN CARLOS
+        fila 2: Tabla procesada de la capa ...
+        fila 3: (vacia)
+        fila 4: N | Nombre de la Vereda | Poblacion | Area | Densidad
+
+    Tomando la fila 1 como cabecera, la hoja entraba al indice con UNA
+    columna llamada como el titulo y ningun dato aprovechable. Cuatro hojas
+    del libro estaban asi: el agente las habia "estudiado" y no sabia nada
+    de ellas.
+
+    COMO SE DECIDE
+    --------------
+    La cabecera es la primera fila con al menos dos celdas con contenido
+    que vaya SEGUIDA de otra igual de ancha. Lo segundo importa: sin eso,
+    un titulo repartido en dos celdas se tomaria por cabecera.
+
+    Args:
+        hoja: Hoja abierta de openpyxl en modo lectura.
+
+    Returns:
+        Tupla `(numero_de_fila, celdas)`, con la fila en base 1. Si no se
+        encuentra nada, `(1, ())`.
+    """
+    vistas = []
+    for numero, fila in enumerate(
+            hoja.iter_rows(max_row=FILAS_PARA_BUSCAR_CABECERA,
+                           values_only=True), start=1):
+        llenas = sum(1 for c in fila if c is not None and str(c).strip())
+        vistas.append((numero, fila, llenas))
+
+    for indice, (numero, fila, llenas) in enumerate(vistas):
+        if llenas < MINIMO_CELDAS_CABECERA:
+            continue
+        siguiente = vistas[indice + 1] if indice + 1 < len(vistas) else None
+        if siguiente and siguiente[2] >= MINIMO_CELDAS_CABECERA:
+            return numero, fila
+    # Ninguna fila cumple: se devuelve la primera que tuviera algo, y si no
+    # hay ninguna, la hoja esta vacia de verdad.
+    for numero, fila, llenas in vistas:
+        if llenas:
+            return numero, fila
+    return 1, ()
+
+
+def _filas_de_excel(ruta: str):
+    """
+    Abre un libro de Excel en modo lectura y devuelve columnas y filas.
+
+    POR QUE `read_only`
+    -------------------
+    Un .xlsx es un ZIP con un XML por hoja. Abrirlo del modo normal construye
+    en memoria un objeto por celda: un libro de 400 MB comprimido se convierte
+    en varios gigas de RAM y tumba el contenedor. En modo `read_only` openpyxl
+    recorre el XML en streaming y va soltando las filas, asi que la memoria no
+    depende del tamano del libro.
+
+    POR QUE SE PEGAN LAS HOJAS
+    --------------------------
+    Un libro suele traer la misma tabla partida por anos o por zonas. Para el
+    resumen agregado interesa el total, asi que las filas de todas las hojas
+    se tratan como una sola tabla y se anade la columna `__hoja__` para no
+    perder de donde salio cada una: asi el reparto se puede pedir por hoja.
+
+    Las columnas se toman de la PRIMERA hoja. Si otra hoja trae columnas
+    distintas, sus valores se ignoran en el reparto, pero sus filas se siguen
+    contando: el recuento total sigue siendo exacto.
+
+    Args:
+        ruta: Libro .xlsx, .xlsm o .xls ya descargado.
+
+    Returns:
+        Tupla `(columnas, generador_de_filas, nota)`. La nota avisa si el
+        libro traia varias hojas.
+    """
+    import openpyxl
+
+    libro = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+    hojas = list(libro.sheetnames)
+
+    # CADA HOJA TIENE SU PROPIA CABECERA
+    # ----------------------------------
+    # Antes se tomaban las columnas de la primera hoja y se aplicaban a
+    # todas. En un libro donde cada hoja es la MISMA tabla partida por
+    # anos, eso funciona. En el libro real del proyecto no: la hoja 1 es
+    # un resumen ejecutivo y la 2 es poblacion por vereda, con columnas
+    # distintas. Los nombres de vereda acababan etiquetados como "VALOR
+    # CONSOLIDADO", que es peor que no tener etiqueta: es una etiqueta
+    # falsa.
+    #
+    # Ahora la lista de columnas es la UNION de las de todas las hojas, y
+    # cada fila trae solo las suyas. Agrupar por una columna que una hoja
+    # no tiene simplemente no cuenta sus filas, que es lo correcto.
+    cabeceras = {}
+    columnas = []
+    for nombre_hoja in hojas:
+        fila_cab, celdas = _buscar_cabecera(libro[nombre_hoja])
+        propias = [str(c).strip() if c is not None else "" for c in celdas]
+        propias = [c for c in propias if c]
+        cabeceras[nombre_hoja] = (fila_cab, propias)
+        for c in propias:
+            if c not in columnas:
+                columnas.append(c)
+    libro.close()
+
+    if not columnas:
+        return [], iter(()), "el libro esta vacio"
+
+    def filas():
+        # Se vuelve a abrir porque en modo `read_only` el libro no se puede
+        # recorrer dos veces: el iterador del XML ya se consumio al leer la
+        # cabecera.
+        wb = openpyxl.load_workbook(ruta, read_only=True, data_only=True)
+        try:
+            for nombre_hoja in hojas:
+                hoja = wb[nombre_hoja]
+                suya, propias = cabeceras[nombre_hoja]
+                for numero, valores in enumerate(
+                        hoja.iter_rows(values_only=True), start=1):
+                    if numero <= suya:
+                        continue  # titulo y cabecera no son datos
+                    fila = {"__hoja__": nombre_hoja}
+                    for columna, valor in zip(propias, valores):
+                        fila[columna] = ("" if valor is None
+                                         else str(valor).strip())
+                    yield fila
+        finally:
+            wb.close()
+
+    nota = ""
+    if len(hojas) > 1:
+        nota = (f"El libro trae {len(hojas)} hojas y se recorren todas: "
+                + ", ".join(hojas[:8]))
+    return ["__hoja__"] + columnas, filas(), nota
+
+
+def _agregar(columnas: list, filas_iter, maximo_filas: int) -> dict:
+    """
+    Recorre las filas contando valores por columna y sumando magnitudes.
+
+    Es el nucleo compartido: da igual si las filas vienen de un CSV o de un
+    Excel, porque llegan como diccionarios. Anadir un formato nuevo es
+    escribir su lector, no repetir este conteo.
+
+    Args:
+        columnas: Nombres de columna a vigilar.
+        filas_iter: Iterable de diccionarios columna -> valor.
+        maximo_filas: Tope de filas a recorrer, por prudencia.
+
+    Returns:
+        Diccionario con `conteos`, `sumas`, `filas`, `sumable`, `utiles` y
+        `error`.
+    """
+    from collections import Counter, defaultdict
+
+    conteos = {c: Counter() for c in columnas}
+    sumas = {c: defaultdict(float) for c in columnas}
+    descartadas = set()
+    sumable = next((c for c in columnas
+                    if c.strip().lower() in COLUMNAS_SUMABLES), None)
+
+    filas = 0
+    truncado = False
+    error = ""
+    try:
+        for fila in filas_iter:
+            filas += 1
+            if filas > maximo_filas:
+                # Se alcanzo el tope. Importa DECIRLO: el resumen afirma
+                # haber recorrido la tabla completa, y a partir de aqui
+                # dejaria de ser verdad.
+                truncado = True
+                filas -= 1
+                break
+            magnitud = 0.0
+            if sumable and _es_numero(fila.get(sumable)):
+                magnitud = float(fila[sumable])
+            for columna in columnas:
+                if columna in descartadas:
+                    continue
+                valor = (fila.get(columna) or "")
+                valor = valor.strip() if isinstance(valor, str) else str(valor)
+                if not valor:
+                    continue
+                conteos[columna][valor] += 1
+                if magnitud:
+                    sumas[columna][valor] += magnitud
+                # En cuanto una columna se pasa de categorias deja de
+                # mirarse: es un identificador, no una clasificacion.
+                if len(conteos[columna]) > MAXIMO_CATEGORIAS:
+                    descartadas.add(columna)
+                    conteos[columna].clear()
+                    sumas[columna].clear()
+    except Exception as exc:
+        error = str(exc)[:160]
+
+    utiles = [c for c in columnas
+              if c not in descartadas
+              and 1 < len(conteos[c]) <= MAXIMO_CATEGORIAS]
+    return {"conteos": conteos, "sumas": sumas, "filas": filas,
+            "sumable": sumable, "utiles": utiles, "error": error,
+            "truncado": truncado}
+
+
+def resumir_tabla(ruta: str, maximo_filas: int = None) -> dict:
     """
     Recorre una tabla entera y la resume agrupando por sus columnas.
 
@@ -954,67 +1369,56 @@ def resumir_tabla(ruta: str, maximo_filas: int = 2_000_000) -> dict:
     Una fila suelta de esa tabla no significa nada para una busqueda por
     significado; el agregado si.
 
+    QUE SIGNIFICA "POR COMPLETO"
+    ----------------------------
+    Se leen TODAS las filas del archivo, no una muestra. Lo que se recorta es
+    el resumen que sale, no la lectura que entra: el recuento de filas y las
+    sumas son exactos sobre el archivo entero. Vale igual para un CSV que
+    para un libro de Excel con varias hojas.
+
     Args:
-        ruta: Archivo tabular ya descargado.
-        maximo_filas: Tope de filas a recorrer, por prudencia.
+        ruta: Archivo tabular ya descargado (.csv, .tsv, .txt, .xlsx, .xls).
+        maximo_filas: Tope de filas a recorrer. Por omision,
+            `MAXIMO_FILAS_RESUMEN`, que se ajusta desde el .env.
 
     Returns:
         Diccionario con `lineas` (el resumen, listo para indexar), `filas`,
         `columnas_resumidas` y `segundos`. Si no se pudo leer, `lineas` viene
         vacia y `error` explica por que.
     """
-    import csv
     import time
-    from collections import Counter, defaultdict
 
+    if maximo_filas is None:
+        maximo_filas = MAXIMO_FILAS_RESUMEN
     arranque = time.time()
-    try:
-        columnas, delimitador = leer_encabezado(ruta)
-    except Exception as exc:
-        return {"lineas": [], "filas": 0, "columnas_resumidas": [],
-                "segundos": 0.0, "error": str(exc)[:160]}
+    extension = os.path.splitext(ruta)[1].lower()
+    # El nombre del temporal lleva prefijo; para elegir lector hay que mirar
+    # la extension real, que en los temporales se conserva al final.
+    if extension in (".xlsx", ".xlsm", ".xls"):
+        abrir = _filas_de_excel
+    else:
+        abrir = _filas_de_texto
 
-    # Se cuentan valores por columna y, si hay una magnitud sumable, se suma.
-    conteos = {c: Counter() for c in columnas}
-    sumas = {c: defaultdict(float) for c in columnas}
-    descartadas = set()
-    sumable = next((c for c in columnas
-                    if c.strip().lower() in COLUMNAS_SUMABLES), None)
-
-    filas = 0
-    try:
-        with open(ruta, encoding="utf-8-sig", errors="replace",
-                  newline="") as fh:
-            lector = csv.DictReader(fh, delimiter=delimitador)
-            for fila in lector:
-                filas += 1
-                if filas > maximo_filas:
-                    break
-                magnitud = 0.0
-                if sumable and _es_numero(fila.get(sumable)):
-                    magnitud = float(fila[sumable])
-                for columna in columnas:
-                    if columna in descartadas:
-                        continue
-                    valor = (fila.get(columna) or "").strip()
-                    if not valor:
-                        continue
-                    conteos[columna][valor] += 1
-                    if magnitud:
-                        sumas[columna][valor] += magnitud
-                    # En cuanto una columna se pasa de categorias deja de
-                    # mirarse: es un identificador, no una clasificacion.
-                    if len(conteos[columna]) > MAXIMO_CATEGORIAS:
-                        descartadas.add(columna)
-                        conteos[columna].clear()
-                        sumas[columna].clear()
-    except Exception as exc:
+    def fallo(mensaje, filas=0):
         return {"lineas": [], "filas": filas, "columnas_resumidas": [],
                 "segundos": round(time.time() - arranque, 1),
-                "error": str(exc)[:160]}
+                "error": mensaje[:160]}
 
-    utiles = [c for c in columnas
-              if c not in descartadas and 1 < len(conteos[c]) <= MAXIMO_CATEGORIAS]
+    try:
+        columnas, filas_iter, nota = abrir(ruta)
+    except Exception as exc:
+        return fallo(str(exc))
+
+    if not columnas:
+        return fallo(nota or "no se encontraron columnas")
+
+    agregado = _agregar(columnas, filas_iter, maximo_filas)
+    if agregado["error"] and agregado["filas"] == 0:
+        return fallo(agregado["error"])
+
+    filas = agregado["filas"]
+    sumable = agregado["sumable"]
+    conteos, sumas = agregado["conteos"], agregado["sumas"]
 
     # El nombre va sin el prefijo del temporal: la ficha la lee una persona y
     # "_resumir_e_eccmc_100K_2024.csv" no es el nombre de su archivo.
@@ -1022,27 +1426,69 @@ def resumir_tabla(ruta: str, maximo_filas: int = 2_000_000) -> dict:
     for marca in ("_resumir_", "_estimar_", "_muestra_"):
         if visible.startswith(marca):
             visible = visible[len(marca):]
+    if agregado["truncado"]:
+        # Nunca se dice "completa" si no se leyo completa. El tope existe por
+        # prudencia, pero afirmar lo que no se ha hecho es peor que el tope.
+        alcance = (f"Se leyeron las primeras {_miles(filas)} filas y ahi se "
+                   f"corto por el tope de prudencia: el reparto de abajo NO "
+                   f"cubre la tabla entera.")
+    else:
+        alcance = ("Se recorrio COMPLETA; no se indexa fila a fila, se "
+                   "resume agrupando.")
     lineas = [f"[Resumen de {visible}]",
-              f"Tabla de {filas:,} filas y {len(columnas)} columnas. "
-              f"No se indexa fila a fila: se resume agrupando.".replace(",", ".")]
+              f"Tabla de {_miles(filas)} filas y {len(columnas)} columnas. "
+              f"{alcance}"]
+    if nota:
+        lineas.append(nota)
     if sumable:
         lineas.append(f"Las cantidades se suman sobre la columna '{sumable}'.")
 
-    for columna in utiles:
+    # UNA COLUMNA EMPEZADA NO ES UNA COLUMNA CONTADA
+    # ----------------------------------------------
+    # El primer intento apuntaba la columna como escrita nada mas poner su
+    # cabecera. Pero el tope puede caer a mitad de sus valores, y entonces
+    # queda un "Reparto por X:" con tres de sus cuarenta categorias y nadie
+    # avisa. Media verdad presentada como entera es peor que un hueco
+    # declarado. Solo cuenta como completa la que escribio TODOS sus
+    # valores.
+    completas = []
+    for columna in agregado["utiles"]:
         if len(lineas) >= MAXIMO_LINEAS_RESUMEN:
             break
         lineas.append("")
         lineas.append(f"Reparto por {columna}:")
+        cortada = False
         for valor, cuantas in conteos[columna].most_common(MAXIMO_CATEGORIAS):
             if len(lineas) >= MAXIMO_LINEAS_RESUMEN:
+                cortada = True
                 break
             total = sumas[columna].get(valor, 0.0)
             if total:
-                lineas.append(f"  {valor}: {cuantas:,} registros, "
-                              f"{total:,.0f} {sumable}".replace(",", "."))
+                lineas.append(f"  {valor}: {_miles(cuantas)} registros, "
+                              f"{_miles(total)} {sumable}")
             else:
-                lineas.append(f"  {valor}: {cuantas:,} registros"
-                              .replace(",", "."))
+                lineas.append(f"  {valor}: {_miles(cuantas)} registros")
+        if not cortada:
+            completas.append(columna)
 
-    return {"lineas": lineas, "filas": filas, "columnas_resumidas": utiles,
-            "segundos": round(time.time() - arranque, 1), "error": ""}
+    # SI NO CUPO TODO, SE DICE QUE FALTA
+    # ----------------------------------
+    # Recortar es aceptable; recortar sin avisar no. Quien lea este resumen
+    # tiene que poder saber que de esas columnas no se le esta contando
+    # nada, en vez de concluir que la tabla no las trae.
+    sin_sitio = [c for c in agregado["utiles"] if c not in completas]
+    if sin_sitio:
+        lineas.append("")
+        lineas.append(
+            f"NO CABEN enteros en este resumen los repartos de: "
+            f"{', '.join(sin_sitio)}. La tabla SI trae esas columnas; lo "
+            f"que falta, entero o en parte, es su desglose, por el tope de "
+            f"longitud del resumen.")
+
+    return {"lineas": lineas, "filas": filas,
+            "columnas_resumidas": agregado["utiles"],
+            "columnas_sin_sitio": sin_sitio,
+            "segundos": round(time.time() - arranque, 1),
+            "truncado": agregado["truncado"],
+            "version": VERSION_RESUMEN,
+            "error": agregado["error"]}

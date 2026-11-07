@@ -86,7 +86,7 @@ def _punto_de_gpkg(blob: bytes) -> tuple:
         # de interpretar como latitud el numero de vertices de la linea.
         if tipo == 1:                                   # Point
             lon, lat = struct.unpack(orden + "dd", wkb[5:21])
-            return lon, lat
+            return lon, lat, False
         if tipo == 2:                                   # LineString
             # De un recorrido se toma el primer vertice: es donde empezo. Un
             # recorrido entero no se puede reducir a un punto, pero su inicio
@@ -95,7 +95,12 @@ def _punto_de_gpkg(blob: bytes) -> tuple:
             if cuantos < 1:
                 return None
             lon, lat = struct.unpack(orden + "dd", wkb[9:25])
-            return lon, lat
+            # El tercer valor dice que esto NO es un punto propio sino el
+            # arranque de un recorrido. Importa despues: un recorrido que
+            # empieza fuera del area es normal -- una quebrada nace donde
+            # nace -- y no puede invalidar los datos como lo haria una
+            # ficha de campo tomada fuera.
+            return lon, lat, True
         return None                                     # poligonos y demas
     except (IndexError, KeyError, struct.error, TypeError):
         return None
@@ -165,6 +170,7 @@ def _leer_gpkg(ruta: str) -> dict:
                 "capa": tabla,
                 "lon": par[0],
                 "lat": par[1],
+                "recorrido": par[2],
                 "titulo": (datos.get(etiqueta) or "") if etiqueta else "",
                 "nota": (datos.get(nota) or "") if nota else "",
                 "fecha": (datos.get(cuando) or "") if cuando else "",
@@ -274,13 +280,269 @@ def _leer_tabla(ruta: str) -> dict:
     }
 
 
+#: Columnas del .dbf de las que sale el titulo de un registro, por orden de
+#: preferencia. Se comparan en minusculas y por su PRINCIPIO, porque el
+#: formato shapefile corta los nombres a 10 caracteres: en el formulario de
+#: mariposas del equipo, "Nombre cientifico" quedo como "Nombre cie".
+CAMPOS_TITULO = ("nombre cie", "nombre com", "especie", "nombre", "title",
+                 "name", "titulo")
+
+#: De donde sale la nota u observacion.
+CAMPOS_NOTA = ("notas", "nota", "observ", "obser", "note", "descripcion",
+               "comentario", "habitat")
+
+#: De donde sale la fecha.
+CAMPOS_FECHA = ("fecha", "date", "timestamp", "hora")
+
+
+def _buscar_campos(nombres: list, preferencias: tuple) -> list:
+    """
+    Ordena las columnas que encajan, de la mas preferida a la menos.
+
+    POR QUE DEVUELVE VARIAS Y NO UNA
+    --------------------------------
+    Porque una ficha de campo reparte lo mismo en columnas distintas segun
+    quien la rellene. Se midio en el formulario del equipo: 19 registros
+    traen "Nombre cientifico" y 23 traen "Nombre comun", pero solo 26
+    traen alguno de los dos. Quedandose con la primera columna, el
+    validador avisaba de 35 registros "sin identificar" cuando en realidad
+    eran 31, y culpaba a la ingeniera de un hueco que no existia.
+
+    De las columnas que encajan se toma, para cada registro, el primer
+    valor que no venga vacio.
+
+    Args:
+        nombres: Nombres de columna tal como vienen del .dbf.
+        preferencias: Principios de nombre buscados, por orden.
+
+    Returns:
+        Lista de nombres de columna, en orden de preferencia.
+    """
+    bajos = [(n.lower().strip(), n) for n in nombres]
+    elegidas = []
+    for quiero in preferencias:
+        for bajo, original in bajos:
+            if bajo.startswith(quiero) and original not in elegidas:
+                elegidas.append(original)
+    return elegidas
+
+
+def _primer_valor(atributos: dict, columnas: list) -> str:
+    """
+    Devuelve el primer valor con contenido de una lista de columnas.
+
+    Args:
+        atributos: Los valores del registro.
+        columnas: Columnas candidatas, en orden de preferencia.
+
+    Returns:
+        El valor encontrado, o cadena vacia.
+    """
+    for columna in columnas:
+        valor = (atributos.get(columna) or "").strip()
+        if valor:
+            return valor
+    return ""
+
+
+def _punto_de_shp(contenido: bytes) -> tuple:
+    """
+    Saca una coordenada del contenido de un registro de .shp.
+
+    Igual que con el GeoPackage, HAY QUE MIRAR EL TIPO antes de leer los
+    bytes: un recorrido es una linea y leerlo como punto no da error, da
+    coordenadas basura. De una linea o un poligono se toma su primer
+    vertice, que es donde empezo.
+
+    Args:
+        contenido: Los bytes del registro, sin su cabecera.
+
+    Returns:
+        Par `(lon, lat)`, o None si no se pudo decodificar.
+    """
+    try:
+        tipo = struct.unpack("<i", contenido[:4])[0]
+        if tipo == 0:                       # registro nulo
+            return None
+        if tipo in (1, 11, 21):             # Point, PointZ, PointM
+            return struct.unpack("<dd", contenido[4:20]) + (False,)
+        if tipo in (3, 5, 13, 15, 23, 25):  # lineas y poligonos
+            # Tras la envolvente (32 bytes) vienen el numero de partes y de
+            # puntos, los indices de parte, y por fin las coordenadas.
+            partes, puntos = struct.unpack("<ii", contenido[36:44])
+            if puntos < 1:
+                return None
+            inicio = 44 + partes * 4
+            # El True dice que viene de un recorrido, no de un punto.
+            return struct.unpack(
+                "<dd", contenido[inicio:inicio + 16]) + (True,)
+        if tipo in (8, 18, 28):             # Multipunto
+            puntos = struct.unpack("<i", contenido[36:40])[0]
+            if puntos < 1:
+                return None
+            return struct.unpack("<dd", contenido[40:56]) + (False,)
+    except (struct.error, IndexError):
+        return None
+    return None
+
+
+def _leer_shp(ruta: str) -> dict:
+    """
+    Lee un shapefile de campo: sus puntos y los atributos de cada uno.
+
+    POR QUE HACE FALTA
+    ------------------
+    Porque es lo que exporta QField. El paquete real del equipo
+    -- PROYECTO_MARIPOSAS_SAN_CARLOS.zip, 584 MB -- no trae ningun
+    GeoPackage: trae un shapefile de 58 registros con 37 campos, un
+    poligono de monitoreo, un raster y 229 fotografias. Antes de esto, el
+    validador lo abria y respondia que no habia nada que revisar.
+
+    UN SHAPEFILE SON CINCO ARCHIVOS
+    -------------------------------
+    El .shp guarda la geometria y el .dbf los atributos, emparejados por
+    posicion: el registro 7 del .shp le corresponde al 7 del .dbf. El .prj
+    dice el sistema de referencia y el .cpg la codificacion. Si falta
+    alguno se lee lo que haya y se DICE lo que falta.
+
+    Args:
+        ruta: Ruta del .shp.
+
+    Returns:
+        Diccionario con `puntos`, `capas` y `avisos`.
+    """
+    from core import corpus
+
+    base = os.path.splitext(ruta)[0]
+    capa = os.path.basename(base)
+    avisos = []
+
+    # --- El sistema de referencia manda ----------------------------------
+    # Un shapefile en metros no se puede comparar con un area de estudio en
+    # grados. Decir que un punto "esta a 8.000 km" porque nadie miro el
+    # .prj seria peor que no revisarlo.
+    prj = base + ".prj"
+    if os.path.exists(prj):
+        try:
+            with open(prj, encoding="latin-1") as fh:
+                definicion = fh.read(400)
+        except OSError:
+            definicion = ""
+        if not definicion.lstrip().upper().startswith("GEOGCS"):
+            avisos.append(
+                f"la capa '{capa}' no esta en coordenadas geograficas: su "
+                f".prj declara un sistema proyectado, y sus coordenadas no "
+                f"se pueden comparar con el area de estudio sin "
+                f"reproyectarlas")
+            return {"puntos": [],
+                    "capas": [{"nombre": capa, "tipo": "features",
+                               "epsg": 0, "registros": 0, "columnas": []}],
+                    "avisos": avisos}
+    else:
+        avisos.append(f"la capa '{capa}' no trae .prj: se asume que sus "
+                      f"coordenadas estan en grados, pero no se pudo "
+                      f"comprobar")
+
+    # --- Los atributos ----------------------------------------------------
+    filas, nombres = [], []
+    dbf = base + ".dbf"
+    if os.path.exists(dbf):
+        codificacion = corpus._codificacion_de(dbf)
+        try:
+            with open(dbf, "rb") as fh:
+                registros, tam_cab, tam_reg, campos = corpus._campos_dbf(
+                    fh, codificacion)
+                nombres = [c[0] for c in campos]
+                fh.seek(tam_cab)
+                for _ in range(registros):
+                    bruto = fh.read(tam_reg)
+                    if len(bruto) < tam_reg:
+                        break
+                    posicion, valores = 1, {}
+                    for nombre, _tipo, largo in campos:
+                        valores[nombre] = bruto[
+                            posicion:posicion + largo].decode(
+                                codificacion, "replace").strip()
+                        posicion += largo
+                    filas.append(None if bruto[0:1] == b"*" else valores)
+        except (OSError, struct.error) as exc:
+            avisos.append(f"no se pudo leer la tabla de '{capa}': "
+                          f"{str(exc)[:80]}")
+    else:
+        avisos.append(f"la capa '{capa}' no trae .dbf: sus puntos entran "
+                      f"sin titulo ni nota")
+
+    cols_titulo = _buscar_campos(nombres, CAMPOS_TITULO)
+    cols_nota = _buscar_campos(nombres, CAMPOS_NOTA)
+    cols_fecha = _buscar_campos(nombres, CAMPOS_FECHA)
+
+    # --- La geometria, registro a registro --------------------------------
+    puntos = []
+    try:
+        with open(ruta, "rb") as fh:
+            cabecera = fh.read(100)
+            if len(cabecera) < 100 or struct.unpack(
+                    ">i", cabecera[:4])[0] != 9994:
+                return {"puntos": [],
+                        "capas": [{"nombre": capa, "tipo": "features",
+                                   "epsg": 4326, "registros": 0,
+                                   "columnas": nombres}],
+                        "avisos": avisos + [f"'{capa}' no es un shapefile "
+                                            f"valido"]}
+            indice, sin_geometria = 0, 0
+            while True:
+                encabezado = fh.read(8)
+                if len(encabezado) < 8:
+                    break
+                _numero, palabras = struct.unpack(">ii", encabezado)
+                contenido = fh.read(palabras * 2)
+                par = _punto_de_shp(contenido)
+                atributos = (filas[indice]
+                             if indice < len(filas) else None) or {}
+                indice += 1
+                if par is None:
+                    # NO se descarta en silencio. Un registro sin geometria
+                    # tiene atributos pero no coordenada: alguien lleno la
+                    # ficha y el GPS no fijo posicion. Se midio en el
+                    # paquete real del equipo: de sus 58 registros, uno
+                    # esta asi. Si no se dice, el recuento baja de 58 a 57
+                    # y nadie sabe por que.
+                    sin_geometria += 1
+                    continue
+                puntos.append({
+                    "capa": capa,
+                    "lon": par[0],
+                    "lat": par[1],
+                    "recorrido": par[2],
+                    "titulo": _primer_valor(atributos, cols_titulo),
+                    "nota": _primer_valor(atributos, cols_nota),
+                    "fecha": _primer_valor(atributos, cols_fecha),
+                })
+            if sin_geometria:
+                avisos.append(
+                    f"{sin_geometria} registro(s) de '{capa}' traen datos "
+                    f"pero NO traen coordenada: se rellenó la ficha y el "
+                    f"GPS no fijó posición. Entran {len(puntos)} de "
+                    f"{indice}")
+    except (OSError, struct.error) as exc:
+        avisos.append(f"no se pudo leer la geometria de '{capa}': "
+                      f"{str(exc)[:80]}")
+
+    # La capa se describe igual que las de un GeoPackage: `revisar` las
+    # recorre todas por igual y espera un diccionario, no un nombre suelto.
+    return {"puntos": puntos,
+            "capas": [{"nombre": capa, "tipo": "features", "epsg": 4326,
+                       "registros": len(puntos), "columnas": nombres}],
+            "avisos": avisos}
+
+
 def leer(ruta: str) -> dict:
     """
     Lee un archivo de campo, sea cual sea de los tres formatos.
 
     Args:
-        ruta: El archivo a leer. Un .zip se abre y se leen los GeoPackage
-            que contenga.
+        ruta: El archivo a leer. Un .zip se abre y se leen los
+            GeoPackage, shapefiles, CSV y planillas que contenga.
 
     Returns:
         Diccionario con `puntos`, `capas`, `avisos` y `formato`.
@@ -294,20 +556,54 @@ def leer(ruta: str) -> dict:
         puntos, capas, avisos = [], [], []
         try:
             with zipfile.ZipFile(ruta) as z:
-                # Se extrae solo lo que se va a leer. Un .zip de fuera es
-                # material no confiable: no se vuelca entero sin mirar.
-                nombres = [n for n in z.namelist()
-                           if n.lower().endswith((".gpkg", ".csv", ".xlsx"))
-                           and not n.startswith(("/", "..")) and ".." not in n]
+                # Se extrae SOLO lo que se va a leer. Un .zip de fuera es
+                # material no confiable y ademas enorme: el paquete real
+                # del equipo pesa 584 MB, de los que 570 son fotografias y
+                # videos. Lo que se revisa son 400 kB.
+                #
+                # Los hermanos del shapefile entran aunque no se lean por
+                # si mismos: sin el .dbf la capa no tiene atributos y sin
+                # el .prj no se sabe en que sistema estan sus coordenadas.
+                acompanan = (".dbf", ".prj", ".cpg", ".shx")
+                se_leen = (".gpkg", ".csv", ".xlsx", ".shp")
+                dentro = [n for n in z.namelist()
+                          if n.lower().endswith(se_leen + acompanan)
+                          and not n.startswith(("/", "..")) and ".." not in n]
+                nombres = [n for n in dentro if n.lower().endswith(se_leen)]
                 if not nombres:
                     return {"puntos": [], "capas": [], "formato": "zip",
-                            "avisos": ["el .zip no trae GeoPackage, CSV ni "
-                                       "planilla que se pueda revisar"]}
-                for nombre in nombres:
+                            "avisos": ["el .zip no trae GeoPackage, "
+                                       "shapefile, CSV ni planilla que se "
+                                       "pueda revisar"]}
+
+                # Se extrae todo a la MISMA carpeta y conservando el nombre,
+                # para que cada .shp siga encontrando a sus hermanos.
+                extraidos = {}
+                for nombre in dentro:
                     destino = os.path.join(carpeta, os.path.basename(nombre))
-                    with z.open(nombre) as origen, open(destino, "wb") as salida:
+                    with z.open(nombre) as origen,                             open(destino, "wb") as salida:
                         salida.write(origen.read())
-                    leido = leer(destino)
+                    extraidos[nombre] = destino
+
+                # SE RECONOCE EL PAQUETE QUE GENERA EL PROPIO SISTEMA
+                # ---------------------------------------------------
+                # Esta pestana es para lo que VUELVE del campo. Si alguien
+                # sube aqui el paquete de QGIS que entrega el agente, la
+                # revision funciona -- son geometrias validas -- pero
+                # compara el sistema consigo mismo, y eso no dice nada de
+                # la calidad de ningun dato de campo. Conviene decirlo en
+                # vez de dejar que parezca una validacion de verdad.
+                internos = {n.rsplit("/", 1)[-1].lower() for n in z.namelist()}
+                if {"proyecto.qgs", "capas.gpkg"} <= internos:
+                    avisos.append(
+                        "Esto es el paquete de QGIS que genera el propio "
+                        "sistema, no datos que vengan de campo. Se revisa "
+                        "igual, pero lo que sale es el sistema comparandose "
+                        "consigo mismo: para validar una salida, sube el "
+                        ".zip que exporta QField")
+
+                for nombre in nombres:
+                    leido = leer(extraidos[nombre])
                     puntos.extend(leido["puntos"])
                     capas.extend(leido["capas"])
                     avisos.extend(leido["avisos"])
@@ -322,12 +618,130 @@ def leer(ruta: str) -> dict:
 
     if extension == ".gpkg":
         return {**_leer_gpkg(ruta), "formato": "gpkg"}
+    if extension == ".shp":
+        return {**_leer_shp(ruta), "formato": "shp"}
     if extension in (".xlsx", ".xls", ".csv"):
         return {**_leer_tabla(ruta), "formato": extension.lstrip(".")}
 
     return {"puntos": [], "capas": [], "formato": extension.lstrip("."),
             "avisos": [f"no se sabe leer '{extension}'. Se admiten .zip, "
-                       f".gpkg, .xlsx y .csv"]}
+                       f".gpkg, .shp, .xlsx y .csv"]}
+
+
+#: Carpeta donde el script de QGIS recoge las capas que anade el usuario.
+#:
+#: POR QUE AQUI Y NO EN `data/`
+#: ----------------------------
+#: `cargar_capas_qgis.py` carga solo tres archivos con nombre fijo, y es
+#: zona intocable del proyecto. Pero ya trae una puerta abierta: todo lo
+#: que haya en `capas_extra/` se carga sin que nadie toque su codigo.
+#: Escribiendo ahi, los datos de campo aparecen en QGIS sin modificar el
+#: script.
+CARPETA_CAPAS_EXTRA = "capas_extra"
+
+
+def carpeta_capas_extra() -> str:
+    """
+    Ruta de la carpeta de capas propias del usuario.
+
+    Returns:
+        Ruta absoluta. Se crea si no existe.
+    """
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    carpeta = os.path.join(base, CARPETA_CAPAS_EXTRA)
+    os.makedirs(carpeta, exist_ok=True)
+    return carpeta
+
+
+def _nombre_de_capa(origen: str) -> str:
+    """
+    Convierte el nombre del archivo de origen en nombre de capa.
+
+    Args:
+        origen: Nombre o ruta del paquete que se reviso.
+
+    Returns:
+        Un nombre de archivo sin acentos ni espacios, con su extension.
+    """
+    import unicodedata
+
+    base = os.path.splitext(os.path.basename(origen or "campo"))[0]
+    plano = unicodedata.normalize("NFKD", base)
+    plano = "".join(c for c in plano if not unicodedata.combining(c))
+    limpio = "".join(c if c.isalnum() else "_" for c in plano.lower())
+    while "__" in limpio:
+        limpio = limpio.replace("__", "_")
+    return f"campo_{limpio.strip('_') or 'sin_nombre'}.geojson"
+
+
+def exportar_capa(veredicto: dict, origen: str = "") -> dict:
+    """
+    Escribe los puntos revisados como una capa que QGIS puede abrir.
+
+    POR QUE HACIA FALTA
+    -------------------
+    Estudiar y cartografiar eran dos caminos que no se cruzaban. El agente
+    indexaba el paquete de campo y podia responder preguntas sobre el, pero
+    el mapa seguia mostrando solo el area de estudio: las tres capas salian
+    del KMZ y nadie las volvia a tocar. Se subia un Excel, se revisaba un
+    .zip con 57 registros de mariposas, y el mapa salia identico. Visto
+    desde fuera parecia que el sistema no habia hecho nada.
+
+    QUE SE ESCRIBE Y QUE NO
+    -----------------------
+    Solo los puntos con coordenada valida. Los registros sin geometria -- en
+    el paquete real del equipo habia uno -- no pueden dibujarse y no se
+    inventan: ya quedan declarados en los avisos de la revision.
+
+    Cada punto lleva si cayo DENTRO o FUERA del area de estudio, porque es
+    lo primero que se mira en un mapa de validacion.
+
+    Args:
+        veredicto: Lo que devuelve `revisar()`.
+        origen: Nombre del archivo revisado, para nombrar la capa.
+
+    Returns:
+        Diccionario con `ruta`, `nombre` y `puntos`, o con `error` si no
+        habia nada que escribir.
+    """
+    import json
+
+    puntos = [p for p in (veredicto.get("puntos") or [])
+              if p.get("lon") is not None and p.get("lat") is not None]
+    if not puntos:
+        return {"error": "no hay ningun punto con coordenada que dibujar"}
+
+    entidades = []
+    for punto in puntos:
+        entidades.append({
+            "type": "Feature",
+            "geometry": {"type": "Point",
+                         "coordinates": [float(punto["lon"]),
+                                         float(punto["lat"])]},
+            "properties": {
+                "titulo": punto.get("titulo") or "",
+                "nota": punto.get("nota") or "",
+                "fecha": punto.get("fecha") or "",
+                "capa": punto.get("capa") or "",
+                # `dentro` puede no venir si no habia area fijada. Se
+                # distingue "fuera" de "no se pudo comprobar": decir que un
+                # punto esta fuera cuando nadie lo midio seria inventar.
+                "en_el_area": ("si" if punto.get("dentro") else
+                               ("no" if "dentro" in punto else "sin comprobar")),
+                "origen": os.path.basename(origen) if origen else "",
+            },
+        })
+
+    nombre = _nombre_de_capa(origen)
+    ruta = os.path.join(carpeta_capas_extra(), nombre)
+    try:
+        with open(ruta, "w", encoding="utf-8") as fh:
+            json.dump({"type": "FeatureCollection", "features": entidades},
+                      fh, ensure_ascii=False)
+    except OSError as exc:
+        return {"error": f"no se pudo escribir la capa: {str(exc)[:90]}"}
+
+    return {"ruta": ruta, "nombre": nombre, "puntos": len(entidades)}
 
 
 # ==============================================================================
@@ -377,9 +791,31 @@ def revisar(lectura: dict) -> dict:
     elif veredicto["fuera"]:
         lejos = max((d.get("km_fuera", 0) for d in veredicto["detalle"]
                      if not d["dentro"]), default=0)
-        problemas.append(
-            f"{veredicto['fuera']} de {veredicto['total']} punto(s) caen "
-            f"FUERA del área de estudio, hasta {lejos} km del borde")
+        # UN RECORRIDO QUE EMPIEZA FUERA NO ES UN ERROR
+        # ---------------------------------------------
+        # De una linea se toma su primer vertice, y una quebrada nace
+        # donde nace: que arranque fuera del area y entre despues es lo
+        # normal. Lo que si es sospechoso es una FICHA tomada fuera.
+        #
+        # Se vio al revisar el propio paquete del sistema: "Quebrada El
+        # Jardin" arrancaba 2,4 km fuera del limite municipal y eso
+        # bastaba para declarar todo el archivo no valido. 111 puntos
+        # correctos invalidados por un rio que cruza una frontera.
+        fuera_de_verdad = [d for d in veredicto["detalle"]
+                           if not d["dentro"] and not d.get("recorrido")]
+        recorridos_fuera = veredicto["fuera"] - len(fuera_de_verdad)
+
+        if fuera_de_verdad:
+            problemas.append(
+                f"{len(fuera_de_verdad)} de {veredicto['total']} punto(s) "
+                f"caen FUERA del área de estudio, hasta {lejos} km del "
+                f"borde")
+        if recorridos_fuera:
+            avisos.append(
+                f"{recorridos_fuera} recorrido(s) empiezan fuera del área y "
+                f"entran después. Es normal en un cauce: no invalida nada, "
+                f"pero conviene mirarlo si no esperabas líneas que crucen "
+                f"el límite")
 
         # Antes de dejarlo ahí, se comprueba la equivocación más común: haber
         # puesto la latitud donde va la longitud. Decir "está a 10.402 km" es

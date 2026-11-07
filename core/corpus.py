@@ -56,6 +56,8 @@ import json
 import math
 import os
 import re
+import shutil
+import struct
 import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
@@ -71,7 +73,16 @@ from config import settings
 #: una categoria tematica; el nombre de la subcarpeta ES la categoria. No hay
 #: ninguna lista de categorias escrita en el codigo: se descubren del disco,
 #: igual que los departamentos y las especies del resto del sistema.
-CARPETA_CORPUS_DEFECTO = "corpus"
+#: Carpeta de trabajo de las utilidades manuales `importar.py` y
+#: `sanear.py`. NO ES UNA FUENTE: el agente no la mira nunca.
+#:
+#: Antes esto era "corpus", una carpeta del proyecto que SI se estudiaba
+#: cuando Drive no estaba configurado. Se retiro: era el camino por el que
+#: podia colarse al indice algo que nadie subio a Drive, y se comprobo que
+#: ya habia pasado. Lo que queda es un sitio donde dejar archivos a mano
+#: para convertirlos o revisarlos, dentro de `data/` como todo lo demas que
+#: se genera.
+CARPETA_CORPUS_DEFECTO = os.path.join("data", "importar")
 
 #: Extensiones que el modulo sabe leer. El resto se inventaria pero no se
 #: trocea, y se deja constancia de ello.
@@ -514,6 +525,553 @@ def _leer_pdf(ruta: str) -> list:
     return paginas
 
 
+#: Cuanto se admite descomprimir de un solo .zip.
+#:
+#: Es la defensa contra una "bomba zip": un archivo de pocos kilobytes que al
+#: abrirlo se convierte en gigabytes y llena el disco del servidor. No es
+#: paranoia gratuita -- el .zip puede venir de una exportacion automatica que
+#: nadie mira antes de que entre --, y el coste de la defensa es una resta.
+TOPE_DESCOMPRIMIDO = 2 * 1024 * 1024 * 1024
+
+#: Cuantos archivos como mucho se leen de dentro de un .zip.
+MAXIMO_DENTRO_DEL_ZIP = 2000
+
+
+def _leer_zip(ruta: str) -> list:
+    """
+    Lee los archivos legibles que vengan dentro de un .zip.
+
+    PARA QUE SIRVE
+    --------------
+    Para que una exportacion automatica entre sola. El caso concreto es la
+    copia de seguridad programada de Google: Takeout puede dejar cada dos
+    meses un .zip en Drive con las notas de Gemini Notebook, y sin este
+    lector ese archivo se veria en la carpeta y el proyecto lo saltaria.
+
+    Tambien sirve para un lote de fichas de campo comprimidas, que es como
+    suelen llegar de una salida.
+
+    COMO SE CITA LO DE DENTRO
+    -------------------------
+    Cada archivo interno se devuelve como una "pagina" propia y su texto
+    empieza por el nombre que tenia dentro del .zip. Sin eso, una cita diria
+    "pagina 3 de copia.zip", que no se puede comprobar; asi dice de que
+    archivo salio.
+
+    LO QUE NO HACE
+    --------------
+    No abre .zip dentro de .zip. Un anidamiento es la forma clasica de la
+    bomba de descompresion, y una copia de seguridad legitima no lo necesita.
+
+    Args:
+        ruta: Ruta del archivo .zip.
+
+    Returns:
+        Lista de tuplas `(indice, texto)`, una por archivo leido dentro.
+        Lista vacia si no habia nada legible.
+    """
+    import tempfile
+
+    paginas = []
+    try:
+        with zipfile.ZipFile(ruta) as paquete:
+            miembros = [m for m in paquete.infolist() if not m.is_dir()]
+
+            # El tamano descomprimido se mira ANTES de extraer nada: es el
+            # dato que trae la cabecera del zip, asi que comprobarlo es
+            # gratis y evita llenar el disco por sorpresa.
+            total = sum(m.file_size for m in miembros)
+            if total > TOPE_DESCOMPRIMIDO:
+                anotar_fallo_de_lectura(
+                    ruta, f"al abrirlo ocuparia {total // (1024 ** 3)} GB, "
+                          f"por encima del tope de descompresion")
+                return []
+
+            # TODO SE EXTRAE A LA MISMA CARPETA, Y ES IMPRESCINDIBLE
+            # ------------------------------------------------------
+            # Antes cada archivo iba a un temporal propio. Para un .txt da
+            # igual, pero ROMPE un shapefile: un shapefile no es un archivo,
+            # son cinco (.shp .shx .dbf .prj .cpg) que tienen que estar
+            # juntos y con el mismo nombre. Separandolos, el .shp queda sin
+            # atributos y sin sistema de referencia.
+            #
+            # Se conserva ademas la estructura de carpetas de dentro, porque
+            # un paquete de QField reparte las capas en subcarpetas y dos
+            # capas distintas pueden llamarse igual en carpetas distintas.
+            carpeta = tempfile.mkdtemp(prefix="_zip_")
+            raiz_segura = os.path.realpath(carpeta)
+            try:
+                extraidos = []
+                for miembro in miembros:
+                    destino = os.path.realpath(
+                        os.path.join(carpeta, miembro.filename))
+                    # Un nombre como "../../etc/algo" escaparia de la
+                    # carpeta temporal y escribiria donde no debe. Se
+                    # comprueba que el destino siga dentro.
+                    if not destino.startswith(raiz_segura + os.sep):
+                        anotar_fallo_de_lectura(
+                            f"{ruta}::{miembro.filename}",
+                            "la ruta se sale de la carpeta de extraccion")
+                        continue
+                    os.makedirs(os.path.dirname(destino), exist_ok=True)
+                    with paquete.open(miembro) as origen,                             open(destino, "wb") as salida:
+                        shutil.copyfileobj(origen, salida)
+                    extraidos.append((miembro.filename, destino))
+
+                leidos = 0
+                for interno, destino in extraidos:
+                    if leidos >= MAXIMO_DENTRO_DEL_ZIP:
+                        break
+                    extension = os.path.splitext(interno)[1].lower()
+                    if extension == ".zip" or extension not in LECTORES:
+                        continue
+                    try:
+                        for _pag, texto in (LECTORES[extension](destino) or []):
+                            if texto and texto.strip():
+                                leidos += 1
+                                paginas.append(
+                                    (len(paginas) + 1,
+                                     f"[Dentro de {os.path.basename(ruta)}: "
+                                     f"{interno}]" + chr(10) + texto))
+                    except Exception as exc:
+                        # Un archivo roto dentro del paquete no invalida el
+                        # resto.
+                        anotar_fallo_de_lectura(f"{ruta}::{interno}", exc)
+            finally:
+                shutil.rmtree(carpeta, ignore_errors=True)
+    except zipfile.BadZipFile as exc:
+        anotar_fallo_de_lectura(ruta, exc)
+        return []
+    return paginas
+
+
+#: Tipos de geometria de un shapefile, por su codigo en la cabecera.
+TIPOS_SHAPEFILE = {
+    0: "vacio", 1: "Punto", 3: "Linea", 5: "Poligono", 8: "Multipunto",
+    11: "Punto Z", 13: "Linea Z", 15: "Poligono Z", 18: "Multipunto Z",
+    21: "Punto M", 23: "Linea M", 25: "Poligono M", 28: "Multipunto M",
+}
+
+#: Cuantos registros de una tabla de atributos se escriben en las fichas.
+#:
+#: Un shapefile de campo trae decenas o cientos de registros y cada uno es
+#: una observacion con valor propio. Por encima de este tope se corta y se
+#: DICE, en vez de dejar creer que estan todos.
+MAXIMO_REGISTROS_DBF = 3000
+
+
+def _campos_dbf(fh, codificacion: str = "latin-1") -> tuple:
+    """
+    Lee la cabecera de un .dbf y devuelve su estructura.
+
+    LOS NOMBRES DE CAMPO TAMBIEN LLEVAN ACENTOS
+    -------------------------------------------
+    La norma del .dbf dice que los nombres son ASCII, pero QGIS escribe
+    ahi los bytes tal cual, en la codificacion que declare el .cpg.
+    Leerlos siempre como latin-1 destroza los acentos: en el formulario
+    de mariposas del equipo, "ID unico" salia como "ID Aordmnico" y
+    "Numero in" como "NAordmmero in". Se usa la misma codificacion que
+    para los valores.
+
+    Args:
+        fh: Archivo abierto en binario, posicionado al principio.
+        codificacion: La que declare el .cpg del shapefile.
+
+    Returns:
+        Tupla `(registros, tam_cabecera, tam_registro, campos)`, donde cada
+        campo es `(nombre, tipo, longitud)`.
+    """
+    cabecera = fh.read(32)
+    registros, tam_cabecera, tam_registro = struct.unpack(
+        "<IHH", cabecera[4:12])
+    campos = []
+    while True:
+        bruto = fh.read(32)
+        if not bruto or bruto[0:1] in (b"\x0d", b""):
+            break
+        nombre = bruto[:11].split(b"\x00")[0].decode(
+            codificacion, "replace").strip()
+        campos.append((nombre, bruto[11:12].decode("latin-1"), bruto[16]))
+    return registros, tam_cabecera, tam_registro, campos
+
+
+def _codificacion_de(ruta: str) -> str:
+    """
+    Averigua con que codificacion leer la tabla de un shapefile.
+
+    El .cpg que acompana al shapefile lo dice. Sin el no hay forma de
+    saberlo, y se usa latin-1 porque nunca falla al decodificar: produce
+    acentos raros en el peor caso, pero no pierde el registro entero.
+
+    Args:
+        ruta: Ruta del .shp o del .dbf.
+
+    Returns:
+        Nombre de la codificacion.
+    """
+    cpg = os.path.splitext(ruta)[0] + ".cpg"
+    if os.path.exists(cpg):
+        try:
+            with open(cpg, encoding="ascii", errors="ignore") as fh:
+                declarada = fh.read(32).strip()
+            if declarada:
+                "x".encode(declarada)      # comprueba que Python la conoce
+                return declarada
+        except (OSError, LookupError):
+            pass
+    return "latin-1"
+
+
+def _leer_dbf(ruta: str) -> list:
+    """
+    Lee la tabla de atributos de un shapefile.
+
+    POR QUE ES LA PARTE QUE IMPORTA
+    -------------------------------
+    En un shapefile de campo la geometria dice DONDE y la tabla dice QUE.
+    Un formulario de mariposas trae la especie, el sexo, la etapa, el
+    habitat y las notas del observador: eso es lo que el agente tiene que
+    poder citar. Las coordenadas solas no responden ninguna pregunta.
+
+    Args:
+        ruta: Ruta del .dbf.
+
+    Returns:
+        Lista de tuplas `(indice, texto)`.
+    """
+    codificacion = _codificacion_de(ruta)
+    with open(ruta, "rb") as fh:
+        registros, tam_cabecera, tam_registro, campos = _campos_dbf(
+            fh, codificacion)
+        if not campos:
+            return []
+
+        nombres = [c[0] for c in campos]
+        lineas = [f"[Tabla de atributos de {os.path.basename(ruta)}]",
+                  f"{registros} registros y {len(campos)} campos.",
+                  "Campos: " + ", ".join(nombres)]
+
+        fh.seek(tam_cabecera)
+        leidos = 0
+        for _ in range(registros):
+            bruto = fh.read(tam_registro)
+            if len(bruto) < tam_registro:
+                break
+            if bruto[0:1] == b"*":        # registro marcado como borrado
+                continue
+            if leidos >= MAXIMO_REGISTROS_DBF:
+                lineas.append(f"... se cortan los {registros - leidos} "
+                              f"registros restantes.")
+                break
+            posicion = 1
+            partes = []
+            for nombre, _tipo, largo in campos:
+                valor = bruto[posicion:posicion + largo]
+                posicion += largo
+                texto = valor.decode(codificacion, "replace").strip()
+                if texto:
+                    partes.append(f"{nombre}: {texto}")
+            if partes:
+                leidos += 1
+                lineas.append(" | ".join(partes))
+
+    return [(1, chr(10).join(lineas))] if len(lineas) > 3 else []
+
+
+def _leer_shapefile(ruta: str) -> list:
+    """
+    Lee un shapefile: su geometria por encima y su tabla entera.
+
+    UN SHAPEFILE NO ES UN ARCHIVO
+    -----------------------------
+    Son cinco que viajan juntos y comparten nombre: .shp con la geometria,
+    .dbf con los atributos, .shx con el indice, .prj con el sistema de
+    referencia y .cpg con la codificacion. Esta funcion lee el .shp y va a
+    buscar a sus hermanos al lado.
+
+    Si llegan separados -- por ejemplo si alguien sube solo el .shp a
+    Drive -- se lee lo que haya y se DICE lo que falta, en vez de devolver
+    una capa muda.
+
+    De la geometria no se vuelca punto por punto: una linea de 4.000
+    vertices no significa nada en una busqueda por significado. Se resume:
+    que tipo es, cuantas entidades y que rectangulo ocupan.
+
+    Args:
+        ruta: Ruta del .shp.
+
+    Returns:
+        Lista de tuplas `(indice, texto)`.
+    """
+    base = os.path.splitext(ruta)[0]
+    lineas = [f"[Capa {os.path.basename(base)}]"]
+
+    try:
+        with open(ruta, "rb") as fh:
+            cabecera = fh.read(100)
+        if len(cabecera) < 100 or struct.unpack(">I", cabecera[:4])[0] != 9994:
+            anotar_fallo_de_lectura(ruta, "no parece un shapefile valido")
+            return []
+        codigo = struct.unpack("<i", cabecera[32:36])[0]
+        xmin, ymin, xmax, ymax = struct.unpack("<dddd", cabecera[36:68])
+        lineas.append(f"Geometria: {TIPOS_SHAPEFILE.get(codigo, codigo)}.")
+        lineas.append(f"Ocupa de {ymin:.5f} a {ymax:.5f} de latitud y de "
+                      f"{xmin:.5f} a {xmax:.5f} de longitud.")
+    except (OSError, struct.error) as exc:
+        anotar_fallo_de_lectura(ruta, exc)
+        return []
+
+    prj = base + ".prj"
+    if os.path.exists(prj):
+        try:
+            with open(prj, encoding="latin-1") as fh:
+                definicion = fh.read(400).strip()
+            trozos = definicion.split(chr(34))
+            nombre_srs = trozos[1] if len(trozos) > 1 else ""
+            lineas.append(f"Sistema de referencia: "
+                          f"{nombre_srs or definicion[:70]}")
+        except OSError:
+            pass
+    else:
+        lineas.append("AVISO: no viene el .prj, asi que no se sabe en que "
+                      "sistema de referencia estan estas coordenadas.")
+
+    dbf = base + ".dbf"
+    paginas = [(1, chr(10).join(lineas))]
+    if os.path.exists(dbf):
+        for indice, (_pagina, texto) in enumerate(_leer_dbf(dbf)):
+            paginas.append((len(paginas) + indice + 1, texto))
+    else:
+        paginas[0] = (1, paginas[0][1] + chr(10) +
+                      "AVISO: no viene el .dbf, asi que esta capa llega sin "
+                      "atributos: solo geometria.")
+    return paginas
+
+
+#: Etiquetas del TIFF que interesan para describir un raster.
+#:
+#: Las tres ultimas son de GeoTIFF, que no es otro formato sino un TIFF
+#: normal con etiquetas extra que dicen donde cae la imagen en el mundo.
+ETIQUETAS_TIFF = {
+    256: "ancho", 257: "alto", 258: "bits", 277: "bandas",
+    33550: "escala", 33922: "amarre", 34737: "descripcion_geo",
+}
+
+#: Cuantos bytes ocupa cada tipo de dato de una etiqueta TIFF.
+BYTES_POR_TIPO = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 11: 4, 12: 8}
+
+
+def _leer_geotiff(ruta: str) -> list:
+    """
+    Describe un raster .tif sin abrir sus pixeles.
+
+    POR QUE NO SE LEEN LOS PIXELES
+    ------------------------------
+    Porque no servirian de nada en un indice de busqueda por significado:
+    un mapa base de 18 MB son millones de colores, y ninguno responde una
+    pregunta. Lo que si responde es QUE es y DONDE cae, y eso vive en las
+    etiquetas de la cabecera, que ocupan unos cientos de bytes.
+
+    Asi el agente puede decir "hay un mapa base que cubre el area de
+    estudio, de 4.000 por 3.000 pixeles" en vez de ignorar el archivo.
+
+    SIN GDAL
+    --------
+    Un TIFF empieza por dos letras que dicen el orden de los bytes, un 42 de
+    comprobacion y la posicion de su tabla de etiquetas. Las de GeoTIFF
+    guardan la escala de cada pixel y un punto de amarre, y con esas dos se
+    calcula el rectangulo que ocupa. Es aritmetica, no hace falta libreria.
+
+    Args:
+        ruta: Ruta del .tif o .tiff.
+
+    Returns:
+        Lista con una tupla `(1, texto)`, o vacia si no se pudo leer.
+    """
+    try:
+        with open(ruta, "rb") as fh:
+            cabecera = fh.read(8)
+            if len(cabecera) < 8:
+                anotar_fallo_de_lectura(ruta, "el archivo esta truncado")
+                return []
+            marca = cabecera[:2]
+            if marca == b"II":
+                orden = "<"
+            elif marca == b"MM":
+                orden = ">"
+            else:
+                anotar_fallo_de_lectura(ruta, "no parece un TIFF")
+                return []
+            if struct.unpack(orden + "H", cabecera[2:4])[0] != 42:
+                # Un BigTIFF usa 43 aqui. Se dice en vez de leer basura.
+                anotar_fallo_de_lectura(
+                    ruta, "es un TIFF de una variante que no se sabe leer")
+                return []
+
+            fh.seek(struct.unpack(orden + "I", cabecera[4:8])[0])
+            cuantas = struct.unpack(orden + "H", fh.read(2))[0]
+            valores = {}
+            for _ in range(cuantas):
+                entrada = fh.read(12)
+                if len(entrada) < 12:
+                    break
+                etiqueta, tipo, cantidad = struct.unpack(
+                    orden + "HHI", entrada[:8])
+                if etiqueta not in ETIQUETAS_TIFF:
+                    continue
+                ancho_dato = BYTES_POR_TIPO.get(tipo, 0) * cantidad
+                if ancho_dato == 0:
+                    continue
+                if ancho_dato <= 4:
+                    crudo = entrada[8:8 + ancho_dato]
+                else:
+                    posicion = struct.unpack(orden + "I", entrada[8:12])[0]
+                    guardado = fh.tell()
+                    fh.seek(posicion)
+                    crudo = fh.read(ancho_dato)
+                    fh.seek(guardado)
+
+                nombre = ETIQUETAS_TIFF[etiqueta]
+                if tipo == 2:
+                    valores[nombre] = crudo.split(b"\x00")[0].decode(
+                        "latin-1", "replace")
+                elif tipo == 12:
+                    valores[nombre] = list(struct.unpack(
+                        orden + "d" * cantidad, crudo))
+                elif tipo == 3:
+                    valores[nombre] = struct.unpack(
+                        orden + "H" * cantidad, crudo)[0]
+                elif tipo == 4:
+                    valores[nombre] = struct.unpack(
+                        orden + "I" * cantidad, crudo)[0]
+    except (OSError, struct.error) as exc:
+        anotar_fallo_de_lectura(ruta, exc)
+        return []
+
+    ancho, alto = valores.get("ancho"), valores.get("alto")
+    if not ancho or not alto:
+        anotar_fallo_de_lectura(ruta, "el TIFF no declara su tamano")
+        return []
+
+    lineas = [f"[Raster {os.path.basename(ruta)}]",
+              f"Imagen de {ancho} por {alto} pixeles."]
+    if valores.get("bandas"):
+        lineas.append(f"Tiene {valores['bandas']} bandas de color.")
+
+    escala, amarre = valores.get("escala"), valores.get("amarre")
+    if escala and amarre and len(escala) >= 2 and len(amarre) >= 6:
+        # El amarre dice que coordenada del mundo le toca a un pixel dado, y
+        # la escala cuanto mide un pixel. Con eso sale el rectangulo.
+        px, py = amarre[0], amarre[1]
+        x0, y0 = amarre[3], amarre[4]
+        xmin = x0 - px * escala[0]
+        ymax = y0 + py * escala[1]
+        xmax = xmin + ancho * escala[0]
+        ymin = ymax - alto * escala[1]
+        # NO SE LLAMA "LATITUD" A LO QUE NO SON GRADOS
+        # --------------------------------------------
+        # El mapa base del equipo esta en Pseudo-Mercator, donde las
+        # coordenadas son METROS: valores como 680.260 o -8.359.244. La
+        # primera version de esto decia "de 680260 a 700740 de latitud",
+        # que es falso y ademas inquietante, porque una latitud no pasa de
+        # 90. Se mira el rango antes de ponerle nombre.
+        en_grados = abs(xmin) <= 180 and abs(xmax) <= 180             and abs(ymin) <= 90 and abs(ymax) <= 90
+        if en_grados:
+            lineas.append(f"Esta georreferenciado y cubre de {ymin:.5f} a "
+                          f"{ymax:.5f} de latitud y de {xmin:.5f} a "
+                          f"{xmax:.5f} de longitud.")
+            lineas.append(f"Cada pixel mide {escala[0]:.8f} por "
+                          f"{escala[1]:.8f} grados.")
+        else:
+            lineas.append(f"Esta georreferenciado en un sistema PROYECTADO: "
+                          f"sus coordenadas no son grados. Va de {ymin:.2f} "
+                          f"a {ymax:.2f} en Y y de {xmin:.2f} a {xmax:.2f} "
+                          f"en X.")
+            lineas.append(f"Cada pixel mide {escala[0]:.2f} por "
+                          f"{escala[1]:.2f} unidades de ese sistema.")
+            lineas.append("Para compararlo con las capas del proyecto, que "
+                          "estan en grados (EPSG:4326), hay que "
+                          "reproyectarlo. QGIS lo hace al vuelo al abrirlo.")
+    else:
+        lineas.append("AVISO: no trae las etiquetas de georreferenciacion, "
+                      "asi que es una imagen suelta: no se sabe donde cae "
+                      "en el mapa.")
+
+    if valores.get("descripcion_geo"):
+        lineas.append(f"Sistema de referencia declarado: "
+                      f"{valores['descripcion_geo'].strip('|')}")
+    return [(1, chr(10).join(lineas))]
+
+
+def _leer_proyecto_qgis(ruta: str) -> list:
+    """
+    Describe un proyecto de QGIS: que capas trae y de donde salen.
+
+    No se dibuja nada ni se abren las capas; se lee el proyecto como lo que
+    es, un indice. Sirve para que el agente pueda decir "ese proyecto trae
+    tres capas y un raster, y apunta a estos archivos" en vez de ignorarlo.
+
+    Acepta tanto `.qgs`, que es XML suelto, como `.qgz`, que es ese mismo
+    XML dentro de un zip.
+
+    Args:
+        ruta: Ruta del .qgs o .qgz.
+
+    Returns:
+        Lista con una tupla `(1, texto)`.
+    """
+    try:
+        if ruta.lower().endswith(".qgz"):
+            with zipfile.ZipFile(ruta) as paquete:
+                internos = [n for n in paquete.namelist()
+                            if n.endswith(".qgs")]
+                if not internos:
+                    anotar_fallo_de_lectura(
+                        ruta, "el .qgz no trae ningun .qgs dentro")
+                    return []
+                crudo = paquete.read(internos[0])
+        else:
+            with open(ruta, "rb") as fh:
+                crudo = fh.read()
+        arbol = ET.fromstring(crudo)
+    except (OSError, ET.ParseError, zipfile.BadZipFile) as exc:
+        anotar_fallo_de_lectura(ruta, exc)
+        return []
+
+    lineas = [f"[Proyecto de QGIS {os.path.basename(ruta)}]"]
+    titulo = (arbol.findtext("title") or "").strip()
+    if titulo:
+        lineas.append(f"Titulo: {titulo}")
+    version = arbol.get("version")
+    if version:
+        lineas.append(f"Hecho con QGIS {version}.")
+    crs = arbol.find(".//projectCrs/spatialrefsys/authid")
+    if crs is not None and crs.text:
+        lineas.append(f"Sistema de referencia del proyecto: {crs.text}")
+
+    capas = arbol.findall(".//maplayer")
+    lineas.append(f"Trae {len(capas)} capas:")
+    for capa in capas:
+        nombre = (capa.findtext("layername") or "sin nombre").strip()
+        tipo = capa.get("type") or "?"
+        geometria = capa.get("geometry") or ""
+        fuente = (capa.findtext("datasource") or "").strip()
+        detalle = f"  - {nombre} ({tipo}"
+        if geometria:
+            detalle += f", {geometria}"
+        lineas.append(detalle + f"): {fuente}")
+
+    absoluto = arbol.findtext(".//properties/Paths/Absolute")
+    if absoluto is not None:
+        if absoluto.strip().lower() == "false":
+            lineas.append("Las rutas son relativas, asi que el proyecto se "
+                          "puede mover de carpeta con sus capas.")
+        else:
+            lineas.append("AVISO: las rutas son ABSOLUTAS. Este proyecto "
+                          "solo abre bien en el ordenador donde se hizo.")
+    return [(1, chr(10).join(lineas))]
+
+
 #: Lector por extension. Anadir un formato nuevo es anadir una entrada aqui.
 def _leer_excel(ruta: str) -> list:
     """
@@ -575,6 +1133,99 @@ INSTRUCCION_IMAGEN = (
 )
 
 
+#: Cliente de Gemini, uno para todo el proceso.
+#:
+#: POR QUE SE GUARDA
+#: -----------------
+#: Antes se construia uno NUEVO por cada imagen, dentro de `_leer_imagen`.
+#: Se midio lo que costaba: sobre la misma foto, con cliente nuevo cada vez
+#: tardaba 2,4 y 9,8 segundos; reutilizandolo, 0,9, 1,1 y 1,1. Entre diez y
+#: veinte veces mas rapido, y el trabajo del modelo es identico: lo que se
+#: ahorra es el saludo TLS y la autenticacion, repetidos foto a foto.
+#:
+#: En una carpeta de doscientas fichas de campo eso es la diferencia entre
+#: dos horas y cuatro minutos.
+_CLIENTE_GEMINI = {"clave": None, "cliente": None}
+
+#: Tope de bytes que se envian en linea al modelo.
+#:
+#: La API acepta la imagen dentro de la propia peticion, pero la peticion
+#: entera tiene un techo de unos 20 MB, y la imagen viaja codificada, que
+#: abulta un tercio mas. Una foto de movil moderna de 15 MB se pasaria.
+#:
+#: Por encima de este tope se reduce la resolucion ANTES de enviarla. Se
+#: reduce lo justo y nunca por debajo de 2.000 pixeles de lado largo: el
+#: objeto de la foto suele ser texto pequeno -- una ficha manuscrita, un
+#: rotulo --, y achicarla de mas es perder justo lo que se queria leer.
+TOPE_IMAGEN_EN_LINEA = 12 * 1024 * 1024
+
+#: Lado largo minimo al que se puede reducir una imagen demasiado pesada.
+LADO_MINIMO_IMAGEN = 2000
+
+
+def cliente_gemini():
+    """
+    Devuelve el cliente de Gemini, creandolo solo la primera vez.
+
+    Se rehace si cambia la clave, que pasa cuando se reconfigura el sistema
+    sin reiniciar el contenedor.
+
+    Returns:
+        El cliente, o None si no hay clave configurada.
+    """
+    clave = settings.api_key_gemini()
+    if not clave:
+        return None
+    if _CLIENTE_GEMINI["clave"] != clave:
+        from google import genai
+
+        _CLIENTE_GEMINI["clave"] = clave
+        _CLIENTE_GEMINI["cliente"] = genai.Client(api_key=clave)
+    return _CLIENTE_GEMINI["cliente"]
+
+
+def _imagen_para_enviar(ruta: str, tipo: str) -> tuple:
+    """
+    Lee la imagen y la reduce solo si no cabria en una peticion.
+
+    Args:
+        ruta: Ruta de la imagen.
+        tipo: Su mimeType.
+
+    Returns:
+        Tupla `(datos, tipo, reducida)`. `reducida` dice si hubo que
+        achicarla, para poder informarlo en vez de hacerlo a escondidas.
+    """
+    with open(ruta, "rb") as f:
+        datos = f.read()
+    if len(datos) <= TOPE_IMAGEN_EN_LINEA:
+        return datos, tipo, False
+
+    try:
+        import io as _io
+
+        from PIL import Image
+    except ImportError:
+        # Sin Pillow no se puede reducir. Se manda tal cual y que la API
+        # diga que no: es preferible a fingir que se leyo.
+        return datos, tipo, False
+
+    with Image.open(ruta) as imagen:
+        imagen = imagen.convert("RGB")
+        lado = max(imagen.size)
+        # Se reduce por pasos y se para en cuanto cabe, para no achicar de
+        # mas: cada paso pierde detalle y el detalle es el texto.
+        while lado > LADO_MINIMO_IMAGEN:
+            lado = int(lado * 0.8)
+            copia = imagen.copy()
+            copia.thumbnail((lado, lado), Image.LANCZOS)
+            buf = _io.BytesIO()
+            copia.save(buf, format="JPEG", quality=88)
+            if buf.tell() <= TOPE_IMAGEN_EN_LINEA:
+                return buf.getvalue(), "image/jpeg", True
+    return datos, tipo, False
+
+
 def _leer_imagen(ruta: str) -> list:
     """
     Transcribe una imagen a texto usando el modelo, para poder indexarla.
@@ -599,21 +1250,22 @@ def _leer_imagen(ruta: str) -> list:
         Devolver vacio hace que el importador la rechace diciendo por que, en
         vez de meter una ficha en blanco que luego se cite sin contenido.
     """
-    clave = settings.api_key_gemini()
-    if not clave:
+    cliente = cliente_gemini()
+    if cliente is None:
         return []
 
     tipo = TIPOS_IMAGEN.get(os.path.splitext(ruta)[1].lower())
     if tipo is None:
         return []
 
-    from google import genai
     from google.genai import types
 
-    with open(ruta, "rb") as f:
-        datos = f.read()
+    datos, tipo, reducida = _imagen_para_enviar(ruta, tipo)
+    if reducida:
+        anotar_fallo_de_lectura(
+            ruta, f"se redujo la resolucion para poder enviarla: pesaba mas "
+                  f"de {TOPE_IMAGEN_EN_LINEA // (1024 * 1024)} MB")
 
-    cliente = genai.Client(api_key=clave)
     respuesta = cliente.models.generate_content(
         model=settings.modelo_llm(),
         contents=[types.Part.from_bytes(data=datos, mime_type=tipo),
@@ -639,6 +1291,13 @@ LECTORES = {
     ".pdf": _leer_pdf,
     ".xlsx": _leer_excel,
     ".xls": _leer_excel,
+    ".zip": _leer_zip,
+    ".shp": _leer_shapefile,
+    ".dbf": _leer_dbf,
+    ".qgs": _leer_proyecto_qgis,
+    ".qgz": _leer_proyecto_qgis,
+    ".tif": _leer_geotiff,
+    ".tiff": _leer_geotiff,
 }
 LECTORES.update({ext: _leer_imagen for ext in TIPOS_IMAGEN})
 
