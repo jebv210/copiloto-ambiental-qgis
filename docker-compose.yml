@@ -80,8 +80,12 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./corpus:/app/corpus
       - ./data:/app/data
+      # `capas_extra/` es de donde el script de QGIS recoge las capas que
+      # anade el usuario, y QGIS corre en el EQUIPO, no aqui dentro. Sin
+      # este montaje, el agente escribia las capas de campo y las tablas
+      # unidas en un rincon del contenedor que nadie podia abrir.
+      - ./capas_extra:/app/capas_extra
       - ./api:/app/api
       - ./agent:/app/agent
       - ./core:/app/core
@@ -119,8 +123,12 @@ services:
       # reconstruir, y el cambio parecia no funcionar. Es la misma trampa que
       # con el .env.
       - ./.streamlit:/app/.streamlit
-      - ./corpus:/app/corpus
       - ./data:/app/data
+      # `capas_extra/` es de donde el script de QGIS recoge las capas que
+      # anade el usuario, y QGIS corre en el EQUIPO, no aqui dentro. Sin
+      # este montaje, el agente escribia las capas de campo y las tablas
+      # unidas en un rincon del contenedor que nadie podia abrir.
+      - ./capas_extra:/app/capas_extra
       - ./api:/app/api
       - ./agent:/app/agent
       - ./core:/app/core

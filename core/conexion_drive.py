@@ -374,11 +374,22 @@ def conectar(contenido_json: str, carpeta_pegada: str) -> dict:
 
 def desconectar(borrar_credencial: bool = False) -> dict:
     """
-    Vuelve a leer de la carpeta local.
+    Olvida la carpeta de Drive, sin caer en la carpeta local.
 
-    Lo ya descargado de Drive NO se borra: sigue en `corpus/` y el agente lo
-    conserva. Desconectar es dejar de ir a buscar cosas nuevas, no olvidar lo
-    aprendido.
+    Lo ya indexado NO se borra: el agente conserva lo aprendido.
+    Desconectar es dejar de ir a buscar cosas nuevas, no olvidar.
+
+    POR QUE NO SE VUELVE A LA CARPETA LOCAL
+    ---------------------------------------
+    Antes esto dejaba `FUENTE_CORPUS` en "local", y ese es justo el camino
+    por el que el sistema acababa estudiando lo que hubiera en el disco
+    sin que nadie lo pidiera. Se vio en marcha: `corpus/` tenia un
+    "informacion total.zip" olvidado que habria entrado al indice solo.
+
+    Al desconectar, la fuente sigue siendo Drive pero sin carpeta. El
+    sistema entonces se niega a sincronizar y dice que falta configurarla,
+    que es la respuesta correcta: quedarse sin indice y decirlo es
+    preferible a indexar lo que no toca y callarlo.
 
     Args:
         borrar_credencial: Si ademas se elimina el archivo de la cuenta de
@@ -390,7 +401,7 @@ def desconectar(borrar_credencial: bool = False) -> dict:
     """
     from core import ajustes
 
-    ajustes.guardar({"FUENTE_CORPUS": "local",
+    ajustes.guardar({"FUENTE_CORPUS": "drive",
                      "DRIVE_CARPETA_ID": None,
                      "GOOGLE_CREDENCIALES": None})
 

@@ -87,7 +87,6 @@ proyecto/
 │   ├── .gitignore              Excluye secretos, datos pesados y generados
 │   └── .streamlit/config.toml  Límite de subida y telemetría de Streamlit
 │
-├── corpus/                      Bibliografía del agente (no se versiona)
 │   └── LEEME.md                 Cómo organizarla por categorías
 │
 ├── documentos/                  Entregables: informes, planes, el Excel

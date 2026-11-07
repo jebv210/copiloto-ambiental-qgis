@@ -44,93 +44,17 @@ from config import settings
 from core import corpus
 
 
-# ==============================================================================
-# FUENTE LOCAL: la carpeta corpus/ del proyecto
-# ==============================================================================
-
-class FuenteLocal:
-    """
-    Lee los documentos de la carpeta `corpus/` del proyecto.
-
-    Es la fuente que se usa hoy. Se apoya en `corpus.inventariar()`, que ya
-    sabe que extensiones son legibles, que archivos no son fuente (LEEME,
-    README) y como deducir la categoria a partir de la subcarpeta.
-    """
-
-    nombre = "local"
-
-    def __init__(self, carpeta: str = None):
-        """
-        Args:
-            carpeta: Carpeta a inventariar. Por defecto, la del proyecto.
-        """
-        self.carpeta = carpeta or corpus.carpeta_corpus()
-
-    def disponible(self) -> tuple:
-        """
-        Comprueba que la carpeta exista y tenga documentos.
-
-        Returns:
-            Tupla `(listo, motivo)`.
-        """
-        if not os.path.isdir(self.carpeta):
-            return False, f"No existe la carpeta {self.carpeta}."
-        if not self.documentos():
-            return False, f"La carpeta {self.carpeta} no tiene documentos legibles."
-        return True, f"Carpeta local {self.carpeta}."
-
-    def documentos(self, descargar: bool = True) -> list:
-        """
-        Inventaria los documentos disponibles.
-
-        Returns:
-            Lista de diccionarios con `nombre`, `categoria`, `ruta` y `huella`.
-        """
-        salida = []
-        for doc in corpus.inventariar(self.carpeta):
-            # `inventariar` lista TODO lo que encuentra y marca si sabe leerlo.
-            # Aqui solo interesan los legibles: cualquier otro archivo que
-            # aparezca en la carpeta no es bibliografia y no debe contarse como
-            # documento ni intentar trocearse.
-            if not doc.get("legible"):
-                continue
-            salida.append({
-                "nombre": doc["nombre"],
-                "categoria": doc["categoria"],
-                "ruta": doc["ruta"],
-                "huella": self._huella(doc["ruta"]),
-            })
-        return salida
-
-    @staticmethod
-    def _huella(ruta: str) -> str:
-        """
-        Identifica el contenido de un archivo sin tener que leerlo entero.
-
-        Se usan tamano y fecha de modificacion porque abrir y digerir 134
-        archivos solo para saber si cambiaron costaria mas que reindexarlos.
-        Si el archivo se edita, cualquiera de los dos valores cambia.
-
-        Args:
-            ruta: Ruta del archivo.
-
-        Returns:
-            Huella corta en hexadecimal.
-        """
-        try:
-            st = os.stat(ruta)
-            crudo = f"{st.st_size}-{int(st.st_mtime)}"
-        except OSError:
-            crudo = ruta
-        return hashlib.sha1(crudo.encode("utf-8")).hexdigest()[:16]
-
-
-# ==============================================================================
-# FUENTE DRIVE: pendiente de acceso
-# ==============================================================================
-
+#: Categoria de lo que cuelga directamente de la carpeta, sin subcarpeta.
+#:
+#: Antes se llamaba "Sin categoria", que se leia como un defecto del
+#: archivo. No lo es: estar en la raiz es un sitio tan valido como
+#: cualquier subcarpeta.
 RAIZ = "Raiz de la carpeta"
 
+
+# ==============================================================================
+# FUENTE DE DRIVE: la unica que hay
+# ==============================================================================
 
 class FuenteDrive:
     """
@@ -149,16 +73,60 @@ class FuenteDrive:
       3. Compartir la carpeta con el correo de la cuenta de servicio. Tener el
          archivo de credenciales no da acceso por si solo.
 
-    LIMITE CONOCIDO
-    ---------------
-    Los archivos nativos de Google (Documentos, Hojas de calculo, Presentaciones)
-    NO se leen: su nombre en Drive no lleva extension, asi que el filtro por
-    `EXTENSIONES_LEIBLES` los descarta. Solo entran archivos subidos de verdad
-    (.pdf, .docx, .xlsx, imagenes...). Si la informacion llega como Documento de
-    Google hay que exportarla antes, o anadir aqui la exportacion por mimeType.
+    LOS NATIVOS DE GOOGLE SI ENTRAN
+    -------------------------------
+    Los Documentos, Hojas de calculo y Presentaciones de Google se exportan al
+    vuelo segun la tabla `EXPORTACIONES`, porque no son archivos con bytes
+    propios y `get_media` falla con ellos.
+
+    Esto no es un detalle: es el unico puente OFICIAL que existe entre Gemini
+    Notebook y este proyecto. Notebook no tiene API publica, pero su boton
+    "Exportar a Documentos" deja la nota como Documento de Google en Drive. Si
+    cae en la carpeta que vigila el proyecto, entra sola en la siguiente
+    sincronizacion.
+
+    LO QUE SIGUE SIN ENTRAR
+    -----------------------
+    Un formato sin lector (.pptx, .dwg, .shp suelto) no entra, pero YA NO
+    desaparece: queda en `descartados` con su motivo, para que el agente pueda
+    decir que existe en vez de responder "no tengo informacion".
     """
 
     nombre = "drive"
+
+    #: Como se exporta cada tipo nativo de Google a un formato que si se sabe
+    #: leer: `mimeType de Drive -> (mimeType de exportacion, extension)`.
+    #:
+    #: POR QUE HACE FALTA
+    #: ------------------
+    #: Un Documento de Google no es un archivo: es una fila en una base de
+    #: datos de Google. No tiene bytes que bajar ni extension en el nombre, y
+    #: `files().get_media()` -- que es como se baja todo lo demas -- devuelve
+    #: un error con el. Hay que pedirle a Google que lo CONVIERTA primero,
+    #: con `files().export_media()`.
+    #:
+    #: POR QUE IMPORTA EN ESTE PROYECTO
+    #: --------------------------------
+    #: Es el unico puente oficial que existe entre Gemini Notebook y este
+    #: sistema. Notebook no tiene API publica, pero si tiene "Exportar a
+    #: Documentos", y lo que sale de ahi es un Documento de Google guardado
+    #: en Drive. Sin esta tabla, esas notas se veian en la carpeta y el
+    #: proyecto las saltaba en silencio.
+    #:
+    #: Cada destino se elige por el lector que ya existe en `corpus`:
+    #: Documentos a .docx (`_leer_docx`), Hojas a .xlsx (`_leer_excel`) y
+    #: Presentaciones a .pdf (`_leer_pdf`, que conserva la paginacion para
+    #: poder citar la diapositiva). No hay lector de .pptx.
+    EXPORTACIONES = {
+        "application/vnd.google-apps.document": (
+            "application/vnd.openxmlformats-officedocument"
+            ".wordprocessingml.document", ".docx"),
+        "application/vnd.google-apps.spreadsheet": (
+            "application/vnd.openxmlformats-officedocument"
+            ".spreadsheetml.sheet", ".xlsx"),
+        "application/vnd.google-apps.presentation": (
+            "application/pdf", ".pdf"),
+    }
 
     #: La UNICA autorizacion que este proyecto le pide a Google.
     #:
@@ -336,14 +304,28 @@ class FuenteDrive:
             Tupla `(listo, motivo)`.
         """
         if not self.carpeta_id:
-            return False, ("Falta DRIVE_CARPETA_ID en el .env: el identificador "
-                           "de la carpeta compartida, que sale de su direccion "
-                           "en el navegador.")
+            # Se nombra la PESTANA, no la variable. Quien lee esto suele ser
+            # quien usa la aplicacion, no quien la despliega, y existe un
+            # formulario que hace la conexion entera: mandarle a editar un
+            # archivo de configuracion es mandarle por el camino largo.
+            return False, ("Drive no esta conectado todavia. Se conecta "
+                           "desde la pestana 'Fuente de documentos': se pega "
+                           "la direccion de la carpeta compartida y las "
+                           "credenciales, y el sistema comprueba el acceso "
+                           "antes de guardar nada.")
         if not self.credenciales or not os.path.exists(self.credenciales):
-            return False, ("Falta el archivo de credenciales de Google. Crea "
-                           "una cuenta de servicio con permiso de SOLO LECTURA "
-                           "sobre la carpeta e indica su ruta en "
-                           "GOOGLE_CREDENCIALES.")
+            # NO SE NOMBRAN VARIABLES DE ENTORNO EN LO QUE LEE LA PERSONA
+            # -----------------------------------------------------------
+            # Quien ve este aviso esta usando la aplicacion, no
+            # desplegandola. Decirle "indica su ruta en GOOGLE_CREDENCIALES"
+            # le manda a editar un archivo de configuracion del servidor
+            # para resolver algo que la pestana hace sola, y encima le
+            # obliga a conocer un nombre que no tiene por que saber.
+            return False, ("Faltan las credenciales de Google. Se cargan en "
+                           "la pestana 'Fuente de documentos', pegando el "
+                           "cliente de OAuth o el archivo de la cuenta de "
+                           "servicio. Sea cual sea, basta con permiso de "
+                           "SOLO LECTURA sobre la carpeta.")
         try:
             servicio = self._servicio()
             servicio.files().get(fileId=self.carpeta_id,
@@ -368,7 +350,7 @@ class FuenteDrive:
         vuelve a pedir.
 
         Returns:
-            La misma forma que `FuenteLocal.documentos()`.
+            Lista de diccionarios con `nombre`, `categoria`, `ruta` y `huella`.
         """
         servicio = self._servicio()
         destino = self.carpeta_temporal()
@@ -381,7 +363,35 @@ class FuenteDrive:
         for archivo, categoria in self._recorrer(servicio, self.carpeta_id, ""):
             nombre = archivo["name"]
             extension = os.path.splitext(nombre)[1].lower()
+
+            # LOS NATIVOS DE GOOGLE SE EXPORTAN
+            # ---------------------------------
+            # Su nombre en Drive no lleva extension, asi que el filtro de
+            # abajo los descartaba en silencio. Se le anade la extension del
+            # formato al que se van a convertir, y asi el resto del camino
+            # -- el filtro, el lector, el troceado -- funciona igual que con
+            # un archivo subido.
+            exportar_como = ""
+            conversion = self.EXPORTACIONES.get(archivo.get("mimeType", ""))
+            if conversion:
+                exportar_como, extension = conversion
+                if not nombre.lower().endswith(extension):
+                    nombre += extension
+
             if extension not in corpus.EXTENSIONES_LEIBLES:
+                # NO se salta en silencio. Antes era un `continue` pelado, y
+                # un archivo en un formato que no se sabe leer desaparecia
+                # sin dejar constancia: el agente no podia ni decir que
+                # existia. Se apunta con su motivo, como todo lo demas.
+                self.descartados.append({
+                    "nombre": nombre,
+                    "mb": round(int(archivo.get("size") or 0)
+                                / (1024 * 1024), 1),
+                    "motivo": (f"no hay lector para '{extension}'"
+                               if extension
+                               else "el archivo no tiene extension"),
+                    "categoria": categoria or RAIZ,
+                })
                 continue
 
             # El tope de tamano se aplica ANTES de descargar, con el dato que
@@ -445,7 +455,8 @@ class FuenteDrive:
             # 77 segundos y la pantalla se quedaba en blanco mientras tanto.
             # Contar archivos no deberia costar una descarga.
             if descargar and not self._ya_esta(ruta, huella):
-                self._descargar(servicio, archivo["id"], ruta)
+                self._descargar(servicio, archivo["id"], ruta,
+                                exportar_como)
 
             salida.append({
                 "nombre": nombre,
@@ -501,6 +512,19 @@ class FuenteDrive:
 
         Returns:
             True si no hace falta volver a descargarlo.
+
+        LIMITE CON LOS NATIVOS DE GOOGLE
+        -------------------------------
+        Un Documento o una Hoja de Google no traen `md5Checksum`: no son
+        archivos, son filas en una base de datos de Google. La huella cae
+        entonces en `modifiedTime`, que nunca va a coincidir con el MD5 del
+        .docx exportado, asi que esta funcion devuelve False y el archivo se
+        vuelve a exportar en cada pasada.
+
+        Es la decision deliberada: entre reconvertir un Documento, que pesa
+        kilobytes, y arriesgarse a servir una version vieja, se prefiere lo
+        primero. Y en produccion no cambia nada, porque lo descargado de
+        Drive se borra despues de cada sincronizacion.
         """
         if not os.path.exists(ruta) or not huella:
             return False
@@ -655,14 +679,25 @@ class FuenteDrive:
         from core import catalogo as _cat
 
         extension = os.path.splitext(nombre)[1].lower()
-        if extension not in (".csv", ".tsv", ".txt"):
-            return {"lineas": [], "error": "no es una tabla de texto"}
+        if extension not in _cat.FORMATOS_RESUMIBLES:
+            # La lista la manda `catalogo`, que es quien tiene los lectores en
+            # streaming. Antes aqui habia una tupla escrita a mano con solo
+            # .csv, .tsv y .txt, y por eso un Excel grande no llegaba nunca a
+            # resumirse: se bajaba, se descartaba y no quedaba nada de el.
+            return {"lineas": [],
+                    "error": f"no hay lector en streaming para {extension}"}
 
         guardado = os.path.join(self._carpeta_resumenes(), nombre + ".json")
         if os.path.exists(guardado):
             try:
                 with open(guardado, "r", encoding="utf-8") as fh:
-                    return _json.load(fh)
+                    anterior = _json.load(fh)
+                # Un resumen guardado con una version anterior del resumidor
+                # se descarta y se rehace. Sin esta comprobacion, arreglar
+                # `resumir_tabla` no servia de nada para las capas que ya
+                # tenian resumen: seguian sirviendo el texto viejo.
+                if anterior.get("version") == _cat.VERSION_RESUMEN:
+                    return anterior
             except (OSError, ValueError):
                 pass  # resumen corrupto: se rehace
 
@@ -784,8 +819,13 @@ class FuenteDrive:
         """
         from googleapiclient.http import MediaIoBaseDownload
 
-        peticion = servicio.files().get_media(fileId=archivo_id,
-                                              supportsAllDrives=True)
+        # Aqui NO se exporta. Un nativo de Google no admite descarga
+        # parcial -- no hay bytes que recortar hasta que Google lo
+        # convierte --, y tampoco hace falta: Drive no le da `size`, asi
+        # que nunca llega al camino de la muestra, que solo se usa para
+        # decidir sobre archivos grandes.
+        peticion = servicio.files().get_media(
+            fileId=archivo_id, supportsAllDrives=True)
         temporal = ruta + ".parcial"
         try:
             with open(temporal, "wb") as f:
@@ -802,7 +842,8 @@ class FuenteDrive:
             return False
 
     @staticmethod
-    def _descargar(servicio, archivo_id: str, ruta: str) -> None:
+    def _descargar(servicio, archivo_id: str, ruta: str,
+                   exportar_como: str = "") -> None:
         """
         Baja un archivo de Drive al disco.
 
@@ -810,11 +851,21 @@ class FuenteDrive:
             servicio: Servicio de Drive.
             archivo_id: Identificador del archivo.
             ruta: Destino local.
+            exportar_como: mimeType al que convertirlo, para los
+                nativos de Google. Vacio para un archivo normal.
         """
         from googleapiclient.http import MediaIoBaseDownload
 
-        peticion = servicio.files().get_media(fileId=archivo_id,
-                                              supportsAllDrives=True)
+        if exportar_como:
+            # Un nativo de Google no tiene bytes propios: es una fila
+            # en una base de datos de Google, no un archivo. Hay que
+            # pedirle que lo CONVIERTA al vuelo; `get_media` falla con
+            # el. `export_media` no admite `supportsAllDrives`.
+            peticion = servicio.files().export_media(
+                fileId=archivo_id, mimeType=exportar_como)
+        else:
+            peticion = servicio.files().get_media(
+                fileId=archivo_id, supportsAllDrives=True)
         # Se escribe en un temporal y se renombra al final: si la descarga se
         # corta, no queda un archivo a medias que parezca bueno.
         temporal = ruta + ".parcial"
@@ -831,8 +882,20 @@ class FuenteDrive:
 # ==============================================================================
 
 #: Fuentes registradas. Anadir una nueva es anadir una entrada aqui.
+#: Fuentes registradas. Anadir una nueva es anadir una entrada aqui.
+#:
+#: YA NO HAY FUENTE LOCAL, Y ES DELIBERADO
+#: ---------------------------------------
+#: Habia una `FuenteLocal` que leia una carpeta `corpus/` del propio
+#: proyecto. Se quito junto con la carpeta. El motivo no es de limpieza:
+#: esa carpeta era un camino por el que el agente podia acabar estudiando
+#: lo que hubiera en el disco del servidor sin que nadie lo subiera a
+#: Drive. Se encontro de verdad -- un "informacion total.zip" olvidado que
+#: habria entrado al indice solo en cuanto se anadio el lector de .zip.
+#:
+#: Drive es la unica fuente. Si no esta configurada, el sistema se niega y
+#: lo dice; no hay segunda puerta.
 FUENTES = {
-    "local": FuenteLocal,
     "drive": FuenteDrive,
 }
 
@@ -852,6 +915,15 @@ def obtener(nombre: str = None):
             cuales valen, para no dejar al usuario adivinando.
     """
     elegida = (nombre or settings.fuente_corpus()).strip().lower()
+    if elegida == "local":
+        # Mensaje propio: una configuracion antigua puede seguir pidiendo
+        # "local", y un "valor desconocido" no explicaria por que.
+        raise ValueError(
+            "La fuente 'local' ya no existe: se retiro junto con la carpeta "
+            "corpus/ para que el agente no pueda estudiar nada que no este "
+            "en Drive. Conecta Drive desde la pestana 'Fuente de "
+            "documentos'."
+        )
     if elegida not in FUENTES:
         raise ValueError(
             f"Fuente de corpus desconocida: '{elegida}'. "

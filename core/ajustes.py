@@ -44,9 +44,27 @@ AJUSTES_PERMITIDOS = {
     "FUENTE_CORPUS",
     "DRIVE_CARPETA_ID",
     "GOOGLE_CREDENCIALES",
+    "GEMINI_API_KEY",
 }
 
+#: La clave del modelo se guarda aqui para que no haga falta editar el
+#: `.env`. Antes era la ultima cosa que obligaba a tocar un archivo del
+#: servidor, y quien usa la aplicacion no tiene por que entrar ahi.
+#:
+#: SOBRE GUARDAR UN SECRETO EN ESTE ARCHIVO
+#: ----------------------------------------
+#: `data/ajustes.json` esta en `.gitignore`, asi que no se sube al
+#: repositorio, igual que el `.env`. No es peor sitio que el que ya se
+#: usaba; es el mismo riesgo con menos pasos manuales. Quien prefiera el
+#: `.env` puede seguir usandolo: la variable de entorno tiene prioridad.
+
 _CERROJO = threading.Lock()
+
+#: Claves que `aplicar()` puso en el entorno la ultima vez.
+#:
+#: Sirve para saber cuales son SUYAS. Al volver a aplicar, retira las que
+#: ya no estan guardadas sin tocar las que vengan del `.env`.
+_APLICADOS = set()
 
 
 def ruta() -> str:
@@ -132,8 +150,29 @@ def aplicar() -> dict:
         Los ajustes que se aplicaron.
     """
     guardados = leer()
+    # SE RETIRA LO QUE ESTA FUNCION PUSO Y YA NO ESTA
+    # -----------------------------------------------
+    # Antes esto solo escribia. Si alguien desconectaba Drive, la clave
+    # desaparecia del archivo pero seguia viva en el entorno del proceso,
+    # y el sistema continuaba usandola: la persona pulsaba "Desconectar" y
+    # la pantalla seguia diciendo "Drive conectado".
+    #
+    # OJO CON LO QUE SE BORRA. El primer intento retiraba toda clave
+    # permitida que no estuviera en el archivo, y eso se llevo por delante
+    # `GEMINI_API_KEY`, que venia del `.env` y nunca se habia guardado
+    # aqui. El sistema se quedo sin modelo: la memoria dejo de indexarse y
+    # el motivo que daba -- "falta GEMINI_API_KEY en el .env" -- era falso,
+    # porque estaba.
+    #
+    # Esta funcion solo manda sobre lo que ELLA puso. Lo que venga del
+    # entorno o del `.env` no es suyo y no lo toca.
+    global _APLICADOS
+    for clave in _APLICADOS:
+        if clave not in guardados:
+            os.environ.pop(clave, None)
     for clave, valor in guardados.items():
         os.environ[clave] = valor
+    _APLICADOS = set(guardados)
     return guardados
 
 

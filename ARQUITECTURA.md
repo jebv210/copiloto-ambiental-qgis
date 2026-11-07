@@ -334,8 +334,8 @@ app.py ──────────┬──► agent/chatbot.py ────�
                  ├──► core/catalogo.py ──► core/dynamic_filter.py ──► core/textos.py
                  └──► config/settings.py   (todos leen de aquí)
 
-core/importar.py ──► corpus/          (añadir documentos, con validación)
-core/fuentes.py  ──► corpus/ o Drive  (de dónde salen; se elige en el .env)
+core/importar.py ──► data/importar/   (utilidad manual; NO es fuente del agente)
+core/fuentes.py  ──► Drive            (única fuente; se conecta desde la interfaz)
 
 api/server.py ───┴──► lo mismo, por HTTP  ◄── n8n
 ```

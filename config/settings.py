@@ -553,7 +553,11 @@ def pais_estudio() -> str:
 # ==============================================================================
 
 #: Modelo por defecto. Configurable con la variable `MODELO_LLM`.
-MODELO_LLM_DEFECTO = "gemini-3.5-flash"
+#: El que se usa de verdad en este despliegue. Antes aqui habia otro
+#: nombre de modelo distinto del que estaba configurado: mientras el .env
+#: existe no se nota, pero el dia que falte el sistema arrancaria pidiendole
+#: a Google un modelo que nadie ha comprobado que exista.
+MODELO_LLM_DEFECTO = "gemini-flash-lite-latest"
 
 
 def modelo_llm() -> str:
@@ -776,11 +780,46 @@ def diagnostico() -> dict:
 # no necesita servidor. Asi el proyecto sigue arrancando con doble clic para la
 # practica, y en despliegue basta apuntar QDRANT_URL al contenedor.
 
-#: De donde salen los documentos: "local" (carpeta corpus/) o "drive".
-FUENTE_CORPUS_DEFECTO = "local"
+#: De donde salen los documentos: "drive" o "local" (carpeta corpus/).
+#:
+#: DRIVE ES LA FUENTE, Y NO HAY SEGUNDA
+#: ------------------------------------
+#: El agente solo puede estudiar lo que este en la carpeta de Drive. La
+#: carpeta local `corpus/` esta DESCONECTADA a proposito.
+#:
+#: Por que importa que el valor por omision sea este y no "local": cuando
+#: Drive no esta configurado, lo que hacia el sistema era caer en silencio a
+#: la carpeta del equipo y indexar lo que hubiera dentro. Se vio en marcha:
+#: `/app/corpus` tenia un "informacion total.zip" olvidado, y en cuanto se
+#: anadio el lector de .zip ese archivo habria entrado al indice sin que
+#: nadie lo pidiera. El agente habria citado como fuente del proyecto algo
+#: que nadie subio a Drive.
+#:
+#: Con "drive" por omision eso no puede pasar: si Drive no esta configurado,
+#: `_indexar_todo` levanta un error diciendo que falta, y no se indexa NADA.
+#: Quedarse sin indice y decirlo es correcto; indexar lo que no toca y
+#: callarlo, no.
+#:
+#: "local" sigue existiendo para las baterias de prueba, que necesitan una
+#: carpeta controlada, y para migrar. No para produccion.
+FUENTE_CORPUS_DEFECTO = "drive"
 
 #: Coleccion de Qdrant donde viven los fragmentos del corpus.
-COLECCION_QDRANT_DEFECTO = "corpus_lepidopteros"
+#: NO ES UN NOMBRE CUALQUIERA: ERA DE OTRO PROYECTO
+#: -----------------------------------------------
+#: Hasta ahora decia "corpus_lepidopteros", heredado de un trabajo anterior
+#: sobre mariposas. Este sistema no es ese: evalua impactos ambientales en
+#: la cuenca del rio San Carlos, y su indice guarda capas, informes,
+#: fichas de campo y cartografia. Un nombre prestado de otro proyecto es
+#: justo lo que no debe quedar quemado en el codigo.
+#:
+#: AL CAMBIARLO, EL INDICE ANTERIOR DEJA DE VERSE
+#: ----------------------------------------------
+#: Una coleccion de Qdrant se identifica por su nombre. Apuntando a otro,
+#: lo que hubiera en el viejo sigue ahi pero ya no se consulta. Se cambio
+#: cuando el indice tenia 8 puntos y la fuente no veia ningun documento,
+#: asi que iban a borrarse en la siguiente sincronizacion de todas formas.
+COLECCION_QDRANT_DEFECTO = "copiloto_ambiental"
 
 #: Carpeta del modo embebido, relativa a la raiz del proyecto.
 #:
