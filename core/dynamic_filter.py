@@ -181,10 +181,14 @@ def obtener_municipios_nacional(progreso=None):
     try:
         gdf = gpd.read_file(origen)
     except Exception as exc:
+        # Se dice QUE hace falta, no en que variable escribirlo: quien ve
+        # este error esta usando la aplicacion, y la capa se puede dejar en
+        # la carpeta del proyecto sin tocar ninguna configuracion.
         raise RuntimeError(
             f"No se pudo leer la capa municipal desde '{origen}'. "
-            f"Si no hay internet, indique un archivo local en la variable "
-            f"RUTA_MUNICIPIOS_NACIONAL del archivo .env. Detalle: {exc}"
+            f"Si no hay conexion, deje el archivo de municipios en la "
+            f"carpeta 'data' del proyecto y vuelva a intentarlo. "
+            f"Detalle: {exc}"
         ) from exc
 
     # Guardar la cache solo si vino de la red y aun no existe.

@@ -78,9 +78,14 @@ def comprobar(nombre, condicion, detalle=""):
 
 CARPETA = "application/vnd.google-apps.folder"
 
-#: Un archivo nativo de Google. Se incluye a proposito: su nombre no lleva
-#: extension, y el sistema NO lo sabe leer. La prueba comprueba que se descarta
-#: en silencio y no revienta, que es la limitacion documentada.
+#: Un archivo nativo de Google. Se incluye a proposito porque es el UNICO
+#: puente oficial entre Gemini Notebook y este proyecto: "Exportar a
+#: Documentos" deja la nota como Documento de Google en Drive.
+#:
+#: Antes se descartaba, porque su nombre no lleva extension y el filtro por
+#: `EXTENSIONES_LEIBLES` lo tiraba. Ahora se exporta a .docx al vuelo, y esta
+#: prueba vigila que se pida por `export_media` y no por `get_media`, que es
+#: lo que falla con los nativos.
 DOCUMENTO_NATIVO = "application/vnd.google-apps.document"
 
 
@@ -101,6 +106,7 @@ class DriveFalso:
         self.arbol = arbol
         self.listados = 0
         self.descargas = []
+        self.exportaciones = []
 
     def files(self):
         """Devuelve el propio objeto, que hace de coleccion de archivos."""
@@ -147,6 +153,26 @@ class DriveFalso:
         self._pedido = fileId
         return self
 
+    def export_media(self, fileId=None, mimeType=None, **extra):
+        """
+        Imita `files().export_media()`, que es como se bajan los nativos.
+
+        Un Documento de Google no tiene bytes propios, asi que `get_media`
+        falla con el y hay que pedirle a Google que lo convierta. Se anota el
+        formato pedido para poder comprobar que se eligio el correcto.
+
+        Args:
+            fileId: Identificador del archivo.
+            mimeType: Formato al que se pide la conversion.
+            **extra: Lo que venga.
+
+        Returns:
+            El propio objeto, recordando que se pidio y en que formato.
+        """
+        self._pedido = fileId
+        self.exportaciones.append((fileId, mimeType))
+        return self
+
     def execute(self):
         """
         Devuelve el resultado del `list()` anterior.
@@ -188,6 +214,23 @@ def construir_arbol():
     jpg = b"\xff\xd8\xff\xe0" + b"imagen de prueba" * 4
     xls = b"PK\x03\x04" + b"hoja" * 8
 
+    # El .docx SI se construye de verdad, no con bytes inventados: es lo que
+    # sale de exportar un Documento de Google, y si el lector no lo pudiera
+    # abrir el puente con Notebook no serviria de nada. `_leer_docx` busca
+    # `word/document.xml` dentro del ZIP, asi que hay que ponerlo.
+    import io as _io
+    import zipfile as _zip
+
+    _buf = _io.BytesIO()
+    with _zip.ZipFile(_buf, "w") as _z:
+        _z.writestr("word/document.xml",
+                    '<?xml version="1.0"?>'
+                    '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+                    'wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>'
+                    'Nota exportada desde Gemini Notebook sobre la cuenca de '
+                    'San Carlos.</w:t></w:r></w:p></w:body></w:document>')
+    docx = _buf.getvalue()
+
     arbol = {
         "RAIZ": [
             {"id": "c1", "name": "Cartografia", "mimeType": CARPETA},
@@ -200,12 +243,21 @@ def construir_arbol():
              "md5Checksum": md5(pdf), "datos": pdf},
             {"id": "a2", "name": "tablas.xlsx", "mimeType": "application/xlsx",
              "md5Checksum": md5(xls), "datos": xls},
-            # Formato que el sistema NO sabe leer: debe descartarse.
-            {"id": "a3", "name": "proyecto.qgz", "mimeType": "application/zip",
-             "md5Checksum": md5(b"qgz"), "datos": b"qgz"},
-            # Archivo nativo de Google: sin extension en el nombre.
-            {"id": "a4", "name": "Informe de avance",
-             "mimeType": DOCUMENTO_NATIVO, "md5Checksum": ""},
+            # Formato que el sistema NO sabe leer: debe quedar declarado.
+            #
+            # Antes aqui habia un "proyecto.qgz", y dejo de servir cuando se
+            # anadio el lector de proyectos de QGIS: paso a ser legible y la
+            # prueba quedo comprobando lo contrario de lo que decia. Un .dwg
+            # de AutoCAD sigue sin tener lector, que es lo que hace falta.
+            {"id": "a3", "name": "plano_red_hidrica.dwg",
+             "mimeType": "application/dwg",
+             "md5Checksum": md5(b"dwg"), "datos": b"dwg"},
+            # Nativo de Google: sin extension y sin `size`, como los
+            # devuelve Drive de verdad. Sus "datos" son los del .docx al que
+            # se exporta.
+            {"id": "a4", "name": "Nota de Notebook",
+             "mimeType": DOCUMENTO_NATIVO, "md5Checksum": "",
+             "modifiedTime": "2026-11-01T10:00:00Z", "datos": docx},
             # Un CSV enorme, del tamano de los que llegaron de verdad. NO se
             # declara `datos`: la gracia es que ni siquiera se intente bajar.
             {"id": "a5", "name": "capa_nacional_enorme.csv",
@@ -223,8 +275,9 @@ def construir_arbol():
              "md5Checksum": md5(jpg), "datos": jpg},
         ],
     }
-    # Legibles: suelto.txt, mapa.pdf, tablas.xlsx, ficha_014.jpg, ficha_015.png
-    return arbol, 5
+    # Legibles: suelto.txt, mapa.pdf, tablas.xlsx, ficha_014.jpg,
+    # ficha_015.png y la nota de Notebook, que ahora se exporta a .docx.
+    return arbol, 6
 
 
 # ==============================================================================
@@ -256,9 +309,17 @@ def main():
     fuente = fuentes.FuenteDrive(carpeta_id="RAIZ", credenciales="(falsas)")
     fuente._servicio = lambda: drive
 
-    def descargar_falso(servicio, archivo_id, ruta):
-        """Escribe el contenido del arbol en vez de bajarlo de la red."""
+    def descargar_falso(servicio, archivo_id, ruta, exportar_como=""):
+        """
+        Escribe el contenido del arbol en vez de bajarlo de la red.
+
+        Acepta `exportar_como` a proposito: si manana la fuente deja de
+        pasarlo, esta firma deja de encajar y la prueba avisa en vez de que
+        los nativos se bajen por el camino equivocado.
+        """
         drive.descargas.append(archivo_id)
+        if exportar_como:
+            drive.exportaciones.append((archivo_id, exportar_como))
         with open(ruta, "wb") as f:
             f.write(drive.contenido(archivo_id))
 
@@ -284,10 +345,32 @@ def main():
 
         nombres = {d["nombre"] for d in documentos}
         comprobar("descarta el formato desconocido",
-                  "proyecto.qgz" not in nombres, "proyecto.qgz fuera")
-        comprobar("descarta el archivo nativo de Google",
-                  "Informe de avance" not in nombres,
-                  "sin extension, no se sabe leer; limitacion documentada")
+                  "plano_red_hidrica.dwg" not in nombres,
+                  "el .dwg no entra como bibliografia")
+        # EL PUENTE CON GEMINI NOTEBOOK
+        # -----------------------------
+        # Notebook no tiene API publica, pero su boton "Exportar a
+        # Documentos" deja la nota como Documento de Google en Drive. Si el
+        # proyecto no sabe leer los nativos, ese puente no existe: la nota se
+        # ve en la carpeta y el sistema la salta.
+        comprobar("un nativo de Google entra, con la extension puesta",
+                  "Nota de Notebook.docx" in nombres,
+                  "el Documento se nombra .docx y pasa el filtro")
+        comprobar("y se pide por export_media, no por get_media",
+                  any(ident == "a4" for ident, _ in drive.exportaciones),
+                  f"exportado como "
+                  f"{[m.split('.')[-1] for i, m in drive.exportaciones if i == 'a4']}"
+                  if drive.exportaciones else "no se pidio exportacion")
+
+        # Lo que NO se sabe leer tampoco desaparece: antes era un `continue`
+        # pelado y el archivo se esfumaba sin dejar constancia, asi que el
+        # agente no podia ni decir que existia.
+        _motivos = {d["nombre"]: d["motivo"] for d in fuente.descartados}
+        comprobar("un formato sin lector queda declarado, no se esfuma",
+                  "plano_red_hidrica.dwg" in _motivos
+                  and "dwg" in _motivos["plano_red_hidrica.dwg"],
+                  _motivos.get("plano_red_hidrica.dwg",
+                               "no quedo constancia"))
 
         # --- El tope de tamano, ANTES de descargar ---------------------------
         # El limite existia, pero solo en el inventario de la carpeta local:
@@ -361,8 +444,10 @@ def main():
         comprobar("el reparto usa las carpetas de Drive",
                   "_drive" not in reparto,
                   f"categorias: {sorted(reparto)}")
+        # Tres: mapa.pdf, tablas.xlsx y la nota de Notebook exportada a
+        # .docx. El .qgz no, que no hay lector.
         comprobar("Cartografia aparece con sus documentos",
-                  reparto.get("Cartografia") == 2,
+                  reparto.get("Cartografia") == 3,
                   f"{reparto.get('Cartografia')} documentos")
         comprobar("Fichas de campo incluye lo de la subcarpeta",
                   reparto.get("Fichas de campo") == 2,
@@ -373,9 +458,22 @@ def main():
         bajadas_primera = len(drive.descargas)
         drive.descargas.clear()
         fuente.documentos()
+        # LOS NATIVOS SON LA EXCEPCION, Y ES A PROPOSITO
+        # ----------------------------------------------
+        # `_ya_esta` compara el MD5 del archivo local con el `md5Checksum`
+        # que da Drive. Un nativo de Google NO tiene md5Checksum -- no es un
+        # archivo, es una fila en una base de datos suya --, asi que no hay
+        # con que comparar y se vuelve a exportar.
+        #
+        # Se deja asi a proposito: entre volver a convertir un Documento, que
+        # pesa kilobytes, y arriesgarse a servir una version vieja, se
+        # prefiere lo primero. En produccion da igual, porque lo descargado
+        # se borra despues de cada sincronizacion y nada se conserva en el
+        # equipo.
         comprobar("no vuelve a bajar lo que no cambio",
-                  drive.descargas == [],
-                  f"0 descargas (la primera vez fueron {bajadas_primera})")
+                  drive.descargas == ["a4"],
+                  f"solo se reexporta el nativo (la primera vez fueron "
+                  f"{bajadas_primera} descargas)")
 
         # --- Un documento cambia en Drive -----------------------------------
         print("\n--- Un documento cambia en Drive ---")
@@ -387,8 +485,9 @@ def main():
         drive.descargas.clear()
         fuente.documentos()
         comprobar("baja solo el que cambio",
-                  drive.descargas == ["a1"],
-                  f"descargas: {drive.descargas}")
+                  drive.descargas == ["a1", "a4"],
+                  f"el .pdf corregido y el nativo, que no se puede verificar: "
+                  f"{drive.descargas}")
         with open(os.path.join(corpus_falso, "_drive", "Cartografia",
                                "mapa.pdf"), "rb") as f:
             comprobar("el archivo local queda actualizado",
@@ -418,8 +517,16 @@ def main():
         print("\n--- Diagnostico ---")
         vacia = fuentes.FuenteDrive(carpeta_id="", credenciales="")
         listo, motivo = vacia.disponible()
+        # Se comprueba el COMPORTAMIENTO, no la redaccion. Antes esta
+        # linea exigia que el motivo dijera "DRIVE_CARPETA_ID", y eso ataba
+        # la prueba a un nombre de variable de entorno que no deberia
+        # aparecer en lo que lee una persona. Lo que importa es que no
+        # reviente, que diga que no esta listo, que explique algo, y que
+        # mande a la pestana en vez de a un archivo de configuracion.
         comprobar("sin configurar, explica que falta y no revienta",
-                  listo is False and "DRIVE_CARPETA_ID" in motivo,
+                  listo is False and len(motivo) > 25
+                  and "pestana" in motivo.lower()
+                  and ".env" not in motivo,
                   motivo[:66])
 
     finally:
@@ -435,6 +542,110 @@ def main():
         return 1
     print(f"{ACIERTOS} de {total} comprobaciones superadas")
     return 0
+
+
+
+# ==============================================================================
+# DESCONECTAR NO ES VOLVER A LA CARPETA LOCAL
+# ==============================================================================
+print("\n--- Desconectar Drive ---")
+
+import json as _json_des
+
+from core import ajustes as _ajustes_des
+from core import conexion_drive as _conexion
+
+_archivo_ajustes = _ajustes_des.ruta()
+_respaldo = None
+if os.path.exists(_archivo_ajustes):
+    with open(_archivo_ajustes, encoding="utf-8") as _fh:
+        _respaldo = _fh.read()
+try:
+    _conexion.desconectar()
+    with open(_archivo_ajustes, encoding="utf-8") as _fh:
+        _tras = _json_des.load(_fh)
+    # Dejar la fuente en "local" era el camino por el que el sistema
+    # acababa estudiando lo que hubiera en el disco sin que nadie lo
+    # pidiera. Al desconectar, la fuente sigue siendo Drive pero sin
+    # carpeta: el sistema se niega a sincronizar y lo dice.
+    comprobar("desconectar NO reactiva la carpeta local",
+              _tras.get("FUENTE_CORPUS") == "drive",
+              f"la fuente queda en '{_tras.get('FUENTE_CORPUS')}', sin "
+              f"carpeta configurada")
+    comprobar("y olvida la carpeta y la credencial",
+              _tras.get("DRIVE_CARPETA_ID") is None
+              and _tras.get("GOOGLE_CREDENCIALES") is None,
+              "no queda rastro de la conexion anterior")
+finally:
+    if _respaldo is not None:
+        with open(_archivo_ajustes, "w", encoding="utf-8") as _fh:
+            _fh.write(_respaldo)
+
+
+
+# ==============================================================================
+# EL RESUMEN GUARDADO CADUCA CUANDO CAMBIA EL RESUMIDOR
+# ==============================================================================
+#
+# El resumen de una capa de 418 MB se guarda en disco para no volver a
+# bajarla cada noche. Pero el archivo guardado no decia de que version era,
+# asi que sobrevivia a cualquier arreglo: las cuatro capas del proyecto
+# seguian sirviendo un texto del 25 de octubre, sin tres correcciones
+# posteriores. Un cache sin version es un cache que miente despacio.
+print("\n--- Caducidad del resumen guardado ---")
+
+import json as _json_ver
+
+from core import catalogo as _cat_ver
+from core import fuentes as _fu_ver
+
+_carpeta_ver = tempfile.mkdtemp(prefix="probar_version_")
+_fuente_ver = _fu_ver.FuenteDrive(carpeta_id="x", credenciales="y")
+_fuente_ver._carpeta_resumenes = staticmethod(lambda: _carpeta_ver)
+try:
+    _nombre_ver = "capa_vieja.csv"
+    _viejo = {"lineas": ["[Resumen de capa_vieja.csv]", "texto de antes"],
+              "filas": 1, "columnas_resumidas": [], "segundos": 0.1,
+              "error": ""}          # sin la clave "version"
+    with open(os.path.join(_carpeta_ver, _nombre_ver + ".json"), "w",
+              encoding="utf-8") as _fh:
+        _json_ver.dump(_viejo, _fh)
+
+    _bajadas = {"n": 0}
+
+    def _bajar_ver(_servicio, _ident, ruta_destino, exportar_como=""):
+        """Escribe una tabla pequena en vez de bajar 418 MB."""
+        _bajadas["n"] += 1
+        with open(ruta_destino, "w", encoding="utf-8") as _fh:
+            _fh.write("vereda,cobertura,area_ha\n")
+            for _i in range(40):
+                _fh.write(f"El Jordan,Bosque,{1.5 + _i}\n")
+
+    _fuente_ver._descargar = _bajar_ver
+    _rehecho = _fuente_ver._resumir_capa(None, "id", _nombre_ver,
+                                         _carpeta_ver)
+    comprobar("un resumen sin version se descarta y se rehace",
+              _bajadas["n"] == 1
+              and _rehecho.get("version") == _cat_ver.VERSION_RESUMEN,
+              f"se volvio a calcular, ahora en version "
+              f"{_rehecho.get('version')}")
+
+    comprobar("y el texto nuevo reemplaza al viejo",
+              not any("texto de antes" in l for l in _rehecho["lineas"])
+              and any("COMPLETA" in l for l in _rehecho["lineas"]),
+              "el resumen guardado ya no es el del 25 de octubre")
+
+    # Y con la version al dia NO se vuelve a bajar: el cache tiene que
+    # seguir sirviendo para lo que existe, que es ahorrar 418 MB por noche.
+    _antes_ver = _bajadas["n"]
+    _otra_vez = _fuente_ver._resumir_capa(None, "id", _nombre_ver,
+                                          _carpeta_ver)
+    comprobar("pero un resumen al dia se reutiliza, sin volver a bajar nada",
+              _bajadas["n"] == _antes_ver
+              and _otra_vez["filas"] == _rehecho["filas"],
+              "el cache sigue ahorrando la descarga")
+finally:
+    shutil.rmtree(_carpeta_ver, ignore_errors=True)
 
 
 if __name__ == "__main__":

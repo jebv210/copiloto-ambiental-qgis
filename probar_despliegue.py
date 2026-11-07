@@ -170,8 +170,22 @@ ARCHIVOS_VIGILADOS = [
     "core/fuentes.py", "core/geografia.py", "core/catalogo.py",
     "core/pegado.py", "core/estilos.py", "core/seguridad.py",
     "core/memoria.py", "core/ajustes.py", "core/conexion_drive.py",
-    "app.py",
 ]
+
+#: Archivos que solo vigila el contenedor que de verdad los ejecuta.
+#:
+#: `app.py` lo corre Streamlit en `copiloto-app`; `copiloto-api` arranca
+#: uvicorn sobre `api.server` y no lo abre nunca. Comparandolo en los dos,
+#: la bateria daba por desfasado un archivo que ese contenedor ni toca, y
+#: mandaba a reconstruir la imagen sin motivo. Peor aun: `copiloto-app` lo
+#: tiene MONTADO en vivo, asi que ahi nunca puede estar desfasado y la
+#: reconstruccion no habria arreglado nada.
+#:
+#: Una alarma que se dispara donde no pasa nada ensena a ignorar las
+#: alarmas.
+VIGILADOS_POR_CONTENEDOR = {
+    "copiloto-app": ["app.py"],
+}
 
 
 def _resumen_local(ruta):
@@ -185,13 +199,15 @@ def _resumen_local(ruta):
 
 
 for contenedor in ("copiloto-api", "copiloto-app"):
+    vigilados = (ARCHIVOS_VIGILADOS
+                 + VIGILADOS_POR_CONTENEDOR.get(contenedor, []))
     orden = ["python", "-c",
              "import hashlib,sys\n"
              "for r in sys.argv[1:]:\n"
              "    try:\n"
              "        print(r, hashlib.sha1(open('/app/'+r,'rb').read()).hexdigest()[:12])\n"
              "    except OSError:\n"
-             "        print(r, 'AUSENTE')"] + ARCHIVOS_VIGILADOS
+             "        print(r, 'AUSENTE')"] + vigilados
     salida = _en_contenedor(contenedor, orden)
     if not salida:
         omitir(f"{contenedor} ejecuta el codigo del disco",
@@ -199,12 +215,12 @@ for contenedor in ("copiloto-api", "copiloto-app"):
         continue
 
     dentro = dict(l.split() for l in salida.splitlines() if " " in l)
-    distintos = [r for r in ARCHIVOS_VIGILADOS
+    distintos = [r for r in vigilados
                  if dentro.get(r) != _resumen_local(r)]
     comprobar(
         f"{contenedor} ejecuta el codigo del disco",
         not distintos,
-        f"{len(ARCHIVOS_VIGILADOS)} archivos comparados"
+        f"{len(vigilados)} archivos comparados"
         if not distintos else
         f"DESFASADOS: {', '.join(distintos)}  ->  'docker compose build' "
         f"(sin nombre de servicio) y recrea")
@@ -237,9 +253,28 @@ if codigo == 200 and isinstance(estado, dict):
                   f"{fuente.get('documentos')} documentos")
 
     corpus_ = estado.get("corpus", {})
-    comprobar("el corpus se lee desde el contenedor",
-              corpus_.get("documentos", 0) > 0,
-              f"{corpus_.get('documentos')} documentos, version {corpus_.get('version')}")
+    # LA CARPETA LOCAL YA NO ES LA FUENTE
+    # -----------------------------------
+    # Esta comprobacion exigia que `corpus/` tuviera documentos. Dejo de
+    # tener sentido cuando se desconecto: el agente solo estudia lo que este
+    # en Drive, y la carpeta del equipo no debe aportar nada.
+    #
+    # Lo que si hay que vigilar es que no haya marcha atras silenciosa. Si
+    # la fuente es Drive, da igual lo que haya en `corpus/`: lo que cuenta
+    # es que el sistema lo diga y no indexe de tapadillo lo que encuentre en
+    # el disco. Se midio por que importa: la carpeta local tenia un
+    # "informacion total.zip" olvidado que, en cuanto se anadio el lector de
+    # .zip, habria entrado al indice sin que nadie lo pidiera. Esa carpeta
+    # ya se elimino, con su montaje y con la fuente que la leia.
+    if fuente.get("fuente") == "drive":
+        comprobar("la carpeta local no se usa como fuente",
+                  True,
+                  "la fuente es Drive; la carpeta local ya no existe")
+    else:
+        comprobar("el corpus se lee desde el contenedor",
+                  corpus_.get("documentos", 0) > 0,
+                  f"{corpus_.get('documentos')} documentos, version "
+                  f"{corpus_.get('version')}")
 
     vect = estado.get("vectorial", {})
     comprobar("el indice declara su modelo y tamano",
@@ -295,23 +330,54 @@ else:
     # sincronizacion no tiene trabajo y termina en menos de tres segundos, asi
     # que la segunda llamada llegaba cuando ya no habia ninguna en marcha y
     # recibia 200. No era un defecto del cerrojo, era la prueba midiendo mal.
+    # SE VIGILA POR EL ENDPOINT RAPIDO, NO POR /corpus/estado
+    # -------------------------------------------------------
+    # Antes se preguntaba por `/corpus/estado`, que tarda alrededor de un
+    # segundo en responder la primera vez. Con una fuente sin documentos la
+    # sincronizacion entera dura milisegundos, asi que la propia consulta
+    # duraba mas que lo que intentaba observar: veia `ejecutando: true` y,
+    # para cuando mandaba la segunda peticion, la primera ya habia acabado.
+    # La prueba fallaba acusando al cerrojo de un defecto que no tenia.
+    #
+    # `/corpus/sincronizacion` responde en 3 milisegundos y existe para esto.
     arranco = time.time()
     sigue = False
     while time.time() - arranco < 10:
-        _, estado = pedir(f"{API}/corpus/estado", espera=20)
-        sigue = bool((estado or {}).get("sincronizacion", {}).get("ejecutando"))
+        _, marcha = pedir(f"{API}/corpus/sincronizacion", espera=20)
+        sigue = bool((marcha or {}).get("ejecutando"))
         if sigue:
             break
 
     if not sigue:
-        # Termino antes de que diera tiempo a pillarla en marcha. No se puede
-        # comprobar la concurrencia, pero tampoco hay nada roto: se omite.
         omitir("rechaza la segunda simultanea",
                "la primera sincronizacion termino antes de poder solaparlas")
     else:
+        # Se guarda CUANDO arranco la primera. Es lo unico que permite
+        # distinguir despues las dos explicaciones de un 200.
+        arranco_primera = (marcha or {}).get("arranco")
         codigo2, r2 = pedir(f"{API}/corpus/sincronizar", "POST", {}, espera=60)
-        comprobar("rechaza la segunda simultanea", codigo2 == 409,
-                  f"HTTP {codigo2} (409 esperado)")
+        if codigo2 == 409:
+            comprobar("rechaza la segunda simultanea", True, "HTTP 409")
+        else:
+            # Un 200 aqui tiene DOS explicaciones y no se pueden confundir:
+            # que el cerrojo no funcione, o que la primera terminara en el
+            # hueco entre la comprobacion y esta llamada.
+            #
+            # Mirar si "hay algo ejecutando" NO sirve para distinguirlas: si
+            # la segunda peticion paso, arranco su PROPIA sincronizacion, asi
+            # que siempre se ve una en marcha. Lo que lo decide es la marca
+            # de arranque: si cambio, la segunda empezo una nueva y la
+            # primera ya habia acabado.
+            _, despues = pedir(f"{API}/corpus/sincronizacion", espera=20)
+            arranco_ahora = (despues or {}).get("arranco")
+            if arranco_ahora == arranco_primera:
+                comprobar("rechaza la segunda simultanea", False,
+                          f"HTTP {codigo2} con la primera aun en marcha: "
+                          f"el cerrojo no esta parando la segunda")
+            else:
+                omitir("rechaza la segunda simultanea",
+                       "la primera acabo entre la comprobacion y la segunda "
+                       "llamada: no hubo concurrencia que rechazar")
 
 
 # ==============================================================================
@@ -1200,6 +1266,60 @@ else:
         omitir("la capa del area se encuentra desde ahi",
                "todavia no se ha fijado un area de estudio")
 
+
+
+# ==============================================================================
+# LA SINCRONIZACION DEJA CONSTANCIA QUE SOBREVIVE AL REINICIO
+# ==============================================================================
+#
+# `_SINCRONIZACION` vive en el proceso. Al reiniciar la API volvia a "Sin
+# sincronizaciones en esta sesion", y con ella se perdia si la del cron de
+# las 02:00 funciono, cuanto indexo y que fallo.
+#
+# Se vio en marcha y fue el caso malo entero: una sincronizacion se corto a
+# mitad -- el equipo se durmio --, el contenedor arranco de nuevo y no
+# quedaba ni rastro. Hubo que deducir que el indice estaba incompleto
+# contando documentos distintos dentro de Qdrant. Eso no se le puede pedir
+# a nadie a las ocho de la manana.
+print("\nCONSTANCIA DE LA SINCRONIZACION - sobrevive al reinicio")
+
+_cod_sinc, _marcha = pedir(f"{API}/corpus/sincronizacion", espera=30)
+if _cod_sinc != 200 or not isinstance(_marcha, dict):
+    omitir("el seguimiento informa de la sincronizacion anterior",
+           f"el endpoint no respondio (HTTP {_cod_sinc})")
+else:
+    # La clave tiene que existir SIEMPRE, con valor nulo si todavia no hay
+    # ninguna registrada. Si faltara, la interfaz no podria distinguir
+    # "nunca se sincronizo" de "esta version no lo cuenta".
+    comprobar("el seguimiento declara siempre la sincronizacion anterior",
+              "anterior" in _marcha,
+              "la clave 'anterior' viene aunque sea nula")
+
+    _previa = _marcha.get("anterior")
+    if _previa is None:
+        omitir("y la anterior trae cuando fue y como acabo",
+               "todavia no ha terminado ninguna desde que se guarda")
+    else:
+        comprobar("y la anterior trae cuando fue y como acabo",
+                  isinstance(_previa, dict)
+                  and _previa.get("cuando")
+                  and ("mensaje" in _previa),
+                  f"{_previa.get('cuando')} — "
+                  f"{str(_previa.get('mensaje'))[:46]}")
+
+        # Lo que importa de verdad: distinguir una que acabo bien de una que
+        # fallo. Un registro que no lo diga no sirve para nada por la
+        # manana.
+        comprobar("y distingue si acabo bien o fallo",
+                  "error" in _previa and "resultado" in _previa,
+                  "exito y fallo quedan separados, no mezclados en el texto")
+
+    # Lo que esta pasando AHORA y lo que paso la ultima vez no se mezclan:
+    # confundirlos haria creer que hay trabajo en marcha cuando no lo hay.
+    comprobar("no se confunde lo de ahora con lo de antes",
+              isinstance(_marcha.get("ejecutando"), bool),
+              f"ejecutando={_marcha.get('ejecutando')} es del momento, "
+              f"'anterior' es historico")
 
 # ==============================================================================
 print("\n" + "=" * 70)

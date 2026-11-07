@@ -36,6 +36,7 @@ basta apuntar la variable al contenedor.
 """
 
 import atexit
+import os
 import hashlib
 import random
 import time
@@ -58,7 +59,31 @@ ESPERAS_REINTENTO = [2, 5, 15, 40, 70]
 #:
 #: El cuello NO son las peticiones sino los tokens: por eso agrandar el lote no
 #: acelera nada, solo hace que el 429 llegue antes.
-TOKENS_POR_MINUTO = 20000
+#:
+#: ESTE NUMERO ES EL QUE MANDA EN LO QUE TARDA TODO
+#: ------------------------------------------------
+#: Indexar no esta limitado por el disco ni por la CPU. Recorrer 418 MB tarda
+#: 27 segundos; vectorizar 2.000 fichas tarda media hora. La diferencia es
+#: este freno, y solo este.
+#:
+#: Con 20.000 tokens por minuto y fichas de ~225 tokens salen unas 89 fichas
+#: por minuto, o sea 1,5 por segundo. De ahi se saca cuanto va a tardar
+#: cualquier sincronizacion: fichas / 89 = minutos.
+#:
+#: SE PUEDE SUBIR, Y CONVIENE COMPROBARLO
+#: --------------------------------------
+#: La documentacion publica de Google da 30.000 tokens por minuto para la
+#: capa gratuita de embeddings, un 50% mas de lo que se midio aqui. La
+#: diferencia puede ser del modelo, del momento, o de que el limite sea por
+#: proyecto y no por clave. No se sube a ciegas: la medida propia es prueba y
+#: la cifra de internet no.
+#:
+#: Lo honesto es dejarlo ajustable y que se compruebe contra el limite real
+#: del proyecto, que aparece en la consola de AI Studio. Subirlo a 28.000
+#: acortaria las sincronizaciones un 40% sin pagar nada; pasarse solo
+#: provoca 429 y reintentos de 40 y 70 segundos, que es MAS lento que ir
+#: frenado.
+TOKENS_POR_MINUTO = int(os.environ.get("TOKENS_POR_MINUTO") or 20000)
 
 #: Estimacion de tokens a partir de caracteres. Para texto en espanol, cuatro
 #: caracteres por token se queda corto por poco, que es el lado seguro.
@@ -201,14 +226,16 @@ def _cliente_gemini():
     Raises:
         RuntimeError: Si no hay clave configurada.
     """
-    clave = settings.api_key_gemini()
-    if not clave:
+    cliente = corpus.cliente_gemini()
+    if cliente is None:
         raise RuntimeError(
             "Falta GEMINI_API_KEY en el .env. Los embeddings los genera "
             "Gemini, asi que sin clave no se puede construir el indice."
         )
-    from google import genai
-    return genai.Client(api_key=clave)
+    # Se pide a `corpus`, que lo guarda, en vez de construir uno aqui. Antes
+    # habia dos sitios creando clientes y ninguno lo reutilizaba: se midio
+    # que construirlo cuesta entre 1,5 y 9 segundos, cada vez.
+    return cliente
 
 
 # ==============================================================================
@@ -1210,6 +1237,120 @@ def indexar(forzar: bool = False, progreso=None) -> dict:
     return resumen
 
 
+def _fichas_de_presencia(nombre_doc: str, fichas: list) -> list:
+    """
+    Construye unas pocas fichas que describen un documento demasiado grande.
+
+    POR QUE NO SE DEJA EN NADA
+    --------------------------
+    Antes, un documento que se pasaba del presupuesto se descartaba y no
+    dejaba RASTRO en el indice. El efecto practico es el peor posible: el
+    agente consulta el indice, no encuentra nada, y responde "no tengo
+    informacion" sobre un archivo que estuvo en el disco. Eso se lee como
+    "ese documento no existe", que es falso.
+
+    Un documento de texto no se puede agregar como una tabla -- no hay
+    columnas que agrupar --, asi que lo que se indexa es su PRESENCIA: cuanto
+    mide, cuantas fichas costaria entero, como empieza y que terminos
+    aparecen mas. Son tres o cuatro fichas en vez de las miles que costaria
+    completo, y bastan para que el agente sepa que existe, de que trata y que
+    hace falta ampliar el presupuesto para leerlo entero.
+
+    Los terminos se cuentan EN LOCAL: contar palabras no gasta cuota.
+
+    Args:
+        nombre_doc: Nombre del documento.
+        fichas: Las fichas que habria dado entero, como `(pagina, texto)`.
+
+    Returns:
+        Lista corta de tuplas `(pagina, texto)` lista para indexar.
+    """
+    from collections import Counter
+
+    paginas = {p for p, _ in fichas}
+    cabecera = [
+        f"[Presencia de {nombre_doc}]",
+        f"Documento de {len(paginas)} paginas que daria "
+        f"{len(fichas)} fichas, por encima del presupuesto de "
+        f"{corpus.PRESUPUESTO_FICHAS}. Se leyo COMPLETO pero solo se indexa "
+        f"esta descripcion: para buscar dentro de el hace falta ampliar el "
+        f"presupuesto de fichas.",
+    ]
+
+    # Terminos mas frecuentes, sin las palabras de funcion que no distinguen
+    # nada. No es un resumen semantico: es una pista de contenido que sale
+    # gratis.
+    vacias = {
+        "para", "como", "esta", "este", "esto", "esas", "esos", "pero", "mas",
+        "sus", "los", "las", "del", "una", "uno", "unos", "unas", "que", "con",
+        "por", "sin", "sobre", "entre", "desde", "hasta", "donde", "cuando",
+        "ser", "son", "fue", "han", "hay", "the", "and", "for", "with",
+    }
+    cuenta = Counter()
+    for _pagina, texto in fichas:
+        for palabra in texto.lower().split():
+            limpia = "".join(c for c in palabra if c.isalpha())
+            if len(limpia) > 3 and limpia not in vacias:
+                cuenta[limpia] += 1
+    if cuenta:
+        cabecera.append("Terminos mas frecuentes: " + ", ".join(
+            f"{palabra} ({veces})" for palabra, veces in cuenta.most_common(40)))
+
+    salida = [(1, chr(10).join(cabecera))]
+    # Como empieza, que suele traer el titulo, el autor y el objeto del
+    # documento. Es lo que mas ayuda a reconocerlo en una busqueda.
+    for pagina, texto in fichas[:2]:
+        salida.append((pagina, texto))
+    return salida
+
+
+def _conviene_resumir(ruta: str) -> bool:
+    """
+    Dice si una tabla hay que recorrerla en streaming en vez de abrirla.
+
+    POR QUE EXISTE
+    --------------
+    `corpus.leer_documento` carga el archivo ENTERO en memoria: para Excel
+    pasa por pandas, que construye un DataFrame con todas las filas. Un libro
+    de 400 MB se convierte en varios gigas de RAM y tumba el contenedor
+    ANTES de llegar al guardia del presupuesto, que es justo quien deberia
+    haberlo parado. Por eso la decision tiene que tomarse por el TAMANO, sin
+    abrir nada.
+
+    DE DONDE SALE EL UMBRAL
+    -----------------------
+    Del presupuesto mismo: `PRESUPUESTO_FICHAS` fichas de `TAMANO_FICHA`
+    caracteres son 1,72 MB de texto. Por debajo de eso ninguna tabla puede
+    pasarse del presupuesto, asi que se indexa entera y punto.
+
+    Se midio que el umbral vale igual para Excel que para CSV: un .xlsx da
+    unas 1.500 fichas por MB (2.000 filas -> 1.336; 20.000 -> 1.508;
+    100.000 -> 1.535) y un CSV tabular daba 1.485. La compresion del ZIP y el
+    relleno del XML casi se anulan entre si, asi que no hace falta un umbral
+    aparte por formato.
+
+    Args:
+        ruta: Archivo ya descargado.
+
+    Returns:
+        True si hay que desviarlo al resumen agregado.
+    """
+    from core import catalogo as _cat
+
+    if os.path.splitext(ruta)[1].lower() not in _cat.FORMATOS_RESUMIBLES:
+        return False
+    try:
+        if os.path.getsize(ruta) <= (corpus.PRESUPUESTO_FICHAS
+                                     * corpus.TAMANO_FICHA):
+            return False
+    except OSError:
+        return False
+    # La extension no basta. Un informe de prosa de 3 MB tambien es un .txt,
+    # y agruparlo por columnas no significa nada: hay que mirar si de verdad
+    # tiene filas con la misma forma.
+    return _cat.parece_tabla(ruta)
+
+
 def _indexar_documento(cliente, nombre: str, doc: dict, resumen: dict,
                        progreso=None, puesto: str = "") -> None:
     """
@@ -1226,11 +1367,77 @@ def _indexar_documento(cliente, nombre: str, doc: dict, resumen: dict,
     from qdrant_client import models
 
     fichas = []
-    for pagina, texto in corpus.leer_documento(doc["ruta"]):
-        for trozo in corpus.trocear(texto):
-            if merece_vector(trozo):
-                fichas.append((pagina, trozo))
+
+    # TABLA GRANDE: SE RECORRE COMPLETA Y SE INDEXA SU RESUMEN
+    # --------------------------------------------------------
+    # Antes de este desvio, un Excel grande se bajaba entero, se intentaba
+    # abrir con pandas y -- si sobrevivia a la memoria -- se descartaba abajo
+    # por presupuesto SIN dejar nada: ni catalogo ni resumen. Se gastaba la
+    # descarga y el agente seguia diciendo "no tengo informacion" de un
+    # archivo que habia tenido en el disco.
+    #
+    # Ahora se recorre en streaming de punta a punta, se agrupa y se indexa
+    # el agregado. La lectura es COMPLETA -- el recuento de filas y las sumas
+    # son exactos sobre todo el archivo -- y no gasta ni un embedding en
+    # recorrerlo: lo unico que se vectoriza son las pocas decenas de lineas
+    # del resumen.
+    if _conviene_resumir(doc["ruta"]):
+        from core import catalogo as _cat
+
+        datos = _cat.resumir_tabla(doc["ruta"])
+        if not datos.get("lineas"):
+            # No se pudo recorrer. Se dice por que y NO se cae al lector
+            # normal: abrirlo con pandas es justo lo que hay que evitar.
+            resumen.setdefault("no_resumidas", []).append({
+                "documento": doc["nombre"],
+                "error": datos.get("error") or "no se pudo recorrer",
+            })
+            if progreso:
+                progreso(f"{puesto} {doc['nombre'][:42]} — no se pudo "
+                         f"recorrer", resumen.get("_fraccion", 0.0))
+            return
+        for trozo in corpus.trocear(chr(10).join(datos["lineas"])):
+            fichas.append((1, trozo))
+        resumen.setdefault("resumidas", []).append({
+            "documento": doc["nombre"],
+            "filas": datos["filas"],
+            "fichas": len(fichas),
+            "segundos": datos["segundos"],
+        })
+        if progreso:
+            progreso(f"{puesto} {doc['nombre'][:42]} — "
+                     f"{datos['filas']} filas recorridas, "
+                     f"{len(fichas)} fichas de resumen",
+                     resumen.get("_fraccion", 0.0))
+    else:
+        for pagina, texto in corpus.leer_documento(doc["ruta"]):
+            for trozo in corpus.trocear(texto):
+                if merece_vector(trozo):
+                    fichas.append((pagina, trozo))
+
     if not fichas:
+        # NO SE SALE EN SILENCIO
+        # ----------------------
+        # Que un archivo no diera texto se trataba como un no-evento: se
+        # hacia `return` y nadie se enteraba. Pero las dos causas que lo
+        # provocan de verdad no son "estaba vacio":
+        #
+        #   - una imagen que no se pudo transcribir, porque la cuota del
+        #     modelo se agoto o porque falta la clave
+        #   - un PDF escaneado, que es una imagen sin capa de texto
+        #
+        # En los dos casos el archivo SI tiene contenido y hay que volver a
+        # intentarlo otro dia. Se deja constancia en el informe para que se
+        # vea, en vez de que el archivo se esfume.
+        resumen.setdefault("sin_contenido", []).append({
+            "documento": doc["nombre"],
+            "extension": os.path.splitext(doc["ruta"])[1].lower(),
+            "mb": round(os.path.getsize(doc["ruta"]) / (1024 * 1024), 2)
+                  if os.path.exists(doc["ruta"]) else 0,
+        })
+        if progreso:
+            progreso(f"{puesto} {doc['nombre'][:42]} — no dio texto, "
+                     f"queda pendiente", resumen.get("_fraccion", 0.0))
         return
 
     # GUARDIA EXACTO DEL PRESUPUESTO
@@ -1244,15 +1451,21 @@ def _indexar_documento(cliente, nombre: str, doc: dict, resumen: dict,
     # diario para luego abandonar el documento a medias seria lo peor de las
     # dos opciones.
     if len(fichas) > corpus.PRESUPUESTO_FICHAS:
+        # NO se abandona. Se cambian sus miles de fichas por tres que digan
+        # que existe, de que trata y que esta sin leer del todo. Antes se
+        # hacia `return` y el documento desaparecia del indice, asi que el
+        # agente respondia "no tengo informacion" sobre algo que si tenia.
         resumen.setdefault("fuera_de_presupuesto", []).append({
             "documento": doc["nombre"],
             "fichas": len(fichas),
             "presupuesto": corpus.PRESUPUESTO_FICHAS,
+            "indexado_como": "presencia",
         })
         if progreso:
             progreso(f"{puesto} {doc['nombre'][:42]} — {len(fichas)} fichas, "
-                     f"fuera de presupuesto", resumen.get("_fraccion", 0.0))
-        return
+                     f"fuera de presupuesto: se indexa su presencia",
+                     resumen.get("_fraccion", 0.0))
+        fichas = _fichas_de_presencia(doc["nombre"], fichas)
 
     # El documento mas grande del corpus pesa 2,5 MB y da miles de fichas: sin
     # avisar por dentro, la indexacion parecia colgada ocho minutos seguidos

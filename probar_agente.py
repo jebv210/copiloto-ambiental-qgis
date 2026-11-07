@@ -104,9 +104,25 @@ comprobar("la herramienta del corpus no presupone el tema",
           "mariposa" not in desc and "lepidopt" not in desc,
           "su descripcion es la que lee el modelo")
 
-comprobar("las dos puertas de entrada estan registradas",
-          set(fuentes.FUENTES) == {"local", "drive"},
+# SOLO HAY UNA PUERTA DE ENTRADA, Y ES A PROPOSITO
+# ------------------------------------------------
+# Habia dos: "local" leia una carpeta `corpus/` del propio proyecto. Se
+# retiro junto con la carpeta, porque era el camino por el que el agente
+# podia acabar estudiando algo que nadie subio a Drive. Se comprobo que ya
+# habia pasado: un "informacion total.zip" olvidado que habria entrado al
+# indice solo en cuanto se anadio el lector de .zip.
+comprobar("Drive es la UNICA fuente registrada",
+          set(fuentes.FUENTES) == {"drive"},
           ", ".join(sorted(fuentes.FUENTES)))
+
+try:
+    fuentes.obtener("local")
+    comprobar("pedir la fuente retirada falla y explica por que",
+              False, "la acepto en vez de rechazarla")
+except ValueError as _exc:
+    comprobar("pedir la fuente retirada falla y explica por que",
+              "ya no existe" in str(_exc) and "Drive" in str(_exc),
+              str(_exc)[:70])
 
 previo = os.environ.get("FUENTE_CORPUS")
 os.environ["FUENTE_CORPUS"] = "drive"
@@ -334,6 +350,51 @@ if _fichas_locales == 0:
 else:
     omitir("sin texto local no afirma que un binomio 'NO aparece'",
            f"hay {_fichas_locales} fichas locales: si puede comprobarlo")
+
+
+# ==============================================================================
+# LAS COORDENADAS SE DAN, NO SE INSINUAN
+# ==============================================================================
+#
+# A la pregunta mas obvia que se le puede hacer a un area de estudio
+# -- donde esta -- el agente no tenia con que responder: describia el
+# nombre, los km2 y el numero de vertices, y ninguna coordenada.
+print("\n--- Coordenadas del area de estudio ---")
+
+_descripcion = tools.describir_area_de_estudio()
+
+if "no hay ninguna fijada" in _descripcion:
+    omitir("el area declara entre que coordenadas cae",
+           "no hay area de estudio fijada en este equipo")
+    omitir("y dice donde esta su centro", "idem")
+    omitir("la ruta de la capa no mezcla barras", "idem")
+else:
+    import re as _re_coord
+
+    comprobar("el area declara entre que coordenadas cae",
+              "EPSG:4326" in _descripcion
+              and "de latitud" in _descripcion
+              and "de longitud" in _descripcion,
+              next((l for l in _descripcion.split(chr(10))
+                    if "latitud" in l), "")[:88])
+
+    _centro = _re_coord.search(
+        r"centro cae en (-?\d+\.\d+), (-?\d+\.\d+)", _descripcion)
+    comprobar("y dice donde esta su centro",
+              _centro is not None
+              and 6.0 < float(_centro.group(1)) < 6.4
+              and -75.2 < float(_centro.group(2)) < -74.7,
+              f"{_centro.group(1)}, {_centro.group(2)} — dentro de San "
+              f"Carlos" if _centro else "no da el centro")
+
+    # La ruta se arma dentro de un contenedor Linux pero apunta al equipo
+    # de quien pregunta, que es Windows. Mezclar las dos barras deja
+    # "C:\\proyecto/data/capa.geojson", que se lee como un error.
+    _linea_ruta = next((l for l in _descripcion.split(chr(10))
+                        if "La capa esta en" in l), "")
+    comprobar("la ruta de la capa no mezcla barras",
+              not ("/" in _linea_ruta and chr(92) in _linea_ruta),
+              _linea_ruta[:88] or "no se nombra la capa")
 
 # ==============================================================================
 print("\n" + "=" * 70)

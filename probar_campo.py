@@ -317,6 +317,255 @@ comprobar("un formato que no se sabe leer se declara",
 shutil.rmtree(BANCO, ignore_errors=True)
 
 # ==============================================================================
+# SHAPEFILE: LO QUE DE VERDAD EXPORTA QFIELD
+# ==============================================================================
+#
+# El paquete real del equipo, PROYECTO_MARIPOSAS_SAN_CARLOS.zip, pesa 584 MB
+# y NO trae ningun GeoPackage: trae un shapefile de 58 registros con 37
+# campos, un poligono de monitoreo, un raster y 229 fotografias. Antes de
+# estas comprobaciones el validador lo abria y contestaba que no habia nada
+# que revisar, que es la peor respuesta posible: no es que los datos esten
+# mal, es que no se miraron.
+print("\n--- Shapefile: el formato que llega de campo ---")
+
+import struct as _st_shp
+import zipfile as _zip_shp
+
+_banco_shp = tempfile.mkdtemp(prefix="probar_campo_shp_")
+try:
+    def _shapefile(base, campos, filas, puntos, geogcs=True, cpg="UTF-8"):
+        """
+        Escribe un shapefile con sus hermanos.
+
+        Args:
+            base: Ruta sin extension.
+            campos: Nombres de columna.
+            filas: Valores, una lista por registro.
+            puntos: Lista de `(lon, lat)`, o None para geometria nula.
+            geogcs: Si el .prj declara coordenadas geograficas.
+            cpg: Codificacion declarada.
+        """
+        cuerpo = b""
+        for numero, par in enumerate(puntos, start=1):
+            if par is None:
+                contenido = _st_shp.pack("<i", 0)        # registro nulo
+            else:
+                contenido = _st_shp.pack("<idd", 1, par[0], par[1])
+            cuerpo += (_st_shp.pack(">ii", numero, len(contenido) // 2)
+                       + contenido)
+        reales = [p for p in puntos if p]
+        cabecera = bytearray(100)
+        cabecera[0:4] = _st_shp.pack(">i", 9994)
+        cabecera[24:28] = _st_shp.pack(">i", (100 + len(cuerpo)) // 2)
+        cabecera[28:32] = _st_shp.pack("<i", 1000)
+        cabecera[32:36] = _st_shp.pack("<i", 1)
+        if reales:
+            cabecera[36:68] = _st_shp.pack(
+                "<dddd", min(p[0] for p in reales), min(p[1] for p in reales),
+                max(p[0] for p in reales), max(p[1] for p in reales))
+        with open(base + ".shp", "wb") as fh:
+            fh.write(bytes(cabecera) + cuerpo)
+
+        largo = 80
+        descriptores = b""
+        for nombre in campos:
+            bruto = nombre.encode(cpg)[:11]
+            descriptores += (bruto.ljust(11, b"\x00") + b"C" + b"\x00" * 4
+                             + bytes([largo]) + b"\x00" * 15)
+        cab = bytearray(32)
+        cab[0] = 0x03
+        cab[4:8] = _st_shp.pack("<I", len(filas))
+        cab[8:10] = _st_shp.pack("<H", 32 + len(descriptores) + 1)
+        cab[10:12] = _st_shp.pack("<H", 1 + largo * len(campos))
+        datos = b""
+        for fila in filas:
+            datos += b" " + b"".join(
+                str(v).encode(cpg)[:largo].ljust(largo, b" ") for v in fila)
+        with open(base + ".dbf", "wb") as fh:
+            fh.write(bytes(cab) + descriptores + b"\x0d" + datos + b"\x1a")
+
+        with open(base + ".prj", "w", encoding="latin-1") as fh:
+            fh.write('GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984"]]' if geogcs
+                     else 'PROJCS["WGS 84 / Pseudo-Mercator",PROJECTION["x"]]')
+        with open(base + ".cpg", "w", encoding="ascii") as fh:
+            fh.write(cpg)
+
+    # Dentro del area de estudio de San Carlos, que es la que esta fijada.
+    _DENTRO = [(-75.0061, 6.1827), (-75.0008, 6.1870), (-75.0010, 6.1869)]
+
+    # --- Un shapefile suelto ---------------------------------------------
+    _base = os.path.join(_banco_shp, "Formulario Mariposas")
+    _shapefile(_base, ["Nombre cie", "Notas de c", "Fecha"],
+               [["Hamadryas", "", "20260823"],
+                ["Anartia amathea", "sobre flor", "20260913"],
+                ["", "", "20260926"]],
+               _DENTRO)
+    _lec = campo.leer(_base + ".shp")
+    comprobar("se lee un shapefile de campo",
+              _lec["formato"] == "shp" and len(_lec["puntos"]) == 3,
+              f"{len(_lec['puntos'])} puntos leidos del .shp")
+
+    comprobar("los atributos acompanan a cada punto",
+              _lec["puntos"][0]["titulo"] == "Hamadryas"
+              and _lec["puntos"][1]["nota"] == "sobre flor",
+              "la especie y la nota viajan con su coordenada")
+
+    # --- Un registro sin coordenada se DECLARA ---------------------------
+    # Se midio en el paquete real: de sus 58 registros, uno trae la ficha
+    # llena y la geometria vacia. Si se descarta callando, el recuento baja
+    # de 58 a 57 y nadie sabe por que.
+    _nulo = os.path.join(_banco_shp, "Con hueco")
+    _shapefile(_nulo, ["Nombre cie"], [["Morpho"], ["Heliconius"]],
+               [_DENTRO[0], None])
+    _lec_nulo = campo.leer(_nulo + ".shp")
+    comprobar("un registro sin coordenada no desaparece en silencio",
+              len(_lec_nulo["puntos"]) == 1
+              and any("NO traen coordenada" in a
+                      for a in _lec_nulo["avisos"]),
+              _lec_nulo["avisos"][0][:72] if _lec_nulo["avisos"]
+              else "no quedo constancia")
+
+    # --- Un sistema proyectado no se interpreta como grados --------------
+    # Leer metros como si fueran grados no da error: pone los puntos en
+    # otro continente y el validador los declara "fuera del area".
+    _metros = os.path.join(_banco_shp, "En metros")
+    _shapefile(_metros, ["Nombre cie"], [["Morpho"]],
+               [(-8359244.11, 680260.31)], geogcs=False)
+    _lec_m = campo.leer(_metros + ".shp")
+    comprobar("un shapefile en metros se rechaza en vez de malinterpretarse",
+              not _lec_m["puntos"]
+              and any("proyectado" in a for a in _lec_m["avisos"]),
+              "se avisa de que hay que reproyectarlo")
+
+    # --- El titulo cae a la siguiente columna cuando la primera esta vacia
+    # Se midio en el formulario del equipo: 19 registros traen nombre
+    # cientifico y 23 traen nombre comun, pero solo 26 traen alguno. Con una
+    # sola columna, el validador acusaba de "sin identificar" a siete
+    # registros que si lo estaban.
+    _dos = os.path.join(_banco_shp, "Dos nombres")
+    _shapefile(_dos, ["Nombre cie", "Nombre com"],
+               [["", "Mariposa monarca"], ["Morpho helenor", ""]],
+               _DENTRO[:2])
+    _lec_dos = campo.leer(_dos + ".shp")
+    _titulos = [p["titulo"] for p in _lec_dos["puntos"]]
+    comprobar("si falta el nombre cientifico se usa el comun",
+              _titulos == ["Mariposa monarca", "Morpho helenor"],
+              "ningun registro identificado se cuenta como anonimo")
+
+    # --- Dentro de un .zip, con los hermanos juntos ----------------------
+    # Es como llega de verdad. Extraer cada archivo por su lado separaria
+    # el .shp de su .dbf y la capa entraria muda.
+    _paquete = os.path.join(_banco_shp, "salida_de_campo.zip")
+    with _zip_shp.ZipFile(_paquete, "w") as _z:
+        for _ext in (".shp", ".dbf", ".prj", ".cpg"):
+            _z.write(_base + _ext, "PROYECTO/Formulario Mariposas" + _ext)
+        # Una foto, para comprobar que NO se extrae lo que no se revisa.
+        _z.writestr("PROYECTO/DCIM/foto.jpg", b"\xff\xd8\xff\xe0" + b"x" * 5000)
+    _lec_zip = campo.leer(_paquete)
+    comprobar("un shapefile dentro de un .zip conserva sus atributos",
+              len(_lec_zip["puntos"]) == 3
+              and _lec_zip["puntos"][0]["titulo"] == "Hamadryas",
+              "los cinco archivos se extraen juntos")
+
+    # --- El veredicto completo -------------------------------------------
+    _v = campo.revisar(_lec_zip)
+    comprobar("el veredicto dice si sirve y con que recuento",
+              _v["sirve"] is True and _v["resumen"]["puntos"] == 3,
+              f"sirve={_v['sirve']}, {_v['resumen']['puntos']} puntos, "
+              f"{_v['resumen']['dentro']} dentro del area")
+
+    # --- Lo que no se sabe leer se declara --------------------------------
+    comprobar("el mensaje de formato desconocido nombra el shapefile",
+              ".shp" in campo.leer(os.path.join(
+                  _banco_shp, "x.rtf"))["avisos"][0],
+              "se admiten .zip, .gpkg, .shp, .xlsx y .csv")
+finally:
+    shutil.rmtree(_banco_shp, ignore_errors=True)
+
+
+# ==============================================================================
+# LO REVISADO SE CONVIERTE EN CAPA DE MAPA
+# ==============================================================================
+#
+# Estudiar y cartografiar eran dos caminos que no se cruzaban. El agente
+# indexaba el paquete de campo y sabia responder sobre el, pero el mapa
+# seguia saliendo del KMZ del area: se subia un .zip con 57 registros de
+# mariposas y la cartografia salia identica, como si no se hubiera hecho
+# nada. Visto desde fuera, el sistema parecia roto.
+print("\n--- Los datos de campo acaban en el mapa ---")
+
+import json as _json_capa
+
+_banco_capa = tempfile.mkdtemp(prefix="probar_capa_campo_")
+_extra_real = campo.carpeta_capas_extra
+campo.carpeta_capas_extra = lambda: _banco_capa
+try:
+    _veredicto = {
+        "sirve": True,
+        "puntos": [
+            {"lon": -75.0061, "lat": 6.1827, "titulo": "Hamadryas",
+             "nota": "sobre tronco", "fecha": "20260823",
+             "capa": "Formulario", "dentro": True},
+            {"lon": -75.0008, "lat": 6.1870, "titulo": "Anartia amathea",
+             "nota": "", "fecha": "20260913", "capa": "Formulario",
+             "dentro": False},
+        ],
+        "resumen": {}, "problemas": [], "avisos": [],
+    }
+    _hecho = campo.exportar_capa(_veredicto, "PROYECTO_MARIPOSAS.zip")
+    comprobar("revisar un paquete escribe una capa de mapa",
+              _hecho.get("puntos") == 2 and os.path.exists(_hecho["ruta"]),
+              _hecho.get("nombre", _hecho.get("error", "")))
+
+    # Va a `capas_extra/` y no a `data/` a proposito: el script de QGIS
+    # carga esa carpeta entera sin que nadie toque su codigo, y ese script
+    # es zona intocable del proyecto.
+    comprobar("la capa va donde QGIS la recoge sin tocar su script",
+              os.path.dirname(_hecho["ruta"]) == _banco_capa,
+              "escrita en la carpeta de capas propias")
+
+    with open(_hecho["ruta"], encoding="utf-8") as _fh:
+        _capa = _json_capa.load(_fh)
+    comprobar("es un GeoJSON de puntos con sus coordenadas",
+              _capa["type"] == "FeatureCollection"
+              and _capa["features"][0]["geometry"]["type"] == "Point"
+              and _capa["features"][0]["geometry"]["coordinates"][1] == 6.1827,
+              f"{len(_capa['features'])} entidades de tipo Point")
+
+    _props = [f["properties"] for f in _capa["features"]]
+    comprobar("cada punto lleva su especie, su nota y su fecha",
+              _props[0]["titulo"] == "Hamadryas"
+              and _props[0]["fecha"] == "20260823",
+              "los atributos viajan con la geometria")
+
+    # Lo primero que se mira en un mapa de validacion es quien cayo fuera.
+    comprobar("y si cayo dentro o fuera del area de estudio",
+              _props[0]["en_el_area"] == "si"
+              and _props[1]["en_el_area"] == "no",
+              "dentro y fuera se distinguen en el mapa")
+
+    # NO se inventa una posicion para quien no la tiene. En el paquete real
+    # del equipo habia un registro con la ficha llena y el GPS sin fijar.
+    _sin_coord = {"sirve": True, "puntos": [
+        {"lon": None, "lat": None, "titulo": "Morpho", "nota": "",
+         "fecha": "", "capa": "x"}], "resumen": {}, "problemas": [],
+        "avisos": []}
+    _nada = campo.exportar_capa(_sin_coord, "vacio.zip")
+    comprobar("un registro sin coordenada no se dibuja ni se inventa",
+              "error" in _nada and not _nada.get("ruta"),
+              _nada.get("error", "")[:60])
+
+    # Dos paquetes distintos no se pisan: cada uno es su propia capa.
+    _otro = campo.exportar_capa(_veredicto, "SALIDA_OCTUBRE.zip")
+    comprobar("dos paquetes distintos dan dos capas distintas",
+              _otro["nombre"] != _hecho["nombre"]
+              and os.path.exists(_otro["ruta"]),
+              f"{_hecho['nombre']} y {_otro['nombre']}")
+finally:
+    campo.carpeta_capas_extra = _extra_real
+    shutil.rmtree(_banco_capa, ignore_errors=True)
+
+# ==============================================================================
 print("\n" + "=" * 70)
 total = ACIERTOS + len(FALLOS)
 if FALLOS:

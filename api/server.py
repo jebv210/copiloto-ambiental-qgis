@@ -475,6 +475,60 @@ class SincronizarInput(BaseModel):
     )
 
 
+def _archivo_ultima_sincronizacion() -> str:
+    """
+    Ruta del archivo donde queda constancia de la ultima sincronizacion.
+
+    Returns:
+        Ruta dentro de `data/`, que sobrevive al contenedor.
+    """
+    import os as _os
+
+    base = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    carpeta = _os.path.join(base, "data")
+    _os.makedirs(carpeta, exist_ok=True)
+    return _os.path.join(carpeta, "ultima_sincronizacion.json")
+
+
+def _dejar_constancia(estado: dict) -> None:
+    """
+    Guarda en disco como acabo la sincronizacion.
+
+    POR QUE NO BASTA LA MEMORIA
+    ---------------------------
+    `_SINCRONIZACION` vive en el proceso. Al reiniciar la API vuelve a
+    "Sin sincronizaciones en esta sesion", y con el se pierde si la del
+    cron de las 02:00 funciono, cuanto indexo y que fallo.
+    
+    Se vio en marcha y es exactamente el caso malo: una sincronizacion se
+    corto a mitad -- el equipo se durmio --, el contenedor arranco de nuevo
+    y no quedaba ni rastro. Hubo que deducir que estaba incompleta contando
+    documentos distintos dentro de Qdrant. Eso no se le puede pedir a nadie
+    a las ocho de la manana.
+
+    Un fallo al escribir no interrumpe nada: perder la constancia es malo,
+    pero tirar la sincronizacion por no poder anotarla seria peor.
+
+    Args:
+        estado: El bloque `_SINCRONIZACION` tal como quedo.
+    """
+    import json as _json
+
+    try:
+        with open(_archivo_ultima_sincronizacion(), "w",
+                  encoding="utf-8") as fh:
+            _json.dump({
+                "cuando": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                        time.localtime()),
+                "origen": estado.get("origen", ""),
+                "mensaje": estado.get("mensaje", ""),
+                "error": estado.get("error"),
+                "resultado": estado.get("resultado"),
+            }, fh, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
 def _trabajo_sincronizar(forzar: bool) -> None:
     """
     Ejecuta la indexacion fuera del hilo que atiende la peticion.
@@ -521,6 +575,60 @@ def _trabajo_sincronizar(forzar: bool) -> None:
     finally:
         with _CERROJO:
             _SINCRONIZACION["ejecutando"] = False
+            _dejar_constancia(_SINCRONIZACION)
+
+
+@app.post("/ajustes/recargar", summary="Releer la configuracion guardada")
+def recargar_ajustes():
+    """
+    Vuelve a aplicar lo que hay en los ajustes guardados.
+
+    POR QUE HACE FALTA UN ENDPOINT PARA ESTO
+    ----------------------------------------
+    La interfaz y la API son dos procesos distintos. Cuando alguien conecta
+    o desconecta Drive desde la interfaz, el cambio se escribe en el
+    archivo de ajustes y se aplica al entorno DE LA INTERFAZ. La API no se
+    entera: sigue con lo que tenia cuando arranco.
+
+    Se vio asi: la persona pulsaba "Desconectar", el archivo quedaba limpio
+    y la pantalla seguia diciendo "Drive conectado", porque ese dato lo
+    pinta la API. Parecia que el boton no hacia nada.
+
+    Returns:
+        Las claves que quedaron aplicadas, para poder comprobarlo.
+    """
+    from core import ajustes as _aj
+    from core import fuentes as _fu
+
+    aplicados = _aj.aplicar()
+    # El estado de la fuente se guarda unos segundos para no listar Drive
+    # en cada recarga de pantalla. Tras un cambio de configuracion ese
+    # recuerdo es justo lo que no se quiere.
+    try:
+        _fu.olvidar_estado()
+    except Exception:
+        pass
+
+    # UN ERROR DE CONFIGURACION CADUCA AL CAMBIAR LA CONFIGURACION
+    # ------------------------------------------------------------
+    # El ultimo fallo se conserva a proposito: si el cron de las 02:00 se
+    # rompe, nadie lo esta mirando y callarlo equivale a no haberlo
+    # intentado. Pero cuando el fallo FUE la configuracion y la
+    # configuracion acaba de cambiar, ese veredicto ya no describe nada.
+    #
+    # Se vio en pantalla: la banda roja decia "Drive no esta conectado
+    # todavia" mientras la barra lateral, dos centimetros mas a la
+    # izquierda, decia "Drive conectado". Las dos tenian razon sobre
+    # momentos distintos, y juntas no se podian creer.
+    #
+    # Lo guardado en disco NO se borra: ahi queda el historial.
+    with _CERROJO:
+        if _SINCRONIZACION.get("error") and not _SINCRONIZACION["ejecutando"]:
+            _SINCRONIZACION["error"] = None
+            _SINCRONIZACION["mensaje"] = (
+                "La configuracion cambio. El ultimo intento fallo antes de "
+                "ese cambio: vuelve a estudiar para saber como queda ahora.")
+    return {"aplicados": sorted(aplicados)}
 
 
 @app.post("/corpus/sincronizar", summary="Actualizar el indice documental")
@@ -590,6 +698,25 @@ def estado_sincronizacion():
         trabajo["segundos"] = round(time.time() - trabajo["arranco"], 1)
     else:
         trabajo["segundos"] = None
+
+    # LO DE ANTES DE REINICIAR TAMBIEN CUENTA
+    # ---------------------------------------
+    # Sin esto, al reiniciar la API el endpoint contesta "Sin
+    # sincronizaciones en esta sesion" aunque el cron llevara semanas
+    # funcionando. La pregunta que importa por la manana -- "funciono la de
+    # anoche?" -- se quedaba sin respuesta, y habia que deducirla contando
+    # documentos dentro de Qdrant.
+    #
+    # Va en una clave aparte y no mezclada: una cosa es lo que esta pasando
+    # ahora y otra lo que paso la ultima vez. Confundirlas haria creer que
+    # hay trabajo en marcha cuando no lo hay.
+    import json as _json
+
+    try:
+        with open(_archivo_ultima_sincronizacion(), encoding="utf-8") as fh:
+            trabajo["anterior"] = _json.load(fh)
+    except (OSError, ValueError):
+        trabajo["anterior"] = None
     return trabajo
 
 
@@ -639,12 +766,31 @@ def estado_corpus():
         # Los que la fuente aparto por tamano se cuentan igual que los del
         # corpus local: la interfaz ya sabe pintar esa lista con nombre y
         # peso, y es la respuesta a "y los otros cuatro archivos?".
+        # SE DICE SI ADEMAS SE RESUMIO, Y NO SOLO QUE SE APARTO
+        # ------------------------------------------------------
+        # "Apartado" y "sin analizar" no son lo mismo. Una capa apartada
+        # por tamano se recorre entera despues y se indexa su agregado; de
+        # eso queda un resumen guardado en `data/resumenes_capas/`.
+        #
+        # Sin este dato la interfaz no podia distinguirlas, y acababa
+        # avisando de cuatro archivos "con problema" que estaban
+        # perfectamente estudiados. Un aviso que sale siempre deja de
+        # leerse.
+        def _tiene_resumen(nombre: str) -> bool:
+            """Dice si esa capa ya tiene su resumen agregado en disco."""
+            import os as _os
+
+            base = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+            return _os.path.exists(_os.path.join(
+                base, "data", "resumenes_capas", f"{nombre}.json"))
+
         resumen["demasiado_grandes"] = [
             {"nombre": d.get("nombre", "?"), "mb": d.get("mb", 0),
              # Cuando se pudo estimar, se dice lo que COSTARIA, que es el
              # motivo real de que no entre. Los megas solo son el sintoma.
              "fichas_estimadas": d.get("fichas_estimadas"),
-             "motivo": d.get("motivo", "")}
+             "motivo": d.get("motivo", ""),
+             "resumido": _tiene_resumen(d.get("nombre", ""))}
             for d in (fuente.get("descartados") or [])]
     else:
         resumen = dict(resumen)

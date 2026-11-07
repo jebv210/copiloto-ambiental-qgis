@@ -9,6 +9,8 @@ equipo de desarrollo, y se indica de dónde sale cada cifra.
 
 ---
 
+Tener en cuenta el link del repositorio https://github.com/jebv210/copiloto-ambiental-qgis
+
 ## 1. Qué se despliega
 
 El sistema son **cuatro contenedores** que ya funcionan juntos con

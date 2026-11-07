@@ -554,14 +554,98 @@ def _adjuntos_para_el_modelo() -> list:
     return salida
 
 
+def _limpiar_marca(texto: str, marca: str) -> str:
+    """
+    Quita una marca del texto y recoge lo que deja detras.
+
+    El modelo a veces nombra la marca en mitad de la frase y la deja entre
+    acentos graves ("...mediante el boton (`[[...]]`)"). Al quitarla queda un
+    par de acentos vacios, que se ven como un hueco raro. Se barren tambien
+    los parentesis que hubieran quedado sin contenido.
+
+    Args:
+        texto: El mensaje del agente.
+        marca: La marca a retirar.
+
+    Returns:
+        El texto limpio, sin espacios sobrantes al final.
+    """
+    import re as _re
+
+    limpio = (texto or "").replace(marca, "")
+    limpio = _re.sub(r"\(\s*``\s*\)", "", limpio)
+    limpio = _re.sub(r"``", "", limpio)
+    limpio = _re.sub(r"[ \t]{2,}", " ", limpio)
+    return limpio.rstrip()
+
+
+def _pintar_con_paquete(texto: str, orden: int) -> None:
+    """
+    Muestra el mensaje y ofrece el paquete de QGIS que el agente armo.
+
+    El .zip lo escribio la herramienta en `data/entregas/`, que es una
+    carpeta compartida entre los contenedores, asi que aqui solo hay que
+    leerlo. Se lee en bytes y se entrega tal cual: no se vuelve a armar, para
+    que lo que se descargue sea exactamente lo que el agente describio.
+
+    Args:
+        texto: Contenido del mensaje, con la marca todavia dentro.
+        orden: Posicion del mensaje, para que la clave del boton sea unica.
+    """
+    from agent.tools import MARCA_PAQUETE_QGIS
+
+    st.write(_limpiar_marca(texto, MARCA_PAQUETE_QGIS))
+
+    ruta = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "data", "entregas", "Area_estudio_QGIS.zip")
+    if not os.path.exists(ruta):
+        st.warning("El paquete se describio pero no esta en disco. "
+                   "Vuelve a pedirlo.")
+        return
+    with open(ruta, "rb") as f:
+        st.download_button(
+            label="🗺️ Descargar el proyecto de QGIS (.zip)",
+            data=f.read(),
+            file_name="Area_estudio_QGIS.zip",
+            mime="application/zip",
+            key=f"descargar_paquete_qgis_{orden}",
+        )
+
+
+def _avisar_a_la_api_del_cambio() -> None:
+    """
+    Le dice a la API que vuelva a leer la configuracion guardada.
+
+    La interfaz y la API son procesos distintos: cambiar la configuracion
+    aqui no la cambia alli. Sin este aviso, desconectar Drive dejaba el
+    archivo limpio y la pantalla seguia diciendo "Drive conectado", porque
+    ese dato lo pinta la API con lo que tenia al arrancar.
+
+    Un fallo al avisar no se oculta pero tampoco interrumpe: el cambio ya
+    quedo guardado y se aplicara cuando la API reinicie.
+    """
+    try:
+        _api("/ajustes/recargar", metodo="POST", espera=20)
+    except Exception:
+        pass
+
+
 def _pintar_mensaje(texto: str, orden: int = 0) -> None:
     """
-    Escribe un mensaje del chat y, si toca, ofrece el script de QGIS.
+    Escribe un mensaje del chat y, si toca, ofrece lo que el agente preparo.
 
-    El agente no puede dibujar botones: solo devuelve texto. Cuando entrega el
-    script deja una marca al final, esta funcion la quita antes de mostrar
-    nada y pone en su sitio un boton de descarga de verdad. Asi quien lee la
+    El agente no puede dibujar botones: solo devuelve texto. Cuando entrega
+    algo descargable deja una marca al final, esta funcion la quita antes de
+    mostrar nada y pone en su sitio un boton de verdad. Asi quien lee la
     conversacion nunca ve la marca.
+
+    Hay dos entregas distintas y conviene no confundirlas:
+
+      PAQUETE  un .zip con el proyecto y las capas, para abrir con doble
+               clic. Es lo que casi siempre se quiere decir con "un archivo
+               para QGIS".
+      SCRIPT   el `cargar_capas_qgis.py`, para pegarlo en la consola de
+               Python de QGIS cuando ya se tiene el programa abierto.
 
     Args:
         texto: Contenido del mensaje.
@@ -569,22 +653,17 @@ def _pintar_mensaje(texto: str, orden: int = 0) -> None:
             cada boton tenga una clave distinta: dos botones con la misma
             clave hacen que Streamlit se queje y corte el repintado.
     """
-    from agent.tools import MARCA_SCRIPT_QGIS
+    from agent.tools import MARCA_PAQUETE_QGIS, MARCA_SCRIPT_QGIS
+
+    if MARCA_PAQUETE_QGIS in (texto or ""):
+        _pintar_con_paquete(texto, orden)
+        return
 
     if MARCA_SCRIPT_QGIS not in (texto or ""):
         st.write(texto)
         return
 
-    limpio = texto.replace(MARCA_SCRIPT_QGIS, "")
-    # El modelo a veces nombra la marca en mitad de la frase y la deja entre
-    # acentos graves ("...mediante el boton (`[[...]]`)"). Al quitarla queda un
-    # par de acentos vacios, que se ven como un hueco raro. Se barren tambien
-    # los parentesis que hubieran quedado sin contenido.
-    import re as _re
-    limpio = _re.sub(r"\(\s*``\s*\)", "", limpio)
-    limpio = _re.sub(r"``", "", limpio)
-    limpio = _re.sub(r"[ \t]{2,}", " ", limpio)
-    st.write(limpio.rstrip())
+    st.write(_limpiar_marca(texto, MARCA_SCRIPT_QGIS))
 
     ruta = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "cargar_capas_qgis.py")
@@ -951,8 +1030,9 @@ with st.sidebar:
     # variable: es el que hay que usar en campo, donde no hay cobertura.
     with st.expander("Clave de Gemini"):
         st.caption(
-            "La clave se lee de GEMINI_API_KEY en el archivo .env. Aquí puedes "
-            "escribir otra para esta sesión sin tocar el archivo."
+            "Pega aquí la clave del modelo. Al validarla se guarda, así que "
+            "sobrevive a los reinicios y no hay que tocar ningún archivo "
+            "del servidor."
         )
 
         clave_escrita = st.text_input(
@@ -976,6 +1056,19 @@ with st.sidebar:
                 valida, mensaje = validar_api_key(st.session_state.api_key)
                 st.session_state.api_key_valida = valida
                 st.session_state.api_key_mensaje = mensaje
+                # SE GUARDA SOLO SI FUNCIONA
+                # --------------------------
+                # Guardar una clave sin comprobarla deja el sistema
+                # arrancando cada dia contra un servicio que lo rechaza, y
+                # el fallo aparece de madrugada en la sincronizacion, lejos
+                # de quien la escribio. Si valida, se guarda y ya no hay que
+                # volver a escribirla.
+                if valida and st.session_state.api_key:
+                    from core import ajustes as _aj
+                    _aj.guardar({"GEMINI_API_KEY":
+                                 st.session_state.api_key.strip()})
+                    _aj.aplicar()
+                    st.session_state.api_key_mensaje += " Clave guardada."
 
         if st.session_state.api_key_valida is True:
             st.success(f"IA: CONECTADA. {st.session_state.api_key_mensaje}")
@@ -1036,13 +1129,22 @@ with st.sidebar:
         if st.button("Desconectar Drive", use_container_width=True,
                      key="desconectar_drive_lateral"):
             _cdrive.desconectar()
+            _avisar_a_la_api_del_cambio()
+            # YA NO HAY CARPETA LOCAL A LA QUE VOLVER
+            # ----------------------------------------
+            # Este aviso decia que el agente "vuelve a estudiar de la
+            # carpeta local". Esa carpeta se elimino, junto con la fuente
+            # que la leia: era el camino por el que podia acabar
+            # estudiando algo que nadie subio a Drive. Al desconectar, el
+            # sistema se queda sin fuente y lo dice.
             st.session_state.aviso_drive = (
-                "Drive desconectado. El agente vuelve a estudiar de la "
-                "carpeta local. Lo ya descargado NO se ha borrado.")
+                "Drive desconectado. El agente deja de estudiar: Drive es "
+                "la única fuente. Lo ya indexado NO se ha borrado y se "
+                "puede seguir consultando.")
             st.rerun()
     else:
         st.markdown(
-            _est.indicador("Carpeta local", "tibio", "Drive sin conectar"),
+            _est.indicador("Sin fuente", "mal", "Drive sin conectar"),
             unsafe_allow_html=True)
         st.caption("Conéctalo en la pestaña **Drive y Estudio**.")
 
@@ -1074,28 +1176,36 @@ with st.sidebar:
                 f"{_bib['documentos']} documentos", "ok",
                 f"{_bib['fichas']:,} fichas".replace(",", ".")),
             unsafe_allow_html=True)
-        # Los archivos que la fuente VE pero no lee enteros. Sin esta linea la
-        # barra decia "4 documentos" sobre una carpeta de ocho, y la
-        # diferencia solo se descubria abriendo Drive y contando a mano.
+        # Las capas de datos, que se indexan de otra manera. Se nombran
+        # aparte porque conviene saber a cuales NO se les puede preguntar
+        # por una fila concreta; no porque les pase nada malo.
+        #
+        # ESTE INDICADOR ESTABA EN NARANJA Y MENTIA
+        # -----------------------------------------
+        # Decia "no se leen enteras" y las pintaba de color de aviso. Las
+        # dos cosas eran falsas: se recorren ENTERAS -- 460.350 filas de la
+        # capa de ecosistemas, medidas -- y entran al indice resumidas. El
+        # naranja hacia pensar que quedaba trabajo pendiente sobre unos
+        # archivos que ya estaban estudiados.
         _grandes_barra = _bib.get("demasiado_grandes") or []
         if _grandes_barra:
             st.markdown(
-                _est.indicador(f"{len(_grandes_barra)} capas de datos",
-                               "tibio", "no se leen enteras"),
+                _est.indicador(f"{len(_grandes_barra)} capas de datos", "ok",
+                               "enteras, resumidas"),
                 unsafe_allow_html=True)
-            with st.expander("¿Cuáles y por qué?"):
+            with st.expander("¿Cuáles y cómo entran?"):
                 st.markdown(
                     _est.lista_documentos(
                         [(_g["nombre"], f"{_g['mb']} MB")
                          for _g in _grandes_barra]),
                     unsafe_allow_html=True)
                 st.caption(
-                    f"Darían más de las "
-                    f"{_bib.get('presupuesto_fichas', 2000):,} fichas de "
-                    f"presupuesto por documento. De cada una se lee **solo la "
-                    f"cabecera**, y eso sí queda en el índice: pregúntale al "
-                    f"agente por el nombre del archivo y te dice qué columnas "
-                    f"trae y si sirve para QGIS.".replace(",", ".")
+                    "Están estudiadas. Se recorren **enteras** y se indexa "
+                    "su resumen agrupado en vez de fila a fila. "
+                    "Pregúntale al agente por el nombre del archivo: te "
+                    "dice cuántas filas tiene, qué columnas trae y cómo se "
+                    "reparten sus valores. Lo único que no puede darte de "
+                    "ellas es una fila suelta."
                 )
 
         # La version es la huella del conjunto de documentos del EQUIPO. Con
@@ -1197,8 +1307,13 @@ def _banda_de_carga() -> None:
         # un fallo del cron de las 10:30 ocurre cuando nadie mira, y callarlo
         # equivale a no haberlo intentado.
         if trabajo.get("error"):
+            # Se fecha. Un fallo sin fecha parece de ahora mismo, y este
+            # puede ser de anoche: saber cuando fue cambia si hay que
+            # correr a arreglarlo o si ya se arreglo.
+            _cuando = (trabajo.get("anterior") or {}).get("cuando") or ""
+            _fecha = f" ({_cuando.replace('T', ' a las ')})" if _cuando else ""
             st.error(
-                f"⚠️ La última carga de información **falló**: "
+                f"⚠️ La última carga de información **falló**{_fecha}: "
                 f"{trabajo['error'][:200]}"
             )
         return
@@ -1289,8 +1404,8 @@ with tab_chat:
             st.info(
                 "El agente está en **modo simulador**: reconoce la intención por "
                 "palabras clave y ejecuta las mismas herramientas, pero no razona. "
-                "Para activar el modo IA, configura `GEMINI_API_KEY` en el `.env` "
-                "o valida una clave en la barra lateral."
+                "Para activar el modo IA, pega la clave del modelo en "
+                "la barra lateral y pulsa «Validar y conectar»."
             )
 
     # La caja de escribir se rellena ANTES de generar nada, para que siga
@@ -1866,7 +1981,34 @@ with tab_estudio:
                 _lectura = _campo.leer(_ruta_c)
                 _revision = _campo.revisar(_lectura)
 
+            # LO REVISADO SE CONVIERTE EN CAPA
+            # --------------------------------
+            # Sin esto, revisar un paquete de campo no cambiaba el mapa: la
+            # cartografia seguia saliendo del KMZ del area y los 57 puntos
+            # de mariposas no aparecian en ninguna parte. Se escribe en
+            # `capas_extra/`, que es la carpeta de donde el script de QGIS
+            # recoge las capas propias, asi que el mapa los muestra sin
+            # tocar ese script.
+            _capa_campo = None
+            if _revision["sirve"]:
+                _capa_campo = _campo.exportar_capa(_revision,
+                                                   _subido_campo.name)
+
             _r = _revision["resumen"]
+
+            # Hacerlo y no decirlo seria igual de confuso que no hacerlo:
+            # quien revisa un paquete tiene que saber que ya puede abrirlo
+            # en el mapa.
+            if _capa_campo and _capa_campo.get("ruta"):
+                st.success(
+                    f"Estos {_capa_campo['puntos']} puntos ya son una capa "
+                    f"de mapa: **{_capa_campo['nombre']}**. Aparece al "
+                    f"ejecutar el script de QGIS y dentro del paquete de "
+                    f"QGIS que entrega el agente."
+                )
+            elif _capa_campo and _capa_campo.get("error"):
+                st.warning(f"No se pudo escribir la capa de mapa: "
+                           f"{_capa_campo['error']}")
 
             # --- Lo que trae dentro ------------------------------------------
             if _lectura["capas"]:
@@ -2062,6 +2204,10 @@ with tab_drive:
                         _canje["refresh_token"], _espera["carpeta"])
                 else:
                     _res = {"conectado": False, "motivo": _canje["motivo"]}
+            # Conectar tambien es un cambio de configuracion: si la API
+            # no lo relee, seguira diciendo que no hay fuente.
+            if (_res or {}).get("conectado"):
+                _avisar_a_la_api_del_cambio()
             _mostrar_resultado_drive(_res)
 
     codigo_f, fuente = _api("/corpus/fuente", espera=120)
@@ -2117,9 +2263,12 @@ with tab_drive:
             if cdb.button("Desconectar", use_container_width=True,
                           key="desconectar_drive"):
                 conexion_drive.desconectar()
+                _avisar_a_la_api_del_cambio()
                 st.session_state.aviso_drive = (
-                    "Desconectado. El agente vuelve a estudiar de la carpeta "
-                    "local. Lo ya descargado de Drive **no se ha borrado**.")
+                    "Desconectado. Drive es la única fuente, así que el "
+                    "agente deja de estudiar hasta que se vuelva a "
+                    "conectar. Lo ya indexado **no se ha borrado** y se "
+                    "puede seguir consultando.")
                 st.rerun()
 
     # --- Sin conectar: el formulario ---------------------------------------
@@ -2357,14 +2506,20 @@ with tab_drive:
     # ella sola hacia algo. No hace nada por si misma: solo decide COMO va a
     # estudiar el boton.
     lanzar = st.button("Estudiar ahora", type="primary")
-    forzar = st.checkbox(
-        "Volver a estudiarlo todo (opción del botón, no hace nada por sí sola)",
-        help="Sin marcar, el botón solo lee lo que cambió en la fuente: lo "
-             "demás ya está en el índice y se deja como está. Marcada, vuelve "
-             "a leer TODO desde cero, incluso lo que no ha cambiado. Gasta "
-             "mucha más cuota del modelo: úsala solo si sospechas que el "
-             "índice quedó mal.",
-    )
+    # La casilla se guarda en un desplegable en vez de ocupar la linea
+    # siguiente al boton. No se quita: es la unica forma de rehacer el
+    # indice desde aqui cuando se sospecha que quedo mal. Pero es una
+    # opcion rara y cara, y estar siempre a la vista la hacia parecer un
+    # paso normal del estudio.
+    with st.expander("Opciones avanzadas"):
+        forzar = st.checkbox(
+            "Volver a estudiarlo todo, incluso lo que no ha cambiado",
+            help="Sin marcar, el botón solo lee lo que cambió en la fuente: "
+                 "lo demás ya está en el índice y se deja como está. "
+                 "Marcada, vuelve a leer TODO desde cero. Gasta mucha más "
+                 "cuota del modelo: úsala solo si sospechas que el índice "
+                 "quedó mal.",
+        )
     if forzar:
         st.caption(
             "⚠️ Marcada: al pulsar **Estudiar ahora** se releerá todo desde "
@@ -2428,6 +2583,21 @@ with tab_drive:
         # Documentos que se ven pero NO entran al indice por tamano. Decirlo
         # con nombre y peso evita la busqueda a ciegas de por que "falta" algo.
         _grandes = (estado_api.get("corpus") or {}).get("demasiado_grandes") or []
+
+        # SOLO SE AVISA DE LO QUE VA MAL
+        # ------------------------------
+        # Este panel listaba las cuatro capas en cada recarga, aunque
+        # estuvieran perfectamente estudiadas. Un aviso que sale siempre
+        # deja de ser un aviso: se vuelve parte del decorado y la vez que
+        # de verdad pase algo, nadie lo mira.
+        #
+        # Una capa resumida NO es un problema: se recorrio entera y su
+        # agregado esta en el indice. Problema es la que se aparto sin
+        # llegar a resumirse, porque de esa no hay nada.
+        # Se reemplaza SIEMPRE, tambien cuando la lista queda vacia: asi
+        # el panel de abajo no se dibuja. Conservando la lista original
+        # cuando no hay problemas, el aviso seguiria saliendo igual.
+        _grandes = [_g for _g in _grandes if not _g.get("resumido")]
         if _grandes:
             # El límite ya no son los megas sino las FICHAS, porque es lo que
             # cuesta: cada ficha es una llamada a la API de embeddings. Decir
@@ -2435,12 +2605,23 @@ with tab_drive:
             # síntoma: 1 MB de CSV da 1.485 fichas y 1 MB de informe, decenas.
             _presu = (estado_api.get("corpus") or {}).get(
                 "presupuesto_fichas", 2000)
+            # ESTE AVISO DECIA LO CONTRARIO DE LO QUE PASA
+            # --------------------------------------------
+            # Decia "no entran al indice" y "de cada uno se lee la
+            # cabecera". Las dos cosas dejaron de ser ciertas: estos
+            # archivos se recorren ENTEROS -- 460.350 filas de la capa de
+            # ecosistemas, medidas -- y lo que se indexa es su resumen
+            # agrupado. Lo que no se hace es indexarlos fila a fila, que
+            # son 620.433 fichas por archivo y anos de cuota.
+            #
+            # Un aviso que subestima lo que el sistema hace es tan danino
+            # como uno que lo exagera: lleva a pensar que falta trabajo por
+            # hacer cuando ya esta hecho.
             st.warning(
-                f"{len(_grandes)} archivo(s) **no entran al índice**: darían "
-                f"más de las {_presu:,} fichas de presupuesto por documento. "
-                f"De cada uno se lee la cabecera, así que el agente sabe que "
-                f"existen y qué columnas traen — pregúntale por su nombre."
-                .replace(",", "."))
+                f"{len(_grandes)} archivo(s) **no se pudieron resumir**: "
+                f"se apartaron por tamaño y no llegó a leerse su contenido. "
+                f"De ellos el agente solo sabe que existen y qué columnas "
+                f"traen.")
             st.markdown(
                 estilos.lista_documentos(
                     [(_g["nombre"],
@@ -2449,9 +2630,8 @@ with tab_drive:
                      for _g in _grandes]),
                 unsafe_allow_html=True)
             st.caption(
-                "El presupuesto se cambia con `PRESUPUESTO_FICHAS` en el "
-                "`.env`. Súbelo si quieres que entren documentos más largos; "
-                "cada ficha de más gasta cuota del modelo.")
+                "Pregúntale al agente por el nombre de cualquiera de ellos "
+                "y te responde con lo que trae dentro.")
 
         _fallos = (estado_api.get("corpus") or {}).get("fallos_de_lectura") or {}
         if _fallos:

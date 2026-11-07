@@ -664,33 +664,57 @@ try:
               _fichas_caro > _cp.PRESUPUESTO_FICHAS,
               f"{_fichas_caro} fichas, presupuesto {_cp.PRESUPUESTO_FICHAS}")
 
-    # El embebedor se bloquea: si el guardia fallara se notaria aqui en vez
-    # de gastar miles de embeddings en silencio, que es justo lo que este
-    # limite existe para evitar.
+    # El embebedor se cuenta en vez de bloquearse. ANTES se bloqueaba con una
+    # excepcion, porque un documento caro no debia gastar NI UN embedding: se
+    # apartaba y se iba sin dejar rastro.
+    #
+    # Eso se cambio a proposito. El efecto de no dejar rastro era que el
+    # agente consultaba el indice, no encontraba nada y respondia "no tengo
+    # informacion" sobre un documento que si existia. Ahora se indexa su
+    # PRESENCIA: un punado de fichas que dicen que existe, cuanto mide y de
+    # que trata.
+    #
+    # Asi que lo que hay que comprobar ya no es "cero embeddings", sino que
+    # el guardia sigue cumpliendo su trabajo de verdad: que no se gasten las
+    # MILES de fichas del documento entero. Se exige que lo que se embebe sea
+    # una fraccion minima, y que quede constancia del coste real.
     _embeber_real = _vc.embeber
-    _se_intento = {"si": False}
+    _gastadas = {"n": 0}
 
-    def _embeber_prohibido(*_a, **_k):
-        """Sustituto que delata al guardia si deja pasar algo caro."""
-        _se_intento["si"] = True
-        raise AssertionError("el guardia no paro: se intento embeber")
+    def _embeber_contado(_textos, *_a, **_k):
+        """Sustituto que cuenta cuanto se habria gastado de verdad."""
+        _gastadas["n"] += len(_textos)
+        return [[0.0] * 768 for _ in _textos]
 
-    _vc.embeber = _embeber_prohibido
+    _vc.embeber = _embeber_contado
     try:
+        # La coleccion tiene que existir antes: `_indexar_documento` empieza
+        # borrando los puntos viejos del documento, y sobre una coleccion
+        # que no existe eso da un 404. En produccion nunca ocurre porque
+        # `_indexar_todo` llama antes a `asegurar_coleccion`; la prueba, que
+        # entra por la puerta de en medio, tiene que hacerlo igual. Salio a
+        # la luz al renombrar la coleccion: con una recien creada, la
+        # bateria entera se caia aqui.
+        _vc.asegurar_coleccion(_vc._cliente_qdrant())
         _resumen_p = {"fichas": 0, "_fraccion": 0.0}
         _vc._indexar_documento(
             _vc._cliente_qdrant(), _st.coleccion_qdrant(),
             {"nombre": "pasa_del_presupuesto.txt", "categoria": "prueba",
              "ruta": _caro, "huella": "x"}, _resumen_p, None, "[1/1]")
         _fuera = _resumen_p.get("fuera_de_presupuesto") or []
-        comprobar("lo que se pasa se aparta sin gastar un solo embedding",
-                  not _se_intento["si"] and len(_fuera) == 1
-                  and _fuera[0]["fichas"] == _fichas_caro,
-                  f"apartado con {_fuera[0]['fichas']} fichas" if _fuera
+        comprobar("el guardia evita el coste del documento entero",
+                  _gastadas["n"] <= 6 and _gastadas["n"] < _fichas_caro / 100,
+                  f"{_gastadas['n']} fichas embebidas en vez de "
+                  f"{_fichas_caro}")
+        comprobar("queda constancia del coste real que se evito",
+                  len(_fuera) == 1 and _fuera[0]["fichas"] == _fichas_caro,
+                  f"apartado declarando {_fuera[0]['fichas']} fichas"
+                  if _fuera else "no quedo constancia")
+        comprobar("un documento caro NO desaparece: se indexa su presencia",
+                  bool(_fuera) and _fuera[0].get("indexado_como") == "presencia"
+                  and _gastadas["n"] > 0,
+                  f"{_gastadas['n']} fichas de presencia" if _fuera
                   else "no quedo constancia")
-    except AssertionError as _exc:
-        comprobar("lo que se pasa se aparta sin gastar un solo embedding",
-                  False, str(_exc))
     finally:
         _vc.embeber = _embeber_real
 
@@ -760,6 +784,154 @@ comprobar("un texto demasiado corto si se rechaza, y lo dice",
           _mem.guardar_recuerdo_detallado("hola", "prueba_bateria")["a_salvo"]
           is False,
           "no se guarda lo que no significa nada")
+# ==============================================================================
+# TABLAS GRANDES: SE RECORREN COMPLETAS Y SE INDEXA SU AGREGADO
+# ==============================================================================
+#
+# Lo que se protege aqui es la promesa de que NINGUN archivo se descarga para
+# luego tirarse. Antes de esto, un Excel grande pasaba el filtro de descarga
+# -- .xlsx no se puede estimar por muestra --, se bajaba entero, se abria con
+# pandas (varios gigas de RAM para un libro de 400 MB) y se descartaba por
+# presupuesto SIN dejar catalogo ni resumen. Se gastaba la descarga y el
+# agente seguia sin saber que el archivo existia.
+print("\n--- Tablas grandes: Excel ---")
+
+import openpyxl as _xl
+from core import catalogo as _cat
+
+_banco_x = tempfile.mkdtemp(prefix="probar_excel_")
+try:
+    _VEREDAS = ["El Jordan", "Palmichal", "La Hondita", "Juanes"]
+
+    def _libro(ruta, filas_n, hojas=("datos",)):
+        """Escribe un .xlsx y devuelve la suma real de area_ha."""
+        import random as _rnd
+        _rnd.seed(filas_n)
+        total = 0.0
+        wb = _xl.Workbook(write_only=True)
+        for nombre_hoja in hojas:
+            h = wb.create_sheet(nombre_hoja)
+            h.append(["vereda", "cobertura", "area_ha"])
+            for _ in range(filas_n):
+                a = round(_rnd.uniform(0.5, 60), 2)
+                total += a
+                h.append([_rnd.choice(_VEREDAS),
+                          _rnd.choice(["Bosque", "Pastos", "Rastrojo"]), a])
+        wb.save(ruta)
+        return total
+
+    # --- Un libro pequeno se indexa entero, como siempre ------------------
+    _chico = os.path.join(_banco_x, "inventario_chico.xlsx")
+    _libro(_chico, 300)
+    comprobar("un Excel pequeno NO se desvia: se indexa entero",
+              _vc._conviene_resumir(_chico) is False,
+              f"{os.path.getsize(_chico) // 1024} KB, por debajo del umbral")
+
+    # --- Un libro grande se desvia al recorrido en streaming ---------------
+    _grande = os.path.join(_banco_x, "censo_predial.xlsx")
+    _suma_real = _libro(_grande, 60000, hojas=("2023", "2024"))
+    comprobar("un Excel grande se desvia al resumen agregado",
+              _vc._conviene_resumir(_grande) is True,
+              f"{os.path.getsize(_grande) // 1024 // 1024} MB, "
+              f"por encima del umbral")
+
+    # Lo que de verdad hay que demostrar: que se lee COMPLETO. No una
+    # muestra. Se midio por que importa: los primeros 20 MB de la capa de
+    # ecosistemas son Caqueta y Putumayo, porque viene ordenada por region,
+    # asi que muestrear el principio no dice NADA de Antioquia.
+    _res_x = _cat.resumir_tabla(_grande)
+    comprobar("se recorren TODAS las filas, de todas las hojas",
+              _res_x["filas"] == 120000 and not _res_x["truncado"],
+              f"{_res_x['filas']} filas leidas de 120.000 en 2 hojas")
+
+    _suma_leida = sum(_res_x and _cat._agregar(
+        *_cat._filas_de_excel(_grande)[:2], 2_000_000)["sumas"]["vereda"]
+        .values() or [0])
+    comprobar("las sumas del agregado son EXACTAS, no aproximadas",
+              abs(_suma_leida - _suma_real) < 1.0,
+              f"{_suma_leida:,.0f} leido frente a {_suma_real:,.0f} real"
+              .replace(",", "."))
+
+    comprobar("el libro de varias hojas declara que las recorrio todas",
+              any("2 hojas" in l for l in _res_x["lineas"]),
+              [l for l in _res_x["lineas"] if "hojas" in l][0][:70]
+              if any("hojas" in l for l in _res_x["lineas"]) else "no lo dice")
+
+    # --- Y cuesta una fraccion de lo que costaria fila a fila -------------
+    _embeber_real = _vc.embeber
+    _gasto_x = {"n": 0}
+
+    def _contar_x(_textos, *_a, **_k):
+        _gasto_x["n"] += len(_textos)
+        return [[0.0] * 768 for _ in _textos]
+
+    _vc.embeber = _contar_x
+    try:
+        _vc.asegurar_coleccion(_vc._cliente_qdrant())
+        _resumen_x = {"fichas": 0, "_fraccion": 0.0, "fallidos": []}
+        _vc._indexar_documento(
+            _vc._cliente_qdrant(), _st.coleccion_qdrant(),
+            {"nombre": "censo_predial.xlsx", "categoria": "prueba",
+             "ruta": _grande, "huella": "x"}, _resumen_x, None, "[1/1]")
+        _resumidas = _resumen_x.get("resumidas") or []
+        comprobar("el Excel grande NO se descarta: entra resumido",
+                  len(_resumidas) == 1
+                  and not _resumen_x.get("fuera_de_presupuesto"),
+                  f"{_resumidas[0]['filas']} filas recorridas en "
+                  f"{_resumidas[0]['segundos']} s" if _resumidas
+                  else "se descarto")
+        comprobar("entrar resumido cuesta una fraccion de la cuota",
+                  0 < _gasto_x["n"] <= 20,
+                  f"{_gasto_x['n']} fichas, frente a las ~{120000 * 3 * 8 // 900} "
+                  f"que costaria fila a fila")
+    finally:
+        _vc.embeber = _embeber_real
+
+    # --- Nunca se afirma "completa" si se corto ---------------------------
+    _cortado = _cat.resumir_tabla(_grande, maximo_filas=5000)
+    comprobar("si se corta por el tope, NO dice que la leyo completa",
+              _cortado["truncado"] is True
+              and not any("COMPLETA" in l for l in _cortado["lineas"])
+              and any("NO cubre la tabla entera" in l
+                      for l in _cortado["lineas"]),
+              "declara que el reparto no cubre la tabla entera")
+
+    # --- La prosa del resumen no se rompe al poner los millares -----------
+    # Habia un `.replace(",", ".")` sobre la linea entera, y los literales de
+    # texto adyacentes se pegan ANTES de llamar al metodo: el reemplazo
+    # alcanzaba tambien las comas de la frase y salian resumenes que decian
+    # "no se indexa fila a fila. se resume" y "855 registros. 25.782 area_ha".
+    _reparto = [l for l in _res_x["lineas"] if "registros," in l]
+    comprobar("los millares usan punto sin romper las comas de la frase",
+              bool(_reparto) and any("fila a fila," in l
+                                     for l in _res_x["lineas"]),
+              _reparto[0].strip()[:60] if _reparto else "no hay reparto")
+
+    # --- Un informe de prosa NO es una tabla, aunque pese lo mismo --------
+    # Se metio este fallo a proposito y la bateria lo cazo: `.txt` esta en la
+    # lista de resumibles porque muchas capas llegan asi, y con eso un
+    # informe de 3 MB de prosa se desviaba al resumen de tablas. El primer
+    # intento de arreglo tampoco servia: una frase repetida tiene el MISMO
+    # numero de comas en cada linea, asi que pasaba por "regular".
+    _prosa = os.path.join(_banco_x, "informe_prosa.txt")
+    with open(_prosa, "w", encoding="utf-8") as _fh:
+        for _i in range(24000):
+            _fh.write(f"Unidad de paisaje {_i}: cobertura de bosque denso "
+                      f"sobre relieve de colinas, drenaje permanente y "
+                      f"suelos profundos.\n")
+    comprobar("un .txt de prosa NO se trata como tabla, aunque sea grande",
+              os.path.getsize(_prosa) > _cp.PRESUPUESTO_FICHAS * _cp.TAMANO_FICHA
+              and _vc._conviene_resumir(_prosa) is False,
+              f"{os.path.getsize(_prosa) // 1024 // 1024} MB de prosa, "
+              f"no se desvia")
+
+    comprobar("y una capa de datos de verdad SI se reconoce como tabla",
+              _cat.parece_tabla(_grande) is True
+              and _cat.parece_tabla(_prosa) is False,
+              "la rejilla entra, el texto corrido no")
+finally:
+    shutil.rmtree(_banco_x, ignore_errors=True)
+
 # ==============================================================================
 print("\n" + "=" * 70)
 if FALLOS:
