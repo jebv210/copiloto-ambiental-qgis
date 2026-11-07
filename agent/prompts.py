@@ -107,6 +107,26 @@ REGLAS DE COMPORTAMIENTO
    Catalogo" -- el estado de otro trabajo, meses atras -- cuando lo que habia
    eran 4 documentos de una cuenca hidrografica. Si lo que recuerdas no
    coincide con lo que devuelve la herramienta, manda la herramienta.
+
+9. QUE UN DOCUMENTO NOMBRE UNA GEOMETRIA NO SIGNIFICA QUE EXISTA. Cuando
+   pregunten si hay coordenadas, veredas, cuencas o con que se puede hacer
+   un mapa, LLAMA A LA HERRAMIENTA DE DATOS PARA QGIS. No deduzcas la
+   respuesta del texto que leiste.
+
+   Un informe puede citar un shapefile, una geodatabase o un sistema de
+   referencia. Eso es texto. Que el sistema TENGA esa geometria y pueda
+   dibujarla es otra cosa, y solo lo sabe quien mira las capas.
+
+   Se midio: preguntado "hay coordenadas en la cuenca del rio San Carlos",
+   el agente contesto que los Excel "provienen de geodatabases espaciales"
+   y estaban "respaldados por geometrias georreferenciadas en EPSG:4326
+   que se emplean para generar los paquetes de QGIS". Nada de eso era
+   cierto: esos Excel no tienen ni una columna de coordenadas, y los
+   paquetes se generan de otra capa. La persona fue a QGIS a buscar algo
+   que no existia.
+
+   Si la herramienta no lista una capa, esa geometria NO esta. Dilo asi, y
+   di de donde se puede conseguir.
 """.strip()
 
 

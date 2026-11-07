@@ -353,6 +353,179 @@ def consultar_biodiversidad_local(buscar_termino: str = "") -> str:
 # HERRAMIENTA 5: ESTADO DEL AREA DE ESTUDIO
 # ==============================================================================
 
+def revisar_datos_de_campo(ruta_archivo: str) -> str:
+    """
+    Revisa un paquete de datos de campo y dice si sirve o no, y por que.
+
+    Usala cuando pasen un archivo de una salida de campo y pregunten si
+    esta bien, si se puede usar, si tiene errores, o cuantos registros
+    trae. Tambien antes de incorporar esos datos a cualquier analisis: un
+    punto mal ubicado arrastra el error hasta el informe final.
+
+    QUE ADMITE
+    ----------
+    Un .zip exportado de QField (aunque pese cientos de megas: solo se
+    abre lo que hay que revisar, no las fotografias), un shapefile .shp
+    con sus archivos hermanos, un GeoPackage .gpkg, o una planilla .xlsx
+    o .csv con columnas de latitud y longitud.
+
+    QUE COMPRUEBA, Y QUE NO
+    -----------------------
+    Comprueba cosas que se pueden decidir sin opinar: coordenadas
+    imposibles, puntos fuera del area de estudio, latitud y longitud
+    cambiadas de sitio, registros a menos de diez metros unos de otros,
+    fichas sin identificar y capas vacias. Todas son deterministas: el
+    mismo archivo da siempre el mismo veredicto.
+
+    NO comprueba si la identificacion de una especie es correcta ni si el
+    dato tiene sentido ecologico. Eso no lo puede saber un programa.
+
+    COMO INTERPRETAR LA RESPUESTA
+    -----------------------------
+    Hay dos niveles y no significan lo mismo. Un PROBLEMA impide usar los
+    datos. Un AVISO no: senala algo que conviene mirar, y muchas veces
+    tiene explicacion -- treinta puntos juntos pueden ser un muestreo
+    intensivo en una parcela pequena, no un error. No presentes un aviso
+    como si fuera un fallo.
+
+    Args:
+        ruta_archivo: Ruta del archivo o del paquete a revisar.
+
+    Returns:
+        El veredicto, el recuento y la lista de problemas y avisos.
+    """
+    import os
+
+    from core import campo
+
+    if not ruta_archivo or not os.path.exists(ruta_archivo):
+        return (f"No encuentro el archivo '{ruta_archivo}'. Necesito la "
+                f"ruta de un .zip, .shp, .gpkg, .xlsx o .csv que exista "
+                f"en el equipo.")
+
+    try:
+        lectura = campo.leer(ruta_archivo)
+        veredicto = campo.revisar(lectura)
+    except Exception as exc:
+        return (f"No pude revisar el archivo: {type(exc).__name__}: "
+                f"{str(exc)[:160]}")
+
+    resumen = veredicto["resumen"]
+    nombre = os.path.basename(ruta_archivo)
+    peso = os.path.getsize(ruta_archivo) / (1024 * 1024)
+
+    lineas = [
+        f"REVISION DE {nombre} ({peso:.1f} MB, formato "
+        f"{resumen.get('formato', '?')})",
+        "",
+    ]
+
+    if veredicto["sirve"]:
+        lineas.append("VEREDICTO: los datos SIRVEN. No hay nada que impida "
+                      "usarlos.")
+    else:
+        lineas.append("VEREDICTO: los datos NO se pueden usar todavia.")
+
+    lineas += [
+        "",
+        f"  Capas leidas        : {resumen.get('capas', 0)}",
+        f"  Puntos con geometria: {resumen.get('puntos', 0)}",
+        f"  Coordenadas validas : {resumen.get('validos', 0)}",
+    ]
+    if resumen.get("hay_area"):
+        lineas.append(f"  Dentro del area     : {resumen.get('dentro', 0)}")
+        lineas.append(f"  Fuera del area      : {resumen.get('fuera', 0)}")
+    else:
+        lineas.append("  No hay area de estudio fijada, asi que no se pudo "
+                      "comprobar si los puntos caen dentro.")
+
+    if veredicto["problemas"]:
+        lineas += ["", "PROBLEMAS (impiden usar los datos):"]
+        lineas += [f"  - {p}" for p in veredicto["problemas"]]
+
+    if veredicto["avisos"]:
+        lineas += ["", "AVISOS (no impiden usarlos, pero conviene mirarlos):"]
+        lineas += [f"  - {a}" for a in veredicto["avisos"]]
+
+    if not veredicto["problemas"] and not veredicto["avisos"]:
+        lineas += ["", "Sin problemas ni avisos: el paquete esta limpio."]
+
+    # LO REVISADO SE CONVIERTE EN CAPA, NO SOLO EN VEREDICTO
+    # ------------------------------------------------------
+    # Antes esto terminaba aqui: se revisaba el paquete y el mapa seguia
+    # mostrando solo el area de estudio. Se subia un .zip con 57 registros
+    # de campo y la cartografia salia identica, como si no se hubiera hecho
+    # nada. Escribir la capa es lo que cierra el circulo.
+    if veredicto["sirve"]:
+        capa = campo.exportar_capa(veredicto, ruta_archivo)
+        if capa.get("ruta"):
+            lineas += [
+                "",
+                f"Se escribio la capa '{capa['nombre']}' con sus "
+                f"{capa['puntos']} puntos. Aparece en QGIS al ejecutar el "
+                f"script, y tambien dentro del paquete de QGIS si lo pides.",
+            ]
+        elif capa.get("error"):
+            lineas += ["", f"No se pudo escribir la capa: {capa['error']}"]
+
+    return "\n".join(lineas)
+
+
+def _coordenadas_del_area(ruta: str) -> list:
+    """
+    Describe donde cae una capa: su recuadro y su centro.
+
+    POR QUE EL RECUADRO Y EL CENTRO, Y NO LOS VERTICES
+    --------------------------------------------------
+    Porque el area de San Carlos tiene 3.405 vertices y volcarlos seria
+    ilegible e inutil. Lo que situa un area en una conversacion son dos
+    cosas: entre que latitudes y longitudes cae, y donde esta su centro.
+
+    Se dan cinco decimales. Un grado son unos 111 km, asi que el quinto
+    decimal vale alrededor de un metro: mas precision seria fingirla.
+
+    Args:
+        ruta: Ruta del .geojson de la capa.
+
+    Returns:
+        Lista de lineas de texto. Vacia si no se pudo leer el archivo.
+    """
+    import json
+
+    try:
+        with open(ruta, encoding="utf-8") as fh:
+            datos = json.load(fh)
+    except (OSError, ValueError):
+        return []
+
+    equis, yes = [], []
+
+    def recorrer(coordenadas):
+        """Baja por la anidacion del GeoJSON hasta los pares de numeros."""
+        if (isinstance(coordenadas, (list, tuple)) and len(coordenadas) >= 2
+                and all(isinstance(v, (int, float))
+                        for v in coordenadas[:2])):
+            equis.append(float(coordenadas[0]))
+            yes.append(float(coordenadas[1]))
+            return
+        if isinstance(coordenadas, (list, tuple)):
+            for trozo in coordenadas:
+                recorrer(trozo)
+
+    for entidad in datos.get("features") or []:
+        recorrer((entidad.get("geometry") or {}).get("coordinates"))
+    if not equis:
+        return []
+
+    xmin, xmax = min(equis), max(equis)
+    ymin, ymax = min(yes), max(yes)
+    return [
+        f"Coordenadas (EPSG:4326, grados decimales): va de {ymin:.5f} a "
+        f"{ymax:.5f} de latitud y de {xmin:.5f} a {xmax:.5f} de longitud.",
+        f"Su centro cae en {(ymin + ymax) / 2:.5f}, {(xmin + xmax) / 2:.5f}.",
+    ]
+
+
 def describir_area_de_estudio() -> str:
     """
     Informa que area de estudio esta cargada ahora mismo en el sistema.
@@ -401,10 +574,25 @@ def describir_area_de_estudio() -> str:
 
         _equipo = _ajustes.ruta_proyecto_en_el_equipo()
         _relativa = vigente["archivo"].replace(_ajustes.BASE_DIR, "").lstrip("/\\")
-        lineas.append(
-            f"La capa esta en {os.path.join(_equipo, _relativa)} y es la que "
-            f"lee QGIS."
-        )
+        # LA BARRA LA MANDA EL EQUIPO DE DESTINO, NO EL CONTENEDOR
+        # --------------------------------------------------------
+        # Esta ruta se arma dentro de un contenedor Linux pero apunta
+        # al equipo de quien pregunta, que es Windows. Usando `os.sep`
+        # salia "C:\\proyecto/data/capa.geojson", con las dos barras
+        # mezcladas: se lee como un error aunque funcione. El separador
+        # se deduce de la propia ruta del equipo.
+        _barra = chr(92) if chr(92) in _equipo else "/"
+        _en_equipo = (_equipo.rstrip("/\\") + _barra
+                      + _relativa.replace("/", _barra).replace(chr(92), _barra))
+        lineas.append(f"La capa esta en {_en_equipo} y es la que lee QGIS.")
+
+        # LAS COORDENADAS, QUE SON LO QUE SE PREGUNTA
+        # -------------------------------------------
+        # Antes esto decia el nombre, los km2 y el numero de vertices, y
+        # nada mas. A la pregunta mas obvia que se le puede hacer a un
+        # area de estudio -- donde esta -- el agente no tenia con que
+        # responder.
+        lineas.extend(_coordenadas_del_area(vigente["archivo"]))
     elif info["municipios_existe"]:
         departamentos = ", ".join(info["departamentos"]) or "sin identificar"
         lineas.append(
@@ -565,6 +753,9 @@ def estado_del_corpus() -> str:
 #: que quien lee la conversacion no la ve.
 MARCA_SCRIPT_QGIS = "[[DESCARGAR_SCRIPT_QGIS]]"
 
+#: Marca que la interfaz cambia por el boton de descarga del paquete.
+MARCA_PAQUETE_QGIS = "[[DESCARGAR_PAQUETE_QGIS]]"
+
 
 def entregar_script_qgis() -> str:
     """
@@ -634,35 +825,220 @@ def entregar_script_qgis() -> str:
     return "\n".join(lineas)
 
 
-def datos_para_qgis() -> str:
+def entregar_paquete_qgis() -> str:
     """
-    Dice que hay en la bibliografia cargada que sirva para hacer un mapa.
+    Arma un proyecto de QGIS listo para abrir y lo deja descargable.
 
-    Usala cuando el usuario pregunte si hay datos para QGIS, si hay
-    coordenadas, cuencas, veredas o quebradas con las que dibujar algo, o que
-    cartografia hace falta conseguir. Tambien antes de proponer un script de
-    QGIS: evita ofrecer un mapa que no se puede hacer porque no hay con que.
+    Usala cuando pidan "un archivo para QGIS", "el mapa", "las capas", "el
+    proyecto" o algo que puedan abrir directamente. Es lo que casi siempre
+    quiere quien lo pide.
 
-    Separa tres cosas que no son lo mismo, y conviene no mezclar al responder:
+    DIFERENCIA CON `entregar_script_qgis`
+    -------------------------------------
+    El script hay que pegarlo en la consola de Python de QGIS y ejecutarlo:
+    sirve para quien ya tiene QGIS abierto y su proyecto montado. Esta
+    herramienta entrega otra cosa, un .zip con el proyecto, las capas y un
+    LEEME, que se descomprime y se abre con doble clic.
 
-      - COORDENADAS: lo unico que situa algo en un mapa por si solo.
-      - TOPONIMOS (cuencas, drenajes, veredas): no situan nada, pero se pueden
-        enganchar por nombre a una capa que ya tenga geometria.
-      - SISTEMA DE REFERENCIA Y SUPERFICIES: hacen falta para que las cifras y
-        las reproyecciones salgan bien.
+    Si dudas, usa esta. Pide el script solo si lo piden por su nombre o si
+    quieren meter las capas en un proyecto de QGIS que ya tienen abierto.
 
-    Cuidado al interpretar el resultado: que existan coordenadas NO significa
-    que sean del area de estudio. Suelen venir de los antecedentes
-    bibliograficos, que citan campanas de campo de otros lugares. El informe lo
-    comprueba cuando hay capa del area de estudio generada, y lo advierte
-    cuando no.
+    QUE LLEVA DENTRO
+    ----------------
+    Un `proyecto.qgs` con rutas relativas, un `capas.gpkg` con todas las
+    capas en EPSG:4326 y un LEEME. Va en GeoPackage y no en shapefile
+    porque el shapefile corta los nombres de campo a 10 caracteres.
+
+    No describas el contenido del .zip de memoria: lo que devuelve esta
+    funcion ya dice que capas lleva y cuantas entidades tiene cada una.
 
     Returns:
-        Informe con lo que hay de cada clase, el documento de donde sale cada
-        dato, y un veredicto explicito sobre si se puede dibujar un mapa.
+        Las instrucciones de uso y el inventario de lo que se empaqueto, o
+        la explicacion de por que no se pudo armar.
     """
-    from core import geografia
-    return geografia.informe()
+    import glob
+    import os
+
+    from core import paquete_qgis
+
+    raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Las capas del area salen de `data/`; las de campo, de `capas_extra/`,
+    # que es la carpeta donde el script de QGIS recoge lo que anade el
+    # usuario. El paquete tiene que llevar las dos: entregar el area sin
+    # los datos de campo que se acaban de validar seria entregar la mitad.
+    fuentes = (sorted(glob.glob(os.path.join(raiz, "data", "*.geojson")))
+               + sorted(glob.glob(os.path.join(raiz, "capas_extra",
+                                               "*.geojson"))))
+    destino = os.path.join(raiz, "data", "entregas", "Area_estudio_QGIS.zip")
+
+    try:
+        hecho = paquete_qgis.construir(destino, fuentes)
+    except ValueError as exc:
+        # Es el caso de "todavia no hay capas". No es un error del sistema y
+        # no conviene presentarlo como tal: hay que decir que falta hacer.
+        return (f"No puedo armar el paquete todavia: {exc}\n\n"
+                f"Las capas se generan desde la pestana Area de Estudio, "
+                f"fijando el limite del area. Hasta entonces no hay "
+                f"geometria que dibujar.")
+    except Exception as exc:
+        return (f"No pude armar el paquete de QGIS: "
+                f"{type(exc).__name__}: {exc}")
+
+    lineas = [
+        "He armado el proyecto de QGIS. Debajo tienes el boton para "
+        "descargarlo.",
+        "",
+        "COMO SE ABRE",
+        "  1. Descomprime el .zip entero en una carpeta.",
+        "  2. Haz doble clic en `proyecto.qgs`.",
+        "",
+        "  No saques el `proyecto.qgs` de la carpeta: las rutas son "
+        "relativas para que el paquete funcione en cualquier ordenador, y "
+        "eso quiere decir que el proyecto y el `capas.gpkg` van juntos.",
+        "",
+        "QUE LLEVA",
+    ]
+    for capa in hecho["capas"]:
+        lineas.append(f"  - {capa['nombre']}: {capa['entidades']} "
+                      f"entidades ({capa['tipo']})")
+        if capa["columnas"]:
+            lineas.append(f"      campos: {', '.join(capa['columnas'])}")
+    lineas += [
+        "",
+        f"  Todo en EPSG:4326, el mismo sistema del GPS y de los datos de "
+        f"QField. El .zip pesa {hecho['bytes'] // 1024} kB.",
+        "",
+        MARCA_PAQUETE_QGIS,
+    ]
+    return "\n".join(lineas)
+
+
+def datos_para_qgis() -> str:
+    """
+    Dice QUE GEOMETRIA tiene el sistema para dibujar un mapa.
+
+    Usala siempre que pregunten si hay coordenadas, si hay veredas, si hay
+    cuencas, con que se puede hacer un mapa, o que falta para hacerlo.
+    Tambien antes de prometer cualquier cartografia.
+
+    LEE LAS CAPAS, NO LOS DOCUMENTOS
+    --------------------------------
+    Esta es la diferencia que importa y la razon de que esta herramienta
+    exista. Un documento puede MENCIONAR un shapefile, una geodatabase o
+    un sistema de referencia; eso no significa que el sistema tenga esa
+    geometria. Son dos cosas distintas:
+
+        "el informe cita Drenaje_Sencillo_San_Carlos.shp"
+        "el sistema tiene las lineas de ese drenaje y puede dibujarlas"
+
+    Lo primero sale de leer texto. Lo segundo, de mirar las capas. Esta
+    herramienta mira las capas.
+
+    NO AFIRMES QUE HAY COORDENADAS PORQUE UN DOCUMENTO HABLE DE ELLAS.
+    Si esta funcion no lista una capa, esa geometria NO esta, por mucho
+    que el corpus la nombre. Decir lo contrario manda a la persona a
+    buscar en QGIS algo que no va a encontrar.
+
+    Returns:
+        Inventario de las capas que existen, con su tipo y su recuento, y
+        un veredicto explicito sobre que se puede dibujar y que no.
+    """
+    import glob
+    import json
+    import os
+
+    raiz = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    rutas = (sorted(glob.glob(os.path.join(raiz, "data", "*.geojson")))
+             + sorted(glob.glob(os.path.join(raiz, "capas_extra",
+                                             "*.geojson"))))
+
+    capas = []
+    for ruta in rutas:
+        try:
+            with open(ruta, encoding="utf-8") as fh:
+                datos = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        entidades = datos.get("features") or []
+        if not entidades:
+            continue
+        tipos = sorted({e["geometry"]["type"] for e in entidades
+                        if e.get("geometry")})
+        campos = []
+        for entidad in entidades:
+            for clave in (entidad.get("properties") or {}):
+                if clave not in campos:
+                    campos.append(clave)
+        capas.append({
+            "nombre": os.path.splitext(os.path.basename(ruta))[0],
+            "donde": os.path.basename(os.path.dirname(ruta)),
+            "tipos": tipos,
+            "entidades": len(entidades),
+            "campos": campos,
+        })
+
+    if not capas:
+        return (
+            "NO hay ninguna capa con geometria en el sistema, asi que no se "
+            "puede dibujar nada todavia.\n\n"
+            "El area de estudio se fija en la pestana 'Area de Estudio', "
+            "subiendo el archivo que la delimita (un .kmz, .kml o .geojson). "
+            "De ahi salen las primeras capas.\n\n"
+            "Aunque algun documento del corpus hable de shapefiles o de "
+            "geodatabases, eso es texto: el sistema no tiene esa geometria."
+        )
+
+    lineas = ["GEOMETRIA QUE EL SISTEMA TIENE AHORA MISMO", ""]
+    poligonos = lineas_geo = puntos = 0
+    for capa in capas:
+        lineas.append(f"  {capa['nombre']}")
+        lineas.append(f"      {capa['entidades']} entidades "
+                      f"({', '.join(capa['tipos'])}) en {capa['donde']}/")
+        if capa["campos"]:
+            lineas.append(f"      campos: {', '.join(capa['campos'][:10])}")
+        for tipo in capa["tipos"]:
+            if tipo.endswith("Polygon"):
+                poligonos += capa["entidades"]
+            elif tipo.endswith("LineString"):
+                lineas_geo += capa["entidades"]
+            elif tipo.endswith("Point"):
+                puntos += capa["entidades"]
+
+    lineas += [
+        "",
+        f"En total: {poligonos} poligono(s), {lineas_geo} linea(s) y "
+        f"{puntos} punto(s). Todo en EPSG:4326, grados decimales.",
+        "",
+        "SE PUEDE DIBUJAR UN MAPA con lo que hay. Pidelo y se entrega el "
+        "paquete de QGIS, que se abre con doble clic.",
+    ]
+
+    # Lo que NO hay se dice por su nombre. Es la pregunta que mas se repite
+    # y la que peor se responde callando: quien pregunta por veredas
+    # merece un "no las hay y de donde sacarlas", no una lista de otras
+    # cosas que si estan.
+    faltan = []
+    campos_todos = " ".join(c["nombre"].lower() for c in capas)
+    if poligonos <= 1:
+        faltan.append(
+            "  - Poligonos de VEREDA. Las veredas solo existen como nombres "
+            "en capas de puntos, no como superficies. La capa de veredas de "
+            "Colombia la publican el DANE y el IGAC.")
+    if "cuenca" not in campos_todos:
+        faltan.append(
+            "  - El poligono de la CUENCA. El unico poligono que hay es el "
+            "limite municipal. No son lo mismo: la cuenca son unos 702 km2 "
+            "y el municipio 720,77. La cuenca sale del POMCA o de la "
+            "zonificacion hidrografica del IDEAM.")
+    if faltan:
+        lineas += ["", "LO QUE NO HAY, Y HACE FALTA CONSEGUIR:"] + faltan
+        lineas += [
+            "",
+            "Esas capas se anaden dejando el archivo en la carpeta "
+            "'capas_extra' del proyecto: no hay que tocar codigo.",
+        ]
+
+    return "\n".join(lineas)
 
 
 def consultar_corpus(pregunta: str) -> str:
@@ -863,8 +1239,10 @@ HERRAMIENTAS = [
     procesar_lote_excel_csv,
     consultar_biodiversidad_local,
     describir_area_de_estudio,
+    revisar_datos_de_campo,
     estado_del_corpus,
     datos_para_qgis,
+    entregar_paquete_qgis,
     entregar_script_qgis,
     consultar_corpus,
     buscar_especie_exacta,
