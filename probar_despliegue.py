@@ -17,6 +17,7 @@ sirva igual con la pila a medio levantar.
 
 import json
 import os
+import os as _os_srv
 import sys
 import time
 import urllib.error
@@ -55,6 +56,38 @@ def omitir(titulo, motivo):
 def pedir(url, metodo="GET", cuerpo=None, espera=120):
     """
     Hace una peticion HTTP y devuelve (codigo, datos).
+
+    Args:
+        url: Direccion completa.
+        metodo: GET o POST.
+        cuerpo: Diccionario a enviar como JSON.
+        espera: Segundos de espera maxima.
+
+    Returns:
+        Tupla `(codigo, datos)`. El codigo es 0 si no hubo conexion.
+    """
+    # UN CORTE SUELTO NO ES UN ENDPOINT CAIDO
+    # ---------------------------------------
+    # Mientras un estudio baja 3,2 GB de Drive, la API mantiene decenas de
+    # conexiones abiertas y de vez en cuando rechaza una. Esta bateria lo
+    # contaba como "el endpoint no responde", y de ahi salian cuatro rojos
+    # en cascada: el estado fallaba, se leia como "no hay estudio en
+    # marcha", y el POST siguiente recibia el 409 correcto marcado como
+    # fallo.
+    #
+    # Se reintenta una vez. Un endpoint de verdad caido falla las dos, asi
+    # que esto no tapa nada: solo deja de confundir un hipo con una averia.
+    for intento in (1, 2):
+        codigo, datos_resp = _pedir_una_vez(url, metodo, cuerpo, espera)
+        if codigo != 0 or intento == 2:
+            return codigo, datos_resp
+        time.sleep(3)
+    return 0, ""
+
+
+def _pedir_una_vez(url, metodo="GET", cuerpo=None, espera=120):
+    """
+    Hace UNA peticion HTTP, sin reintentos.
 
     Args:
         url: Direccion completa.
@@ -170,6 +203,7 @@ ARCHIVOS_VIGILADOS = [
     "core/fuentes.py", "core/geografia.py", "core/catalogo.py",
     "core/pegado.py", "core/estilos.py", "core/seguridad.py",
     "core/memoria.py", "core/ajustes.py", "core/conexion_drive.py",
+    "core/geometria.py", "core/geodatabase.py", "core/capas.py",
 ]
 
 #: Archivos que solo vigila el contenedor que de verdad los ejecuta.
@@ -316,13 +350,43 @@ codigo, estado = pedir(f"{API}/corpus/estado", espera=240)
 corriendo = (estado.get("sincronizacion", {}).get("ejecutando")
              if isinstance(estado, dict) else False)
 
+# UNA BATERIA DE PRUEBAS NO PUEDE LANZAR UN ESTUDIO DE VERDAD
+# -----------------------------------------------------------
+# Esto arrancaba una sincronizacion contra el Drive REAL y seguia adelante
+# sin esperarla. El estudio quedaba corriendo por detras durante una hora,
+# bajandose 3,2 GB, mucho despues de que la bateria hubiera terminado.
+#
+# El 9 de noviembre de 2026 corri esta bateria tres veces en 77 segundos.
+# Arranco tres estudios encadenados; los dos primeros murieron en menos de
+# un minuto y el tercero acabo con "[Errno 2] ... .parcial -> .pdf", porque
+# la limpieza de uno se llevo por delante las descargas del siguiente. El
+# aviso rojo de la pantalla lo puso una prueba, no la aplicacion.
+#
+# Con Drive conectado NO se arranca nada. Si ya hay un estudio en marcha,
+# la parte que de verdad importa -- que el cerrojo rechace al segundo -- se
+# comprueba igual, sin costar una descarga.
+_fuente_viva = (estado.get("fuente", {}) if isinstance(estado, dict) else {})
+_drive_de_verdad = (_fuente_viva.get("fuente") == "drive"
+                    and _fuente_viva.get("listo"))
+
 if corriendo:
     comprobar("rechaza una segunda sincronizacion simultanea",
               pedir(f"{API}/corpus/sincronizar", "POST", {}, espera=60)[0] == 409,
               "HTTP 409, como debe")
+elif _drive_de_verdad:
+    omitir("arranca una sincronizacion",
+           "hay un Drive real conectado: lanzarla costaria 3,2 GB de "
+           "descarga y chocaria con el cron")
+    omitir("rechaza la segunda simultanea",
+           "haria falta arrancar una de verdad para poder solaparla")
 else:
     codigo, r = pedir(f"{API}/corpus/sincronizar", "POST", {}, espera=60)
-    comprobar("arranca una sincronizacion", codigo == 200, f"HTTP {codigo}")
+    # El 409 tambien vale: entre mirar si habia una en marcha y pedir esta,
+    # el cron puede haber arrancado la suya. Es una carrera legitima, no un
+    # fallo, y marcarla en rojo manda a buscar una averia que no existe.
+    comprobar("arranca una sincronizacion", codigo in (200, 409),
+              f"HTTP {codigo}" + (" (ya habia una en marcha)"
+                                  if codigo == 409 else ""))
 
     # La segunda peticion se lanza EN CUANTO se confirma que la primera sigue
     # viva, no tras una espera fija. Con `time.sleep(3)` esta comprobacion
@@ -686,6 +750,20 @@ else:
         if not _hay_clave:
             omitir("la coleccion de memoria crecio de verdad",
                    "no hay GEMINI_API_KEY para vectorizar")
+        elif ((_item or {}).get("memoria_en_espera")
+              or any(_p in ((_item or {}).get("memoria_motivo") or "").lower()
+                     for _p in ("429", "resource_exhausted", "cuota"))):
+            # GUARDADO EN COLA NO ES GUARDADO FALLIDO
+            # ---------------------------------------
+            # Mientras un estudio grande corre, se lleva toda la cuota de
+            # embeddings y el recuerdo se queda esperando en disco: se
+            # guardara en cuanto haya cuota. Marcarlo como fallo entrenaba a
+            # no mirar los fallos, que es peor que no tener la prueba.
+            omitir("la coleccion de memoria crecio de verdad",
+                   f"el recuerdo quedo EN COLA "
+                   f"({(_item or {}).get('memoria_en_espera')} esperando): "
+                   f"no hay cuota de embeddings ahora mismo, se escribira "
+                   f"cuando la haya")
         else:
             comprobar("la coleccion de memoria crecio de verdad",
                       despues.get("total", 0) > _recuerdos_antes,
@@ -842,6 +920,39 @@ comprobar("se puede renombrar una conversacion",
 comprobar("un titulo vacio se rechaza",
           _mem.renombrar_sesion(_ID, "   ") is False,
           "no se deja una charla sin nombre")
+
+# --- UNA ETIQUETA NO PUEDE ENTRAR COMO IDENTIFICADOR ------------------------
+# En la base de datos aparecio una conversacion de verdad -- 42 mensajes y 19
+# recuerdos, titulada "generame QGIS" -- cuyo IDENTIFICADOR era el texto
+# "Charla actual (en curso)", que es la ETIQUETA que la barra lateral le pone
+# a la charla todavia sin guardar.
+#
+# Mientras el identificador solo vivia en memoria casi no se notaba. Desde que
+# la charla viaja en la direccion del navegador se volvio pegajoso: pegabas
+# una imagen en una charla nueva y acababas dentro de esa conversacion de
+# hace tres dias.
+comprobar("un identificador de verdad se acepta",
+          _mem.es_identificador_de_sesion("sesion_274730")
+          and _mem.es_identificador_de_sesion("buzon_274730590"),
+          "letras, digitos, guiones y guiones bajos")
+
+_etiquetas = ["Charla actual (en curso)", "generame QGIS", "", None,
+              "sesion con espacios", "sesión_274730"]
+comprobar("y una etiqueta de pantalla no",
+          not any(_mem.es_identificador_de_sesion(e) for e in _etiquetas),
+          "espacios, acentos y parentesis delatan a una etiqueta")
+
+try:
+    _mem.registrar_sesion("Charla actual (en curso)", "no deberia entrar")
+    _colada = True
+except ValueError:
+    _colada = False
+comprobar("guardar bajo una etiqueta levanta en vez de grabarla",
+          not _colada,
+          "se entera quien llama, en vez de descubrirlo tres dias despues")
+comprobar("y no queda rastro de ella en la base de datos",
+          _mem.obtener_sesion("Charla actual (en curso)") is None,
+          "la conversacion que tenia ese id se migro a un id de verdad")
 
 _antes = len(_mem.cargar_historial(_ID))
 _res = _mem.borrar_sesion(_ID)
@@ -1320,6 +1431,271 @@ else:
               isinstance(_marcha.get("ejecutando"), bool),
               f"ejecutando={_marcha.get('ejecutando')} es del momento, "
               f"'anterior' es historico")
+
+# ==============================================================================
+print("")
+print("UN ESTUDIO QUE SE CORTA TIENE QUE NOTARSE")
+# ------------------------------------------------------------------------------
+# De aqui salio una pregunta razonable: "el cron no esta funcionando?". Si
+# estaba, y se disparaba todos los dias. Lo que pasaba es que los estudios se
+# morian a mitad -- la API reiniciada, el equipo dormido -- y al volver el
+# sistema decia "Sin sincronizaciones en esta sesion", que es palabra por
+# palabra lo mismo que dice cuando el cron no se ha disparado nunca.
+#
+# n8n se equivocaba igual por su cuenta: su bucle sale en cuanto la API deja
+# de decir "ejecutando", y una API recien arrancada dice justo eso. Tres
+# estudios muertos quedaron marcados como `success` en su historial.
+try:
+    import importlib.util as _iu
+
+    _ruta_srv = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "api", "server.py")
+    _spec = _iu.spec_from_file_location("_srv_para_probar", _ruta_srv)
+    _srv = _iu.module_from_spec(_spec)
+    _spec.loader.exec_module(_srv)
+except Exception as _exc:
+    omitir("se distingue un estudio cortado de uno que nunca existio",
+           f"no se pudo cargar api/server.py ({type(_exc).__name__})")
+else:
+    _a_medias = _srv._marcar_si_quedo_a_medias({
+        "ejecutando": False, "error": None,
+        "mensaje": "Sin sincronizaciones en esta sesion.",
+        "anterior": {"cuando": "2026-11-08T09:20:21",
+                     "origen": "cron", "terminado": False}})
+    comprobar("un estudio que quedo abierto se declara interrumpido",
+              _a_medias["interrumpida"] is True
+              and "se corto antes de terminar" in _a_medias["mensaje"],
+              "en vez de 'sin sincronizaciones en esta sesion'")
+    comprobar("y se dice que lo indexado NO se pierde",
+              "NO se pierde" in _a_medias["mensaje"],
+              "quien lo lee tiene que saber si hay que empezar de cero")
+    comprobar("el corte sale tambien como error, para que n8n lo vea",
+              _a_medias["error"] is not None,
+              "su bucle solo mira 'ejecutando' y el error")
+
+    _cerrado = _srv._marcar_si_quedo_a_medias({
+        "ejecutando": False, "error": None, "mensaje": "Listo.",
+        "anterior": {"cuando": "2026-11-08T09:20:21",
+                     "origen": "cron", "terminado": True}})
+    comprobar("uno que SI termino no se marca como cortado",
+              _cerrado["interrumpida"] is False and _cerrado["error"] is None,
+              "si no, el aviso saldria siempre y dejaria de leerse")
+
+    _en_marcha = _srv._marcar_si_quedo_a_medias({
+        "ejecutando": True, "error": None, "mensaje": "Indexando.",
+        "anterior": {"cuando": "x", "origen": "cron", "terminado": False}})
+    comprobar("y uno en marcha tampoco, aunque el anterior quedara abierto",
+              _en_marcha["interrumpida"] is False,
+              "lo que esta pasando ahora manda sobre lo de antes")
+
+    _sin_nada = _srv._marcar_si_quedo_a_medias({
+        "ejecutando": False, "error": None, "mensaje": "", "anterior": None})
+    comprobar("sin ningun estudio previo no se inventa un corte",
+              _sin_nada["interrumpida"] is False,
+              "una instalacion recien montada no ha roto nada")
+
+
+# ==============================================================================
+print("")
+print("IMPORTAR api/server.py NO PUEDE BORRAR NADA")
+# ------------------------------------------------------------------------------
+# Esta misma bateria carga `api/server.py` con `exec_module` para probar sus
+# funciones puras. Mientras la limpieza de arranque vivia al nivel del
+# modulo, hacerlo borraba los 3,2 GB que un estudio en marcha acababa de
+# bajar: un `import` con efecto de `rm -rf`.
+#
+# Paso cuatro veces en dos dias, y la ultima quedo cronometrada: el
+# vigilante de la pasada anoto "habia 425, quedan 0" a las 20:23:29Z, y un
+# segundo despues aparecen en el registro de la API las primeras peticiones
+# de esta bateria.
+_carpeta_testigo = _os_srv.path.join(
+    _os_srv.path.dirname(_os_srv.path.abspath(__file__)),
+    "data", "copiloto_drive", "_testigo_de_importacion")
+_os_srv.makedirs(_carpeta_testigo, exist_ok=True)
+with open(_os_srv.path.join(_carpeta_testigo, "no_me_borres.txt"), "w") as _fh_t:
+    _fh_t.write("este archivo existe para que importar no se lo lleve")
+
+try:
+    import importlib.util as _iu3
+
+    _spec3 = _iu3.spec_from_file_location(
+        "_srv_importacion",
+        _os_srv.path.join(_os_srv.path.dirname(_os_srv.path.abspath(__file__)),
+                          "api", "server.py"))
+    _srv3 = _iu3.module_from_spec(_spec3)
+    _spec3.loader.exec_module(_srv3)
+except Exception as _exc:
+    omitir("importar el servidor no borra la carpeta de descargas",
+           f"no se pudo cargar api/server.py ({type(_exc).__name__})")
+else:
+    comprobar("importar el servidor no borra la carpeta de descargas",
+              _os_srv.path.exists(_os_srv.path.join(_carpeta_testigo,
+                                                    "no_me_borres.txt")),
+              "un import no puede tener el efecto de un rm -rf")
+    comprobar("lo que se hace al arrancar espera a que arranque la aplicacion",
+              isinstance(getattr(_srv3, "_RESTOS_AL_ARRANCAR", None), dict)
+              and "estado" in _srv3._RESTOS_AL_ARRANCAR,
+              "la limpieza vive en el evento de arranque, no en el modulo")
+
+import shutil as _sh_srv
+_sh_srv.rmtree(_carpeta_testigo, ignore_errors=True)
+
+
+# ==============================================================================
+print("")
+print("UNA PASADA QUE NO INDEXA NADA NO PUEDE SALIR EN VERDE")
+# ------------------------------------------------------------------------------
+# Paso de verdad: una pasada termino diciendo "Listo: 367 nuevos, 0
+# actualizados, 58 sin cambios" y no habia anadido NI UNA ficha al indice.
+# Los 367 documentos no estaban en el equipo cuando se fueron a leer. El
+# mensaje era cierto palabra por palabra -- "nuevo" solo quiere decir que se
+# intento -- y daba justo la impresion contraria a la realidad. n8n tambien
+# la dio por buena, porque lo unico que mira es el error.
+try:
+    import importlib.util as _iu2
+
+    _ruta_srv2 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "api", "server.py")
+    _spec2 = _iu2.spec_from_file_location("_srv_pasada", _ruta_srv2)
+    _srv2 = _iu2.module_from_spec(_spec2)
+    _spec2.loader.exec_module(_srv2)
+except Exception as _exc:
+    omitir("una pasada vacia se declara fallida",
+           f"no se pudo cargar api/server.py ({type(_exc).__name__})")
+else:
+    _vacia = {"nuevos": 367, "actualizados": 0, "sin_cambios": 58,
+              "borrados": 0, "fichas": 0,
+              "sin_descargar": [{}] * 355, "sin_contenido": [{}] * 3,
+              "fallidos": [{}] * 9}
+    _texto = _srv2._resumen_de_la_pasada(_vacia)
+    comprobar("el mensaje empieza por las fichas, que es lo que se consigue",
+              _texto.startswith("Listo: 0 fichas"),
+              _texto[:52])
+    comprobar("y dice cuantos quedaron fuera y por que",
+              "355 no llegaron a bajarse" in _texto
+              and "9 fallaron" in _texto,
+              "no se puede leer solo la mitad buena")
+    comprobar("una pasada sin fichas se cuenta como fallida",
+              bool(_srv2._lo_que_salio_mal(_vacia)),
+              "si no, la interfaz la pinta en verde y n8n la da por buena")
+    comprobar("y se nombra la causa correcta: descarga, no lectura",
+              "no es un problema de lectura"
+              in _srv2._lo_que_salio_mal(_vacia).lower(),
+              "mando a buscar el fallo donde no estaba")
+
+    _sana = {"nuevos": 12, "actualizados": 2, "sin_cambios": 400,
+             "borrados": 0, "fichas": 1840, "sin_contenido": [{}] * 2}
+    comprobar("una pasada que SI indexo no se marca como fallida",
+              not _srv2._lo_que_salio_mal(_sana),
+              _srv2._resumen_de_la_pasada(_sana)[:58])
+
+    _quieta = {"nuevos": 0, "actualizados": 0, "sin_cambios": 425,
+               "borrados": 0, "fichas": 0}
+    comprobar("y no haber nada que hacer tampoco es un fallo",
+              not _srv2._lo_que_salio_mal(_quieta),
+              "cero fichas con cero pendientes es lo normal a diario")
+
+
+# ==============================================================================
+print("\nLA CHARLA SOBREVIVE A QUE SE PIERDA LA SESION DEL NAVEGADOR")
+# ==============================================================================
+# `st.session_state` muere con la conexion del navegador, y esa conexion se
+# cae sola: pestana en segundo plano, equipo que se duerme, servidor que se
+# reinicia. Al volver, Streamlit abre una sesion NUEVA y vacia.
+#
+# Donde mas duele es al pegar una imagen, porque para tener una imagen hay que
+# salir de la pestana a copiarla. En el historial del 9 de noviembre de 2026
+# quedaron tres charlas casi identicas -- "de que genero es esta mariposa?" a
+# las 00:54, a las 00:56 y a las 01:01 -- que eran tres veces el mismo intento,
+# cada una en una conversacion nueva y en blanco.
+#
+# La direccion del navegador si sobrevive a todo eso. Lo que se vigila aqui es
+# que siga llevando la charla y el buzon, y que nadie la borre por el camino.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py"),
+          encoding="utf-8") as _fh_app:
+    _APP = _fh_app.read()
+
+comprobar("la charla y el buzon se anotan en la direccion",
+          'st.query_params["charla"]' in _APP
+          and 'st.query_params["buzon"]' in _APP,
+          "sin esto, recargar la pagina abre una conversacion nueva")
+
+comprobar("y se leen ANTES de sembrar el estado de la sesion",
+          (_APP.index('st.query_params.get("charla")')
+           < _APP.index("for clave, valor in _ESTADO_INICIAL.items()")),
+          "leerlos despues no serviria: el identificador ya estaria inventado")
+
+comprobar("al volver se recupera lo que se dijo en esa charla",
+          "_sesion_recien_abierta" in _APP
+          and "cargar_historial(_charla_en_la_url)" in _APP,
+          "recuperar el identificador sin el historial deja la pantalla en "
+          "blanco igual")
+
+# `st.query_params.clear()` se llevaba por delante `charla` y `buzon`:
+# conectar Drive te dejaba en una conversacion nueva y vacia.
+comprobar("nadie vacia la direccion entera",
+          "st.query_params.clear()" not in _APP,
+          "se quitan solo `code` y `state`, que son los que caducan")
+
+# EL INVARIANTE: cambiar de charla y anotarlo van JUNTOS
+# ------------------------------------------------------
+# Si manana se anade otro sitio que cambie de conversacion y se olvida de la
+# direccion, el fallo vuelve y no se nota hasta que alguien recarga.
+_lineas_app = _APP.splitlines()
+_sin_anotar = []
+_cuantos_cambios = 0
+for _n, _linea in enumerate(_lineas_app):
+    if ("session_state.session_id = " not in _linea
+            and 'session_state["session_id"] = ' not in _linea):
+        continue
+    _cuantos_cambios += 1
+    # Se admite en las doce lineas siguientes: lo normal es que vaya pegado,
+    # pero donde se repara un identificador invalido hay que arreglar antes
+    # el buzon, y la anotacion de los dos va junta al final.
+    if "_recordar_en_la_direccion" not in "\n".join(_lineas_app[_n:_n + 13]):
+        _sin_anotar.append(f"linea {_n + 1}: {_linea.strip()[:52]}")
+
+comprobar("cada sitio que cambia de charla lo anota en la direccion",
+          not _sin_anotar,
+          "; ".join(_sin_anotar) if _sin_anotar
+          else f"{_cuantos_cambios} sitios, todos lo anotan")
+
+comprobar("el saludo no se duplica al recuperar una charla",
+          _APP.count("_historial_con_bienvenida") >= 3,
+          "una sola funcion decide si hace falta el saludo, y la usan todos")
+
+comprobar("lo que llega por la direccion se comprueba antes de creerselo",
+          "es_identificador_de_sesion(_charla_en_la_url)" in _APP,
+          "la direccion la edita cualquiera y arrastra lo que hubiera antes")
+
+# UNA PESTANA ABIERTA DE ANTES SE CURA SOLA
+# ------------------------------------------
+# Arreglar el codigo y limpiar la base de datos no alcanza a las pestanas
+# que ya estan abiertas: su identificador vive en la memoria del navegador.
+# Una siguio mandando "Charla actual (en curso)" durante una hora despues de
+# estar todo corregido, y cada pregunta se contestaba sin guardarse.
+_cura = _APP[_APP.index("UNA PESTANA YA ENVENENADA SE CURA SOLA"):][:1400]
+comprobar("una pestana con un identificador invalido se cura sola",
+          'st.session_state.get("session_id")' in _cura
+          and "st.session_state.session_id = " in _cura
+          and "es_identificador_de_sesion" in _cura,
+          "se comprueba en cada pasada, no se espera a que alguien recargue")
+
+# --- Una peticion mal formada no es una caida del servidor -----------------
+# El guardia del identificador levantaba una excepcion y FastAPI la
+# convertia en 500. n8n leia "el servidor se rompio", la pantalla decia
+# "El orquestador de n8n no respondio (HTTP Error 500)" y el motivo real --
+# que el identificador era una etiqueta -- no aparecia por ningun lado.
+_codigo_malo, _cuerpo_malo = pedir(
+    f"{API}/agente/chat", "POST",
+    {"pregunta": "hola", "session_id": "Charla actual (en curso)"}, espera=30)
+comprobar("un identificador invalido se responde 400, no 500",
+          _codigo_malo == 400, f"HTTP {_codigo_malo}")
+comprobar("y el aviso dice que pasa y que hacer",
+          "etiqueta" in str((_cuerpo_malo or {}).get("detail", "")).lower()
+          and "recarga" in str((_cuerpo_malo or {}).get("detail", "")).lower(),
+          str((_cuerpo_malo or {}).get("detail", ""))[:70])
+
 
 # ==============================================================================
 print("\n" + "=" * 70)

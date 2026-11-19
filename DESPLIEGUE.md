@@ -316,7 +316,7 @@ docker compose build
 
 ### 5.3. Comprobar la zona horaria
 
-**El cron depende de esto.** La carga diaria está programada a las 10:30, y esa
+**El cron depende de esto.** La carga diaria está programada a las 02:00, y esa
 hora se interpreta en la zona horaria del contenedor de n8n. Si el servidor
 está en UTC y se espera hora de Colombia, la carga ocurrirá cinco horas
 después de lo previsto.
@@ -449,7 +449,7 @@ olvidarse del script.
 
 ### El estudio programado
 
-Todos los días a las **10:30** (hora del servidor), n8n le pide a la API que
+Todos los días a las **02:00** (hora del servidor), n8n le pide a la API que
 revise Drive y actualice el índice. Solo procesa lo que cambió: si no hay nada
 nuevo, termina en segundos.
 

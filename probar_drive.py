@@ -43,6 +43,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 AQUI = os.path.dirname(os.path.abspath(__file__))
 if AQUI not in sys.path:
@@ -493,6 +494,90 @@ def main():
             comprobar("el archivo local queda actualizado",
                       f.read() == nuevo, "contenido nuevo en disco")
 
+        # --- UNA DESCARGA QUE FALLA NO TUMBA LA PASADA ----------------------
+        # El 9 de noviembre de 2026 un solo archivo de 367 se llevo por
+        # delante un estudio de tres horas: el temporal de
+        # "8. Aldana-2010-Oil-palm-pest-manual.pdf" desaparecio antes del
+        # renombrado y el [Errno 2] subio hasta arriba sin que nadie lo
+        # parase. Lo ya bajado y lo ya indexado se perdio con el.
+        print("\n--- Una descarga que falla no tumba la pasada ---")
+        _bueno = fuente._descargar
+        _victima = {"n": 0}
+
+        def _descargar_con_un_fallo(servicio, archivo_id, ruta_destino,
+                                    exportar_como=""):
+            """Revienta en la primera descarga y se porta bien en el resto."""
+            _victima["n"] += 1
+            if _victima["n"] == 1:
+                _victima["quien"] = ruta_destino
+            # Falla SIEMPRE para el mismo archivo, tambien en el reintento:
+            # asi se comprueba lo que pasa con el que de verdad no se puede
+            # bajar, y no con uno que se recupera al segundo intento.
+            if ruta_destino == _victima.get("quien"):
+                raise FileNotFoundError(
+                    f"[Errno 2] No such file or directory: "
+                    f"'{ruta_destino}.parcial' -> '{ruta_destino}'")
+            return _bueno(servicio, archivo_id, ruta_destino, exportar_como)
+
+        shutil.rmtree(fuente.carpeta_temporal(), ignore_errors=True)
+        fuente._descargar = _descargar_con_un_fallo
+        try:
+            _con_fallo = fuente.documentos()
+            _reviento = ""
+        except Exception as _exc:
+            _con_fallo, _reviento = [], f"{type(_exc).__name__}: {_exc}"
+        finally:
+            fuente._descargar = _bueno
+
+        comprobar("un archivo que no baja no levanta la pasada entera",
+                  not _reviento,
+                  _reviento or "se anota y se sigue, como debe")
+        comprobar("y los demas documentos siguen llegando",
+                  len(_con_fallo) == legibles,
+                  f"{len(_con_fallo)} de {legibles}; ninguno desaparece")
+
+        _apuntados = [d for d in _con_fallo if d.get("no_se_pudo_bajar")]
+        comprobar("el que fallo queda apuntado, con su motivo",
+                  len(_apuntados) == 1
+                  and "Errno 2" in _apuntados[0]["no_se_pudo_bajar"],
+                  (f"{_apuntados[0]['nombre']}: "
+                   f"{_apuntados[0]['no_se_pudo_bajar'][:50]}")
+                  if _apuntados else "no quedo constancia de ninguno")
+
+        # Y el caso que de verdad ocurrio: la carpeta entera desaparece a
+        # mitad de la bajada. No basta con anotarlo trescientas veces; hay
+        # que rehacerla y seguir, o el estudio vuelve con las manos vacias.
+        _sabotaje = {"hecho": False}
+
+        def _descargar_y_borrar_la_carpeta(servicio, archivo_id, ruta_destino,
+                                           exportar_como=""):
+            """Se lleva la carpeta por delante en la segunda descarga."""
+            if not _sabotaje["hecho"]:
+                _sabotaje["hecho"] = True
+                shutil.rmtree(fuente.carpeta_temporal(), ignore_errors=True)
+            return _bueno(servicio, archivo_id, ruta_destino, exportar_como)
+
+        shutil.rmtree(fuente.carpeta_temporal(), ignore_errors=True)
+        fuente._descargar = _descargar_y_borrar_la_carpeta
+        try:
+            _tras_sabotaje = fuente.documentos()
+            _murio = ""
+        except Exception as _exc:
+            _tras_sabotaje, _murio = [], f"{type(_exc).__name__}: {_exc}"
+        finally:
+            fuente._descargar = _bueno
+
+        comprobar("si la carpeta desaparece a mitad, se rehace y se sigue",
+                  not _murio and len(_tras_sabotaje) == legibles,
+                  _murio or f"{len(_tras_sabotaje)} documentos, ninguno "
+                            f"perdido por el borrado")
+        comprobar("y despues de rehacerla los archivos estan en el disco",
+                  all(os.path.exists(d["ruta"]) for d in _tras_sabotaje),
+                  "no quedan rutas que apunten a la nada")
+
+        # Se deja el banco como estaba para lo que viene detras.
+        fuente.documentos()
+
         # --- NO SE CONSERVA NADA EN EL EQUIPO -------------------------------
         # Es la regla que pidio quien dirige el proyecto: el agente estudia de
         # Drive, y lo que baja para leerlo se borra. Lo aprendido vive en el
@@ -512,6 +597,62 @@ def main():
         comprobar("y dice cuanto libero",
                   _limpieza["archivos"] == _antes,
                   f"{_limpieza['archivos']} archivos, {_limpieza['megas']} MB")
+
+        # --- NADIE BORRA LA CARPETA DE UN ESTUDIO AJENO ---------------------
+        # El 9 de noviembre de 2026 esto costo dos estudios seguidos: algo
+        # ajeno al estudio borro data/copiloto_drive mientras el cron la
+        # llenaba, y las dos pasadas acabaron diciendo que trescientos y pico
+        # documentos "no llegaron a bajarse". La carpeta tiene nombre fijo y
+        # cualquiera puede borrarla, asi que tiene que saber defenderse.
+        print("\n--- La carpeta de un estudio en marcha no se toca ---")
+        _plantados = 5
+        _sub = os.path.join(fuente.carpeta_temporal(), "ocupada")
+        os.makedirs(_sub, exist_ok=True)
+        for _i in range(_plantados):
+            with open(os.path.join(_sub, f"bajando_{_i}.pdf"), "wb") as _fh:
+                _fh.write(b"documento a medio bajar")
+
+        # Un cartel de OTRO proceso: un pid que no es el nuestro.
+        import json as _json_marca
+
+        with open(fuentes._ruta_de_la_marca(), "w", encoding="utf-8") as _fh:
+            _json_marca.dump({"pid": os.getpid() + 1, "desde": time.time()},
+                             _fh)
+        try:
+            _rechazo = fuente.limpiar()
+            _siguen = sum(len(a) for _, _, a in os.walk(
+                fuente.carpeta_temporal()))
+            comprobar("limpiar() se niega si otro esta estudiando",
+                      bool(_rechazo.get("rechazado")) and _siguen == _plantados,
+                      _rechazo.get("rechazado", "no dijo que no")[:70])
+
+            # Y el estudio que SI es dueno de la carpeta puede limpiarla: su
+            # propio cartel no puede bloquearle a el.
+            with open(fuentes._ruta_de_la_marca(), "w",
+                      encoding="utf-8") as _fh:
+                _json_marca.dump({"pid": os.getpid(), "desde": time.time()},
+                                 _fh)
+            comprobar("pero el dueno del estudio si puede limpiar lo suyo",
+                      not fuentes.estudio_de_otro(),
+                      "su propio cartel no le cierra la puerta")
+
+            # Un cartel olvidado por un proceso que ya murio no puede dejar
+            # la carpeta blindada para siempre.
+            with open(fuentes._ruta_de_la_marca(), "w",
+                      encoding="utf-8") as _fh:
+                _json_marca.dump(
+                    {"pid": os.getpid() + 1,
+                     "desde": time.time()
+                     - (fuentes.HORAS_PARA_OLVIDAR_LA_MARCA + 1) * 3600},
+                    _fh)
+            comprobar("un cartel olvidado no blinda la carpeta para siempre",
+                      not fuentes.estudio_de_otro()
+                      and not os.path.exists(fuentes._ruta_de_la_marca()),
+                      f"se olvida a las {fuentes.HORAS_PARA_OLVIDAR_LA_MARCA} "
+                      f"horas y se retira solo")
+        finally:
+            fuentes.terminar_estudio()
+            shutil.rmtree(_sub, ignore_errors=True)
 
         # --- Diagnostico cuando falta configuracion -------------------------
         print("\n--- Diagnostico ---")
@@ -647,6 +788,173 @@ try:
 finally:
     shutil.rmtree(_carpeta_ver, ignore_errors=True)
 
+
+
+# ==============================================================================
+print("")
+print("LA CARPETA DE DESCARGAS AGUANTA QUE LA BORREN MIENTRAS SE CREA")
+# ------------------------------------------------------------------------------
+# `exist_ok=True` no quiere decir "no falles nunca": quiere decir "no falles
+# si al terminar hay una carpeta ahi". Mientras la limpieza del estudio
+# anterior borra 3,2 GB, el `mkdir` del siguiente choca con la carpeta a
+# medio borrar y salta [Errno 17] File exists.
+#
+# No es teorico: tumbo una sincronizacion entera en su primer segundo. El
+# informe dijo "Fallo la sincronizacion: File exists" y el motivo real era
+# una carrera de milisegundos.
+import threading as _th_carrera
+import time as _t_carrera
+
+# Se construye la fuente a pelo: `carpeta_temporal()` no habla con Drive,
+# asi que la prueba no necesita credenciales ni red. Pasando por
+# `obtener()` la prueba se saltaba sola en cuanto no habia Drive
+# configurado, que es justo como corre esta bateria.
+from core import fuentes as _fu_carrera
+
+# ESTA PRUEBA BORRA UNA CARPETA 150 VECES SEGUIDAS, Y NO PUEDE SER LA DE VERDAD
+# ----------------------------------------------------------------------------
+# `carpeta_temporal()` no mira el `carpeta_id` que se le pase: devuelve
+# SIEMPRE `data/copiloto_drive`, la carpeta real donde un estudio en marcha
+# esta dejando lo que baja de Drive. Construir la fuente con credenciales
+# falsas no la vuelve inofensiva.
+#
+# Paso de verdad, el 9 de noviembre de 2026. Esta bateria se lanzo a las
+# 11:26 mientras el cron de las 11:10 llevaba dieciseis minutos bajando
+# documentos. El hilo de abajo borro la carpeta 150 veces, y el estudio
+# termino diciendo "354 de 367 documentos no llegaron a bajarse del Drive".
+# La aplicacion no tenia ningun fallo: el fallo era esta prueba.
+#
+# Se le cambia a `ruta_proyecto` la raiz por una carpeta de usar y tirar.
+# Asi `carpeta_temporal()` se ejecuta ENTERA tal como es -- que es lo que se
+# quiere comprobar -- pero sobre una carpeta que no le importa a nadie.
+_raiz_de_pega = tempfile.mkdtemp(prefix="carrera_carpeta_")
+_ruta_proyecto_real = _fu_carrera.settings.ruta_proyecto
+_fu_carrera.settings.ruta_proyecto = (
+    lambda *partes: os.path.join(_raiz_de_pega, *partes))
+
+try:
+    _fuente_carrera = _fu_carrera.FuenteDrive(carpeta_id="prueba",
+                                              credenciales="(falsas)")
+    _carpeta_prueba = _fuente_carrera.carpeta_temporal()
+    comprobar("la carrera se corre sobre una carpeta de pega, no sobre la real",
+              _raiz_de_pega in _carpeta_prueba
+              and "copiloto_drive" in _carpeta_prueba,
+              "borrar 150 veces la carpeta real tumbaria un estudio en marcha")
+except Exception as _exc:
+    comprobar("la carpeta de descargas aguanta la carrera", False,
+              f"no se pudo ni crear la carpeta: {type(_exc).__name__}")
+else:
+    _fallos_carrera = []
+
+    def _borrar_sin_parar():
+        """Borra la carpeta una y otra vez, como hace la limpieza."""
+        for _ in range(150):
+            shutil.rmtree(_carpeta_prueba, ignore_errors=True)
+            _t_carrera.sleep(0.001)
+
+    def _crearla_sin_parar():
+        """Pide la carpeta una y otra vez, como hace cada descarga."""
+        for _ in range(150):
+            try:
+                _fuente_carrera.carpeta_temporal()
+            except Exception as exc:
+                _fallos_carrera.append(type(exc).__name__)
+            _t_carrera.sleep(0.001)
+
+    _hilos = [_th_carrera.Thread(target=_borrar_sin_parar),
+              _th_carrera.Thread(target=_crearla_sin_parar)]
+    for _h in _hilos:
+        _h.start()
+    for _h in _hilos:
+        _h.join()
+
+    comprobar("crear la carpeta no falla aunque la esten borrando",
+              not _fallos_carrera,
+              f"{len(_fallos_carrera)} fallos en 150 intentos simultaneos"
+              + (f": {_fallos_carrera[:3]}" if _fallos_carrera else ""))
+    comprobar("y al final la carpeta esta ahi, lista para descargar",
+              os.path.isdir(_fuente_carrera.carpeta_temporal()),
+              _carpeta_prueba)
+finally:
+    # Se devuelve la raiz de verdad ANTES de que siga la bateria: dejarla
+    # apuntando a un temporal haria que todo lo que viniera despues mirara
+    # una carpeta que no existe.
+    _fu_carrera.settings.ruta_proyecto = _ruta_proyecto_real
+    shutil.rmtree(_raiz_de_pega, ignore_errors=True)
+
+# --------------------------------------------------------------------------
+# DOS DESCARGAS DEL MISMO ARCHIVO NO SE PUEDEN PISAR
+# --------------------------------------------------------------------------
+# El temporal se llamaba igual para todos -- `<archivo>.parcial` --, asi que
+# dos hilos bajando el mismo archivo escribian encima el uno del otro: el
+# primero en terminar renombraba y el segundo se quedaba sin temporal. El
+# estudio entero moria con un ENOENT sobre un PDF de 400 KB que ya estaba
+# bajado.
+_base_descargas = tempfile.mkdtemp(prefix="descargas_a_la_vez_")
+try:
+    _destino = os.path.join(_base_descargas, "documento.pdf")
+
+    _nombres = []
+
+    def _apuntar_su_temporal():
+        """Pide el nombre temporal, como haria una descarga cualquiera."""
+        _nombres.append(_fu_carrera.FuenteDrive._nombre_temporal(_destino))
+
+    _hilos = [_th_carrera.Thread(target=_apuntar_su_temporal)
+              for _ in range(8)]
+    for _h in _hilos:
+        _h.start()
+    for _h in _hilos:
+        _h.join()
+
+    comprobar("cada descarga escribe en su propio temporal",
+              len(set(_nombres)) == len(_nombres) == 8,
+              f"{len(set(_nombres))} nombres distintos entre 8 hilos")
+
+    # La carrera de verdad: los dos han bajado el archivo y los dos lo
+    # quieren dejar en su sitio.
+    _fallos_dejar = []
+    for _quien in ("primero", "segundo"):
+        _temporal = os.path.join(_base_descargas, f"documento.pdf.{_quien}")
+        with open(_temporal, "wb") as _fh:
+            _fh.write(b"PDF de prueba " + _quien.encode())
+        try:
+            _fu_carrera.FuenteDrive._dejar_en_su_sitio(_temporal, _destino)
+        except Exception as _exc:
+            _fallos_dejar.append(f"{_quien}: {type(_exc).__name__}")
+
+    comprobar("los dos dejan el archivo en su sitio sin reventar",
+              not _fallos_dejar, _fallos_dejar or "ninguno fallo")
+    comprobar("y queda un archivo entero, sin restos a medias",
+              os.path.getsize(_destino) > 0
+              and not [a for a in os.listdir(_base_descargas)
+                       if a.endswith((".parcial", ".primero", ".segundo"))],
+              f"{os.path.getsize(_destino)} bytes y nada suelto al lado")
+
+    # El caso exacto que tumbo el estudio: el temporal ya no esta porque lo
+    # renombro otro, pero el archivo SI llego.
+    _perdido = os.path.join(_base_descargas, "documento.pdf.que-no-existe")
+    try:
+        _fu_carrera.FuenteDrive._dejar_en_su_sitio(_perdido, _destino)
+        _reviento = False
+    except Exception:
+        _reviento = True
+    comprobar("si otro ya lo dejo entero, llegar tarde no es un fallo",
+              not _reviento,
+              "el trabajo esta hecho; tirar el estudio seria absurdo")
+
+    # Pero perderlo de verdad SI es un fallo, y hay que enterarse.
+    _sin_nada = os.path.join(_base_descargas, "nunca_llego.pdf")
+    try:
+        _fu_carrera.FuenteDrive._dejar_en_su_sitio(_sin_nada + ".parcial",
+                                                   _sin_nada)
+        _aviso = False
+    except OSError:
+        _aviso = True
+    comprobar("pero si no lo dejo nadie, se entera quien llamo",
+              _aviso, "no se traga una descarga perdida")
+finally:
+    shutil.rmtree(_base_descargas, ignore_errors=True)
 
 if __name__ == "__main__":
     sys.exit(main())

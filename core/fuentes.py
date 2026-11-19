@@ -39,6 +39,8 @@ fecha de modificacion; en Drive sera el `md5Checksum` que da su API.
 
 import hashlib
 import os
+import threading
+import time
 
 from config import settings
 from core import corpus
@@ -55,6 +57,113 @@ RAIZ = "Raiz de la carpeta"
 # ==============================================================================
 # FUENTE DE DRIVE: la unica que hay
 # ==============================================================================
+
+#: Cuantas descargas lleva este proceso. Solo sirve para dar a cada una un
+#: nombre temporal propio; ver `FuenteDrive._nombre_temporal`.
+#: Archivo que declara que hay un estudio bajando documentos ahora mismo.
+#:
+#: POR QUE HACE FALTA UN CARTEL EN LA PUERTA
+#: -----------------------------------------
+#: La carpeta de descargas tiene un nombre fijo, `data/copiloto_drive`, y
+#: cualquier proceso de la maquina puede borrarla. Mientras un estudio la
+#: esta llenando, eso le cuesta el trabajo entero: los documentos siguen
+#: apareciendo en la lista, pero ya no estan en el disco cuando se van a
+#: leer, y el informe acaba diciendo "354 de 367 no llegaron a bajarse".
+#:
+#: Paso dos veces el 9 de noviembre de 2026, y las dos veces lo provoco una
+#: bateria de pruebas corriendo a la vez que el cron. La leccion no es "no
+#: correr las pruebas": es que la carpeta tiene que saber defenderse, porque
+#: manana sera otra cosa -- un script, una limpieza de disco, una persona.
+#:
+#: El cartel lleva el PID de quien estudia. Solo ese proceso puede retirar
+#: lo bajado; a cualquier otro se le dice que no y se explica por que.
+MARCA_ESTUDIO = "estudio_en_marcha.json"
+
+#: A partir de cuantas horas un cartel se considera olvidado. Si el proceso
+#: que estudiaba murio sin retirarlo, la carpeta quedaria blindada para
+#: siempre y nadie podria limpiarla nunca.
+HORAS_PARA_OLVIDAR_LA_MARCA = 12
+
+
+def _ruta_de_la_marca() -> str:
+    """
+    Donde vive el cartel de "hay un estudio en marcha".
+
+    Va en `data/`, FUERA de la carpeta de descargas: si viviera dentro, el
+    primer borrado se lo llevaria por delante y el cartel no protegeria de
+    lo unico de lo que tiene que proteger.
+
+    Returns:
+        Ruta absoluta del archivo.
+    """
+    return settings.ruta_proyecto("data", MARCA_ESTUDIO)
+
+
+def empezar_estudio() -> None:
+    """
+    Cuelga el cartel: este proceso esta bajando documentos.
+
+    No levanta si no puede escribirlo. Un estudio no se tira por no poder
+    poner un aviso; como mucho se queda sin proteccion, que es exactamente
+    como estaba antes.
+    """
+    import json as _json
+
+    try:
+        os.makedirs(os.path.dirname(_ruta_de_la_marca()), exist_ok=True)
+        with open(_ruta_de_la_marca(), "w", encoding="utf-8") as fh:
+            _json.dump({"pid": os.getpid(), "desde": time.time()}, fh)
+    except OSError:
+        pass
+
+
+def terminar_estudio() -> None:
+    """
+    Retira el cartel. Se llama SIEMPRE, tambien cuando el estudio se cae.
+    """
+    try:
+        os.remove(_ruta_de_la_marca())
+    except OSError:
+        pass
+
+
+def estudio_de_otro() -> str:
+    """
+    Dice si hay un estudio de OTRO proceso bajando documentos ahora mismo.
+
+    Returns:
+        El motivo por el que no se puede tocar la carpeta, o cadena vacia
+        si no hay ninguno. Un cartel de este mismo proceso devuelve vacio:
+        la limpieza del propio estudio es justo la que SI tiene que pasar.
+    """
+    import json as _json
+
+    try:
+        with open(_ruta_de_la_marca(), encoding="utf-8") as fh:
+            marca = _json.load(fh)
+    except (OSError, ValueError):
+        return ""
+
+    if marca.get("pid") == os.getpid():
+        return ""
+
+    horas = (time.time() - float(marca.get("desde") or 0)) / 3600.0
+    if horas > HORAS_PARA_OLVIDAR_LA_MARCA:
+        # El proceso que estudiaba ya no existe. Se retira el cartel y se
+        # deja pasar: blindar la carpeta para siempre seria peor.
+        terminar_estudio()
+        return ""
+
+    return (f"hay un estudio en marcha desde hace {horas * 60:.0f} minutos "
+            f"(proceso {marca.get('pid')}) que esta usando esta carpeta")
+
+
+_CUANTAS_DESCARGAS = 0
+
+#: Protege el contador de arriba. Son dos lineas de trabajo, pero sin el
+#: candado dos hilos pueden leer el mismo numero y volver a chocar.
+_CERROJO_TEMPORAL = threading.Lock()
+
 
 class FuenteDrive:
     """
@@ -175,19 +284,143 @@ class FuenteDrive:
     def carpeta_temporal(self) -> str:
         """
         Carpeta donde se materializan los archivos mientras se leen.
+        Usa data/copiloto_drive dentro de la carpeta persistente data/ del proyecto.
 
-        Vive en el area temporal del sistema, NO dentro del proyecto. Asi
-        queda claro que es de paso: ni se versiona, ni se respalda, ni se
-        confunde con documentacion propia.
+        CREARLA PUEDE FALLAR AUNQUE SE PIDA `exist_ok`
+        ----------------------------------------------
+        `exist_ok=True` no significa "no falles nunca": significa "no falles
+        si al terminar hay una carpeta ahi". Si otro hilo esta borrando esa
+        misma carpeta en ese instante -- la limpieza del final de un estudio
+        anterior, que con 3,2 GB tarda lo suyo --, el `mkdir` choca con la
+        carpeta a medio borrar, la comprobacion de despues ya no la ve, y
+        salta `[Errno 17] File exists`.
+
+        Paso de verdad, y no en un sitio inocente: tumbo una sincronizacion
+        entera en el primer segundo. El informe lo dijo bien -- "Fallo la
+        sincronizacion: File exists" --, pero el motivo real era una carrera
+        de tres milisegundos, no un problema de permisos ni de disco.
+
+        Se reintenta. Un choque asi se resuelve solo en cuanto el otro
+        termina; lo que no puede es costar un estudio de seis horas.
 
         Returns:
             Ruta absoluta, creada si no existe.
-        """
-        import tempfile
 
-        destino = os.path.join(tempfile.gettempdir(), "copiloto_drive")
+        Raises:
+            OSError: Si despues de reintentar sigue sin poder crearse. Ahi
+                ya no es una carrera: es que el disco no deja.
+        """
+        destino = settings.ruta_proyecto("data", "copiloto_drive")
+        for intento in range(INTENTOS_CARPETA):
+            try:
+                os.makedirs(destino, exist_ok=True)
+                return destino
+            except FileExistsError:
+                # La carpeta existe pero no se vio como carpeta: alguien la
+                # esta borrando. Si al mirar ya es una carpeta, sirve.
+                if os.path.isdir(destino):
+                    return destino
+            except OSError:
+                if intento == INTENTOS_CARPETA - 1:
+                    raise
+            time.sleep(ESPERA_CARPETA)
         os.makedirs(destino, exist_ok=True)
         return destino
+
+    @staticmethod
+    def _nombre_temporal(ruta: str) -> str:
+        """
+        Inventa un nombre temporal que no pueda chocar con otra descarga.
+
+        DOS DESCARGAS DEL MISMO ARCHIVO SE PISABAN
+        ------------------------------------------
+        El temporal se llamaba `<archivo>.parcial`, el mismo para todos. Dos
+        hilos bajando ese archivo a la vez escribian en el MISMO temporal;
+        el primero en terminar lo renombraba y el segundo se encontraba sin
+        temporal que renombrar. El estudio entero moria con esto:
+
+            Fallo la sincronizacion: [Errno 2] No such file or directory:
+            '.../Las mariposas dan alas a nuevas prendas.pdf.parcial'
+            -> '.../Las mariposas dan alas a nuevas prendas.pdf'
+
+        Un archivo de 400 KB que ya estaba bajado tumbo una pasada de 367
+        documentos. Con el proceso y el hilo en el nombre, cada descarga
+        escribe en el suyo y la que llegue segunda solo repite el trabajo.
+
+        Args:
+            ruta: Destino definitivo del archivo.
+
+        Returns:
+            Ruta del archivo temporal donde escribir mientras se baja.
+        """
+        # EL NUMERO DE HILO NO BASTA: SE REUTILIZA
+        # ----------------------------------------
+        # `threading.get_ident()` solo promete ser unico entre hilos VIVOS.
+        # Al morir uno, su numero se reparte otra vez, y se vio: ocho hilos
+        # seguidos dieron dos nombres distintos. Por eso va tambien un
+        # contador, que no se repite mientras el proceso viva.
+        with _CERROJO_TEMPORAL:
+            global _CUANTAS_DESCARGAS
+            _CUANTAS_DESCARGAS += 1
+            turno = _CUANTAS_DESCARGAS
+        return (f"{ruta}.{os.getpid()}-{threading.get_ident()}-{turno}"
+                f".parcial")
+
+    @staticmethod
+    def _dejar_en_su_sitio(temporal: str, ruta: str) -> None:
+        """
+        Pone el temporal en su nombre definitivo, perdiendo bien las carreras.
+
+        Args:
+            temporal: Archivo recien bajado.
+            ruta: Nombre definitivo.
+
+        Raises:
+            OSError: Si no se pudo dejar el archivo y tampoco lo dejo nadie.
+        """
+        try:
+            os.replace(temporal, ruta)
+        except OSError:
+            # Que el temporal ya no este solo importa si el archivo tampoco
+            # llego: si otro lo dejo entero en su sitio, el trabajo esta
+            # hecho y reventar aqui seria tirar un estudio por haber bajado
+            # dos veces lo mismo.
+            if not (os.path.exists(ruta) and os.path.getsize(ruta) > 0):
+                raise
+            try:
+                os.remove(temporal)
+            except OSError:
+                pass
+
+    def asegurar_descargado(self, doc: dict) -> str:
+        """
+        Descarga el documento a disco si aun no existe en la carpeta local.
+
+        Returns:
+            Ruta absoluta del archivo descargado, o vacia si fallo.
+        """
+        ruta = doc.get("ruta")
+        if ruta and os.path.exists(ruta) and os.path.getsize(ruta) > 0:
+            return ruta
+        archivo_id = doc.get("id")
+        if not archivo_id or not ruta:
+            try:
+                servicio = self._servicio()
+                for arch, _ in self._recorrer(servicio, self.carpeta_id, ""):
+                    if arch.get("name") == doc.get("nombre") or doc.get("nombre", "").startswith(arch.get("name", "")):
+                        archivo_id = arch.get("id")
+                        break
+            except Exception:
+                pass
+        if not archivo_id or not ruta:
+            return ""
+        try:
+            servicio = self._servicio()
+            os.makedirs(os.path.dirname(ruta), exist_ok=True)
+            self._descargar(servicio, archivo_id, ruta, doc.get("exportar_como", ""))
+            return ruta if os.path.exists(ruta) else ""
+        except Exception:
+            return ""
 
     def limpiar(self) -> dict:
         """
@@ -202,6 +435,15 @@ class FuenteDrive:
             Diccionario con `archivos` y `megas` liberados.
         """
         import shutil
+
+        # NO SE BORRA LO QUE OTRO ESTA USANDO
+        # -----------------------------------
+        # Si hay un estudio de otro proceso llenando esta carpeta, llevarsela
+        # por delante le cuesta el trabajo entero. Se dice que no y se explica
+        # quien la esta usando; quien llamo decide.
+        _ocupada = estudio_de_otro()
+        if _ocupada:
+            return {"archivos": 0, "megas": 0.0, "rechazado": _ocupada}
 
         carpeta = self.carpeta_temporal()
         archivos, bytes_totales = 0, 0
@@ -352,6 +594,18 @@ class FuenteDrive:
         Returns:
             Lista de diccionarios con `nombre`, `categoria`, `ruta` y `huella`.
         """
+        # SOLO SE GUARDA EL RECUENTO, NUNCA UNA DESCARGA
+        # ----------------------------------------------
+        # Con `descargar=True` hay que mirar de verdad: ahi se decide que
+        # se baja y que no, y contestar con lo de hace medio minuto podria
+        # saltarse un archivo recien subido. Contar, en cambio, es una foto
+        # que aguanta perfectamente ese medio minuto.
+        if not descargar:
+            guardado = _inventario_guardado(_identidad_de_la_fuente())
+            if guardado is not None:
+                self.descartados = [dict(d) for d in guardado["descartados"]]
+                return [dict(d) for d in guardado["valor"]]
+
         servicio = self._servicio()
         destino = self.carpeta_temporal()
         os.makedirs(destino, exist_ok=True)
@@ -446,7 +700,13 @@ class FuenteDrive:
             os.makedirs(carpeta_cat, exist_ok=True)
             ruta = os.path.join(carpeta_cat, nombre)
 
-            huella = archivo.get("md5Checksum") or archivo.get("modifiedTime", "")
+            # La huella lleva pegada la version con que se sabe leer ese
+            # formato. Sin eso, mejorar un lector no sirve de nada para los
+            # archivos que ya estaban: su md5 no cambia, asi que nadie los
+            # vuelve a mirar y el indice conserva la lectura vieja.
+            huella = ((archivo.get("md5Checksum")
+                       or archivo.get("modifiedTime", ""))
+                      + corpus.sufijo_de_lectura(nombre))
             # `descargar=False` sirve para MIRAR que hay sin traerselo.
             #
             # Se midio el motivo: el endpoint que pinta el estado de la fuente
@@ -454,17 +714,155 @@ class FuenteDrive:
             # carpeta ENTERA cada vez que alguien abria la aplicacion. Tardaba
             # 77 segundos y la pantalla se quedaba en blanco mientras tanto.
             # Contar archivos no deberia costar una descarga.
+            no_se_pudo = ""
             if descargar and not self._ya_esta(ruta, huella):
-                self._descargar(servicio, archivo["id"], ruta,
-                                exportar_como)
+                # UN ARCHIVO QUE NO BAJA NO PUEDE COSTAR EL ESTUDIO ENTERO
+                # --------------------------------------------------------
+                # Esta llamada iba a pelo. Cualquier tropiezo en UNA sola
+                # descarga -- la red que se corta, Drive que responde 500,
+                # el temporal que desaparece porque otro borro la carpeta --
+                # subia hasta arriba y tiraba la pasada completa, incluidos
+                # los trescientos documentos que ya estaban bajados y los
+                # que ya se habian indexado.
+                #
+                # Se vio asi, el 9 de noviembre de 2026, y lo unico que la
+                # pantalla llego a decir fue:
+                #
+                #   [Errno 2] No such file or directory:
+                #   '.../8. Aldana-2010-Oil-palm-pest-manual.pdf.1-...-496.parcial'
+                #   -> '.../8. Aldana-2010-Oil-palm-pest-manual.pdf'
+                #
+                # Tres horas de trabajo perdidas por un archivo de los 367.
+                #
+                # Ahora se apunta cual fallo y por que, y se sigue. El
+                # documento NO desaparece: entra en la lista con su motivo,
+                # el indexador lo cuenta entre los que no llegaron a bajarse
+                # y el informe final lo dice. Un estudio incompleto que se
+                # explica vale mucho mas que ningun estudio.
+                try:
+                    self._descargar(servicio, archivo["id"], ruta,
+                                    exportar_como)
+                except Exception as exc:
+                    # SI LA CARPETA DESAPARECIO, SE REHACE Y SE REINTENTA
+                    # ---------------------------------------------------
+                    # El caso que de verdad ocurre no es "este archivo no se
+                    # deja bajar": es que algo borro la carpeta entera por
+                    # debajo y a partir de ahi fallan TODOS. Apuntar
+                    # trescientos fallos uno a uno seria exacto e inutil.
+                    # Se rehace la carpeta y se le da una segunda
+                    # oportunidad al archivo; con eso el estudio se levanta
+                    # solo en vez de volver con las manos vacias.
+                    try:
+                        os.makedirs(os.path.dirname(ruta), exist_ok=True)
+                        self._descargar(servicio, archivo["id"], ruta,
+                                        exportar_como)
+                    except Exception as otra:
+                        no_se_pudo = f"{type(otra).__name__}: {str(otra)[:160]}"
 
             salida.append({
+                "no_se_pudo_bajar": no_se_pudo,
+                "id": archivo.get("id"),
                 "nombre": nombre,
                 "categoria": categoria or RAIZ,
                 "ruta": ruta,
                 "huella": huella,
+                "mimeType": archivo.get("mimeType", ""),
+                "exportar_como": exportar_como,
             })
+
+        if not descargar:
+            _guardar_inventario(_identidad_de_la_fuente(), salida,
+                                self.descartados)
         return salida
+
+    def inventario(self) -> dict:
+        """
+        Recorre la carpeta entera y devuelve TODO lo que hay, con su ruta.
+
+        EN QUE SE DIFERENCIA DE `documentos()`
+        --------------------------------------
+        `documentos()` devuelve lo que va a ENTRAR al indice: filtra por
+        formato, por tamano y por coste. Eso es lo correcto para indexar y
+        es justo lo que estorba cuando alguien pregunta "que hay en el
+        Drive". La respuesta a esa pregunta no puede ser una lista
+        filtrada: tiene que ser la carpeta tal como es, con sus 46
+        subcarpetas y sus 425 archivos, incluidos los que no se pueden
+        leer y los que no caben.
+
+        Ademas guarda la RUTA completa de cada archivo, no solo la
+        subcarpeta de primer nivel que usa el catalogo como categoria. Sin
+        la ruta, dos archivos llamados igual en carpetas distintas son
+        indistinguibles, y "esta en Normatividad" no se puede decir.
+
+        No descarga nada: solo pregunta a Drive que hay.
+
+        Returns:
+            Diccionario con `carpetas` (lista de rutas) y `archivos` (lista
+            de diccionarios con `ruta`, `nombre`, `carpeta`, `mb` y
+            `extension`). Con `error` si no se pudo consultar.
+        """
+        guardado = _arbol_guardado(_identidad_de_la_fuente())
+        if guardado is not None:
+            return guardado
+
+        try:
+            servicio = self._servicio()
+        except Exception as exc:
+            return {"error": str(exc)[:200], "carpetas": [], "archivos": []}
+
+        carpetas, archivos = [], []
+
+        def bajar(carpeta_id, ruta):
+            """
+            Recorre una carpeta y todo lo que cuelga de ella.
+
+            Args:
+                carpeta_id: Identificador de la carpeta en Drive.
+                ruta: Camino acumulado hasta ella.
+            """
+            pagina = None
+            while True:
+                respuesta = servicio.files().list(
+                    q=f"'{carpeta_id}' in parents and trashed = false",
+                    fields=("nextPageToken, files(id,name,mimeType,size,"
+                            "modifiedTime)"),
+                    pageSize=500, pageToken=pagina,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                ).execute()
+
+                for archivo in respuesta.get("files", []):
+                    nombre = archivo["name"]
+                    dentro = f"{ruta}/{nombre}"
+                    if archivo["mimeType"] == CARPETA_DRIVE:
+                        carpetas.append(dentro)
+                        bajar(archivo["id"], dentro)
+                        continue
+                    bytes_ = int(archivo.get("size") or 0)
+                    archivos.append({
+                        "ruta": dentro,
+                        "nombre": nombre,
+                        "carpeta": ruta or "/",
+                        "mb": round(bytes_ / (1024 * 1024), 2),
+                        "extension": os.path.splitext(nombre)[1].lower(),
+                        "modificado": (archivo.get("modifiedTime") or "")[:10],
+                    })
+
+                pagina = respuesta.get("nextPageToken")
+                if not pagina:
+                    break
+
+        try:
+            bajar(self.carpeta_id, "")
+        except Exception as exc:
+            return {"error": str(exc)[:200], "carpetas": carpetas,
+                    "archivos": archivos}
+
+        arbol = {"carpetas": sorted(carpetas),
+                 "archivos": sorted(archivos, key=lambda a: a["ruta"]),
+                 "error": ""}
+        _guardar_arbol(_identidad_de_la_fuente(), arbol)
+        return arbol
 
     def _recorrer(self, servicio, carpeta_id: str, categoria: str):
         """
@@ -826,7 +1224,7 @@ class FuenteDrive:
         # decidir sobre archivos grandes.
         peticion = servicio.files().get_media(
             fileId=archivo_id, supportsAllDrives=True)
-        temporal = ruta + ".parcial"
+        temporal = FuenteDrive._nombre_temporal(ruta)
         try:
             with open(temporal, "wb") as f:
                 # El primer trozo y se corta: `next_chunk` pide justamente ese
@@ -834,7 +1232,7 @@ class FuenteDrive:
                 bajada = MediaIoBaseDownload(f, peticion,
                                              chunksize=cuantos_bytes)
                 bajada.next_chunk()
-            os.replace(temporal, ruta)
+            FuenteDrive._dejar_en_su_sitio(temporal, ruta)
             return True
         except Exception:
             if os.path.exists(temporal):
@@ -868,13 +1266,21 @@ class FuenteDrive:
                 fileId=archivo_id, supportsAllDrives=True)
         # Se escribe en un temporal y se renombra al final: si la descarga se
         # corta, no queda un archivo a medias que parezca bueno.
-        temporal = ruta + ".parcial"
-        with open(temporal, "wb") as f:
-            bajada = MediaIoBaseDownload(f, peticion)
-            terminado = False
-            while not terminado:
-                _, terminado = bajada.next_chunk()
-        os.replace(temporal, ruta)
+        temporal = FuenteDrive._nombre_temporal(ruta)
+        try:
+            with open(temporal, "wb") as f:
+                bajada = MediaIoBaseDownload(f, peticion)
+                terminado = False
+                while not terminado:
+                    _, terminado = bajada.next_chunk()
+        except Exception:
+            if os.path.exists(temporal):
+                try:
+                    os.remove(temporal)
+                except OSError:
+                    pass
+            raise
+        FuenteDrive._dejar_en_su_sitio(temporal, ruta)
 
 
 # ==============================================================================
@@ -962,6 +1368,138 @@ def _identidad_de_la_fuente() -> tuple:
 #: y evita cientos de consultas durante una conversacion.
 SEGUNDOS_DE_CACHE = 30
 
+#: Cuantas veces se reintenta crear la carpeta de descargas.
+#:
+#: Tres bastan: la carrera que la rompe dura lo que tarda un `rmtree` en
+#: soltar el inodo, milisegundos. Si a la tercera sigue fallando, no es una
+#: carrera y hay que verlo.
+INTENTOS_CARPETA = 3
+
+#: Segundos entre un intento y el siguiente.
+ESPERA_CARPETA = 0.5
+
+#: Como llama Drive a una carpeta.
+CARPETA_DRIVE = "application/vnd.google-apps.folder"
+
+#: Cuanto vale un inventario de la fuente antes de volver a pedirlo.
+#:
+#: POR QUE HACE FALTA, MEDIDO
+#: --------------------------
+#: Contar lo que hay en Drive no descarga nada, pero son varias llamadas
+#: paginadas a Google: con 161 archivos tarda unos diez segundos. El
+#: problema era QUIEN lo pedia y CUANTAS veces.
+#:
+#: `estado()` ya lo guardaba treinta segundos, pero el panel de la fuente
+#: llamaba a `documentos(descargar=False)` por su cuenta, saltandose esa
+#: caja. Resultado: cada vez que Streamlit redibujaba la pagina -- y
+#: redibuja entera ante cualquier clic, incluido el que dispara pegar una
+#: imagen -- se listaba Drive otra vez. Se midio desde el contenedor de la
+#: interfaz: 10,3 s en `/corpus/estado` y 9,5 s mas en `/corpus/fuente`,
+#: veinte segundos de pagina congelada por pegar una captura.
+#:
+#: El inventario solo cambia cuando cambia Drive. Medio minuto de retraso
+#: en un panel no le hace dano a nadie; veinte segundos de espera, si. Y
+#: cuando SI cambia -- al sincronizar o al cambiar de fuente --,
+#: `olvidar_estado()` lo tira.
+#:
+#: DE 45 SEGUNDOS A UN CUARTO DE HORA
+#: ----------------------------------
+#: Cuarenta y cinco segundos bastaban para una pagina que se redibuja sola,
+#: pero no para una CONVERSACION: entre dos preguntas pasan minutos, asi que
+#: la caja estaba siempre vencida y cada turno del chat volvia a recorrer
+#: Drive entero. Medido en el contenedor: 10,91 s de los 11,4 s que costaba
+#: `fuentes.estado()`, pagados DENTRO de la espera de quien pregunta. De los
+#: 25 segundos que tardaba en contestar una pregunta con imagen, once eran
+#: esto.
+#:
+#: El tope no es el mecanismo, es la red de seguridad: lo que de verdad
+#: invalida el inventario es `olvidar_estado()`, que se llama al sincronizar
+#: y al cambiar de fuente. Y si alguien sube algo a Drive y no quiere
+#: esperar, el panel de la fuente tiene su boton de "Volver a probar", que
+#: refresca a la fuerza.
+SEGUNDOS_DE_INVENTARIO = 900
+
+#: Lo ultimo que se vio en la fuente, con cuando se vio y de quien era.
+_ULTIMO_INVENTARIO = {"cuando": 0.0, "quien": None, "valor": None,
+                      "descartados": None}
+
+#: Lo mismo para el recorrido completo con rutas, que cuesta igual de caro.
+_ULTIMO_ARBOL = {"cuando": 0.0, "quien": None, "valor": None}
+
+
+def _inventario_guardado(quien: tuple):
+    """
+    Devuelve el inventario guardado si todavia vale.
+
+    Args:
+        quien: Identidad de la fuente, para no servir el inventario de una
+            carpeta de Drive cuando se ha cambiado a otra.
+
+    Returns:
+        Diccionario con `valor` y `descartados`, o None si no sirve.
+    """
+    import time as _time
+
+    if _ULTIMO_INVENTARIO["valor"] is None:
+        return None
+    if _ULTIMO_INVENTARIO["quien"] != quien:
+        return None
+    if _time.time() - _ULTIMO_INVENTARIO["cuando"] >= SEGUNDOS_DE_INVENTARIO:
+        return None
+    return _ULTIMO_INVENTARIO
+
+
+def _guardar_inventario(quien: tuple, documentos: list,
+                        descartados: list) -> None:
+    """
+    Guarda el inventario recien hecho.
+
+    Args:
+        quien: Identidad de la fuente.
+        documentos: Lo que se vio.
+        descartados: Lo que se vio y no entra, con su motivo.
+    """
+    import time as _time
+
+    _ULTIMO_INVENTARIO["cuando"] = _time.time()
+    _ULTIMO_INVENTARIO["quien"] = quien
+    _ULTIMO_INVENTARIO["valor"] = [dict(d) for d in documentos]
+    _ULTIMO_INVENTARIO["descartados"] = [dict(d) for d in (descartados or [])]
+
+
+def _arbol_guardado(quien: tuple):
+    """
+    Devuelve el recorrido completo guardado, si todavia vale.
+
+    Args:
+        quien: Identidad de la fuente.
+
+    Returns:
+        El arbol, o None si hay que volver a pedirlo.
+    """
+    import time as _time
+
+    if _ULTIMO_ARBOL["valor"] is None or _ULTIMO_ARBOL["quien"] != quien:
+        return None
+    if _time.time() - _ULTIMO_ARBOL["cuando"] >= SEGUNDOS_DE_INVENTARIO:
+        return None
+    return _ULTIMO_ARBOL["valor"]
+
+
+def _guardar_arbol(quien: tuple, arbol: dict) -> None:
+    """
+    Guarda el recorrido completo recien hecho.
+
+    Args:
+        quien: Identidad de la fuente.
+        arbol: Lo que devolvio el recorrido.
+    """
+    import time as _time
+
+    _ULTIMO_ARBOL["cuando"] = _time.time()
+    _ULTIMO_ARBOL["quien"] = quien
+    _ULTIMO_ARBOL["valor"] = arbol
+
 
 def olvidar_estado() -> None:
     """
@@ -973,6 +1511,13 @@ def olvidar_estado() -> None:
     _ULTIMO_ESTADO["cuando"] = 0.0
     _ULTIMO_ESTADO["valor"] = None
     _ULTIMO_ESTADO["quien"] = None
+    _ULTIMO_INVENTARIO["cuando"] = 0.0
+    _ULTIMO_INVENTARIO["valor"] = None
+    _ULTIMO_INVENTARIO["quien"] = None
+    _ULTIMO_INVENTARIO["descartados"] = None
+    _ULTIMO_ARBOL["cuando"] = 0.0
+    _ULTIMO_ARBOL["valor"] = None
+    _ULTIMO_ARBOL["quien"] = None
 
 
 def estado(refrescar: bool = False) -> dict:

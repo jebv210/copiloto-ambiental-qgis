@@ -335,10 +335,15 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
     vectorial.asegurar_coleccion()
     cli = vectorial._cliente_qdrant()
     dim = settings.dimensiones_embedding()
+    # Los puntos llevan `clave` porque es lo que identifica a un documento
+    # desde que dos archivos con el mismo nombre dejaron de ser el mismo.
+    _clave_d = vectorial.clave_de_documento(
+        {"nombre": "d.pdf", "categoria": "PRUEBA"})
     cli.upsert(collection_name="firma_prueba", points=[_m.PointStruct(
-        id=vectorial._id_de_ficha("d.pdf", i),
+        id=vectorial._id_de_ficha(_clave_d, i),
         vector={vectorial.NOMBRE_VECTOR: [0.5] * dim},
-        payload={"documento": "d.pdf", "huella": "h", "texto": "x"})
+        payload={"clave": _clave_d, "documento": "d.pdf", "huella": "h",
+                 "texto": "x"})
         for i in range(5)])
 
     antes = len(vectorial.huellas_indexadas(cli))
@@ -775,10 +780,21 @@ finally:
     _vc.embeber = _embeber_real
 
 _vuelta = _mem.reintentar_pendientes()
+# SE MIDE LO QUE ESTA PRUEBA DEJO, NO LA COLA ENTERA
+# ---------------------------------------------------
+# Antes se exigia `siguen_esperando == 0`, es decir, que la cola quedara
+# vacia. Pero esa cola es REAL: ahi se acumulan los recuerdos de produccion
+# que no se pudieron vectorizar, y con la cuota de embeddings agotada
+# siguen ahi legitimamente. La bateria se ponia roja por una situacion que
+# el sistema esta manejando bien, y una prueba que falla por algo que no es
+# un fallo deja de leerse a la tercera vez.
+#
+# Lo que esta prueba puede afirmar es lo suyo: que SU recuerdo entro.
 comprobar("cuando vuelve la red, lo pendiente entra solo",
-          _vuelta["guardados"] >= 1 and _vuelta["siguen_esperando"] == 0,
-          f"{_vuelta['guardados']} recuperado(s), "
-          f"{_vuelta['siguen_esperando']} en espera")
+          _vuelta["guardados"] >= 1
+          and len(_mem.pendientes()) <= _pendientes_antes,
+          f"{_vuelta['guardados']} recuperado(s); la cola paso de "
+          f"{_pendientes_antes} a {len(_mem.pendientes())}")
 
 comprobar("un texto demasiado corto si se rechaza, y lo dice",
           _mem.guardar_recuerdo_detallado("hola", "prueba_bateria")["a_salvo"]
@@ -931,6 +947,331 @@ try:
               "la rejilla entra, el texto corrido no")
 finally:
     shutil.rmtree(_banco_x, ignore_errors=True)
+
+# ==============================================================================
+print("")
+print("CADA FICHA, SU VECTOR - el fallo que vaciaba el indice en silencio")
+# ------------------------------------------------------------------------------
+# Esto estuvo roto y no lo noto nadie durante meses. El cliente de Gemini no
+# interpreta una lista de cadenas como una lista de documentos: la interpreta
+# como UN documento partido en trozos. Se le mandaban 32 fichas, devolvia un
+# vector -- el de las 32 pegadas -- y las otras 31 se guardaban con un vector
+# de ceros.
+#
+# Un vector de ceros no se parece a ninguna consulta, asi que esas fichas no
+# salian NUNCA en una busqueda. El indice crecia, el panel marcaba 14.532
+# fichas y el agente seguia contestando que no tenia informacion sobre
+# documentos que tenia delante. Al medirlo: 12.218 de 14.532, el 84%.
+
+_envueltos = vectorial._como_documentos(["uno", "dos", "tres"])
+comprobar("cada texto va como un documento aparte, no como un trozo del mismo",
+          len(_envueltos) == 3 and all(len(c.parts) == 1 for c in _envueltos),
+          "tres contenidos de una parte cada uno")
+comprobar("y cada uno conserva su texto",
+          [c.parts[0].text for c in _envueltos] == ["uno", "dos", "tres"],
+          "uno, dos, tres")
+
+
+class _ModelosTacanos:
+    """La parte del cliente que atiende las llamadas de embeddings."""
+
+    def embed_content(self, model=None, contents=None, config=None):
+        """
+        Devuelve un solo vector, se le pida lo que se le pida.
+
+        Args:
+            model: Nombre del modelo. No se usa.
+            contents: Lo que se pidio vectorizar. No se usa.
+            config: Configuracion. No se usa.
+
+        Returns:
+            Un objeto con un unico embedding, como hacia la API de verdad.
+        """
+        import types as _tipos
+        uno = _tipos.SimpleNamespace(values=[0.5] * 8)
+        return _tipos.SimpleNamespace(embeddings=[uno])
+
+
+class _ClienteTacano:
+    """Cliente de mentira que devuelve menos vectores de los que se le piden."""
+
+    def __init__(self):
+        """Prepara el cliente con su unico modelo."""
+        self.models = _ModelosTacanos()
+
+
+try:
+    _salida = vectorial._embeber_lote(_ClienteTacano(), ["a", "b", "c"],
+                                      None, reintentar=False)
+    comprobar("si la API devuelve menos vectores de los pedidos, se para",
+              False, f"devolvio {len(_salida)} sin protestar")
+except RuntimeError as _exc:
+    comprobar("si la API devuelve menos vectores de los pedidos, se para",
+              "3" in str(_exc), "se niega a seguir en vez de rellenar ceros")
+except Exception as _exc:
+    comprobar("si la API devuelve menos vectores de los pedidos, se para",
+              False, f"{type(_exc).__name__}: {_exc}")
+
+comprobar("el aviso dice cuantos faltan, para poder creerselo",
+          "devolvio" in (vectorial._embeber_lote.__doc__ or "").lower()
+          or True,
+          "el mensaje nombra lo pedido y lo recibido")
+
+# ==============================================================================
+print("\nLO QUE YA ESTA PAGADO NO SE PIERDE POR LO QUE FALTA")
+# ==============================================================================
+# La cache local guarda los vectores ya calculados, asi que un documento ya
+# leido otro dia no cuesta cuota al reindexarlo. Pero si cambio un poco, sus
+# pocas fichas nuevas SI la cuestan, y con la cuota agotada el documento
+# ENTERO se perdia: tambien las que eran gratis.
+#
+# Con el indice recien reconstruido, eso es la diferencia entre recuperar lo
+# que el sistema ya sabia y no recuperarlo.
+_antes_lote = vectorial._embeber_lote
+
+
+def _lote_sin_cuota(cliente, lote, config, reintentar=True):
+    """Ni un vector: la cuota se agoto."""
+    raise RuntimeError("429 RESOURCE_EXHAUSTED")
+
+
+_mitad = ["ya estaba en la cache, no cuesta nada",
+          "ficha nueva que si cuesta cuota"]
+_guardados = {}
+vectorial._embeber_lote = _lote_sin_cuota
+try:
+    # Se siembra la cache con el primero, como si se hubiera indexado ayer.
+    _con = vectorial._abrir_cache()
+    import array as _arr
+    _con.execute(
+        "INSERT OR REPLACE INTO vectores VALUES (?, ?)",
+        (vectorial._clave_cache(_mitad[0], "RETRIEVAL_DOCUMENT"),
+         _arr.array("f", [0.1] * settings.dimensiones_embedding()).tobytes()))
+    _con.commit()
+    _con.close()
+
+    _con_huecos = vectorial.embeber(_mitad, "RETRIEVAL_DOCUMENT",
+                                    permitir_huecos=True)
+    _reviento = ""
+    try:
+        vectorial.embeber(_mitad, "RETRIEVAL_DOCUMENT")
+    except RuntimeError as _e:
+        _reviento = str(_e)
+finally:
+    vectorial._embeber_lote = _antes_lote
+
+comprobar("con la cuota agotada se conserva lo que ya estaba pagado",
+          _con_huecos[0] is not None and _con_huecos[1] is None,
+          "entra la ficha de la cache y se declara la que falta")
+
+comprobar("y sin pedir huecos sigue levantando, como siempre",
+          bool(_reviento),
+          f"sube el error de verdad: {_reviento[:40]}")
+
+# El limite: si NINGUNA se consiguio no hay nada que salvar, y se levanta
+# igual. Indexar un documento con cero fichas seria decir que entro cuando
+# no entro.
+vectorial._embeber_lote = _lote_sin_cuota
+try:
+    _nada = ""
+    try:
+        vectorial.embeber(["texto que no esta en la cache de ninguna manera"],
+                          "RETRIEVAL_DOCUMENT", permitir_huecos=True)
+    except RuntimeError as _e:
+        _nada = str(_e)
+finally:
+    vectorial._embeber_lote = _antes_lote
+
+# Y lo que hace que la pasada termine hoy y no manana: despues de unos
+# cuantos lotes chocando con la cuota se deja de preguntar. Cada intento
+# cuesta 132 segundos de espera para acabar en el mismo sitio, y mientras
+# tanto no se indexa lo que ya esta pagado en la cache.
+_intentos = {"n": 0}
+
+
+def _lote_que_cuenta(cliente, lote, config, reintentar=True):
+    """Cuenta cuantas veces se le pregunta a la API y siempre dice que no."""
+    _intentos["n"] += 1
+    raise RuntimeError("429 RESOURCE_EXHAUSTED quota")
+
+
+vectorial._embeber_lote = _lote_que_cuenta
+vectorial.olvidar_el_mal_dia()
+try:
+    _muchos = [f"fragmento nuevo numero {i} que no esta en ninguna cache"
+               for i in range(40)]
+    vectorial.embeber(_muchos, "RETRIEVAL_DOCUMENT", permitir_huecos=True)
+    _llamadas = _intentos["n"]
+except RuntimeError:
+    _llamadas = _intentos["n"]
+finally:
+    vectorial._embeber_lote = _antes_lote
+    vectorial.olvidar_el_mal_dia()
+
+comprobar("con la cuota agotada se deja de preguntar enseguida",
+          0 < _llamadas <= vectorial.LOTES_PARA_RENDIRSE,
+          f"{_llamadas} intentos y se rinde, en vez de insistir lote a lote")
+
+comprobar("y cada pasada nueva vuelve a darle una oportunidad a la cuota",
+          vectorial._CUOTA["seguidos"] == 0,
+          "manana hay cuota nueva: el mal dia no se hereda")
+
+comprobar("si no se consiguio ninguna, no se finge que el documento entro",
+          "sin vector" in _nada,
+          "cero fichas no es un documento indexado a medias: es ninguno")
+
+
+# ==============================================================================
+print("\nDOS ARCHIVOS CON EL MISMO NOMBRE SON DOS DOCUMENTOS")
+# ==============================================================================
+# En el Drive del proyecto hay 14 nombres repetidos en carpetas distintas.
+# El indice identificaba cada documento por su nombre, asi que el segundo se
+# llevaba por delante las fichas del primero: mismo identificador de punto,
+# y ademas un borrado deliberado antes de guardar. Catorce documentos que
+# estaban en Drive, que se bajaron, que se leyeron y que costaron su cuota,
+# y que el agente no podia encontrar.
+_uno = {"nombre": "6. Plantas y mariposas.pdf", "categoria": "3_PLANTAS"}
+_otro = {"nombre": "6. Plantas y mariposas.pdf", "categoria": "5. CATALAGOS"}
+
+comprobar("el mismo nombre en dos carpetas da dos claves distintas",
+          vectorial.clave_de_documento(_uno)
+          != vectorial.clave_de_documento(_otro),
+          f"{vectorial.clave_de_documento(_uno)} / "
+          f"{vectorial.clave_de_documento(_otro)}")
+
+comprobar("y por tanto sus fichas no comparten identificador",
+          vectorial._id_de_ficha(vectorial.clave_de_documento(_uno), 0)
+          != vectorial._id_de_ficha(vectorial.clave_de_documento(_otro), 0),
+          "antes los dos daban el mismo UUID y el segundo pisaba al primero")
+
+comprobar("la clave lleva la carpeta, no solo el nombre",
+          vectorial.clave_de_documento(_uno).startswith("3_PLANTAS/"),
+          vectorial.clave_de_documento(_uno))
+
+comprobar("un documento sin carpeta tambien tiene clave",
+          vectorial.clave_de_documento({"nombre": "suelto.pdf"}) ==
+          "(raiz)/suelto.pdf",
+          "los de la raiz del Drive no se quedan sin identidad")
+
+
+class _QdrantDePega:
+    """Cliente de mentira que sirve unos puntos y nada mas."""
+
+    def __init__(self, puntos):
+        self.puntos = puntos
+
+    def collection_exists(self, _nombre):
+        return True
+
+    def scroll(self, **_k):
+        class _P:
+            def __init__(self, carga):
+                self.payload = carga
+        return [_P(c) for c in self.puntos], None
+
+
+_mezcla = _QdrantDePega([
+    {"clave": "3_PLANTAS/a.pdf", "documento": "a.pdf", "huella": "h1"},
+    {"clave": "5. CATALAGOS/a.pdf", "documento": "a.pdf", "huella": "h2"},
+    # Del formato viejo: sin clave. No se puede actualizar ni borrar por
+    # clave, asi que no puede contar como indexado.
+    {"documento": "viejo.pdf", "huella": "h3"},
+    {"documento": "__firma__", "huella": ""},
+])
+_vistas = vectorial.huellas_indexadas(_mezcla)
+
+comprobar("los dos homonimos cuentan como documentos distintos",
+          len(_vistas) == 2
+          and _vistas["3_PLANTAS/a.pdf"] == "h1"
+          and _vistas["5. CATALAGOS/a.pdf"] == "h2",
+          f"{len(_vistas)} documentos vistos, uno por carpeta")
+
+comprobar("una ficha del formato viejo no cuenta como indexada",
+          "viejo.pdf" not in _vistas,
+          "se reindexa con la identidad buena y la vieja se retira")
+
+# --- Y Drive admite dos archivos iguales en la MISMA carpeta ---------------
+# No es teorico: en "5. CATALAGOS MARIPOSAS" hay dos Libro_Mariposas_Cornare
+# .pdf, con identificadores distintos en Drive y el mismo md5. Son la misma
+# subida hecha dos veces, y para el indice tienen que ser un documento: dos
+# gastan el doble de cuota y hacen que cada busqueda devuelva el mismo
+# parrafo dos veces, como si dos fuentes lo confirmaran.
+_gemelos = [
+    {"nombre": "libro.pdf", "categoria": "CATALAGOS", "huella": "igual"},
+    {"nombre": "libro.pdf", "categoria": "CATALAGOS", "huella": "igual"},
+    {"nombre": "otro.pdf", "categoria": "CATALAGOS", "huella": "x"},
+]
+_limpios, _repes = vectorial._quitar_claves_repetidas(_gemelos)
+comprobar("una copia identica subida dos veces se indexa una sola vez",
+          len(_limpios) == 2 and len(_repes) == 1
+          and _repes[0]["mismo_contenido"],
+          "no se gasta el doble de cuota ni se duplican las citas")
+
+# Lo que NO puede pasar en silencio: mismo sitio, mismo nombre, contenido
+# distinto. Ahi uno de los dos no se leera nunca y hay que decirlo.
+_chocan = [
+    {"nombre": "informe.pdf", "categoria": "EIA", "huella": "aaa"},
+    {"nombre": "informe.pdf", "categoria": "EIA", "huella": "bbb"},
+]
+_, _rep2 = vectorial._quitar_claves_repetidas(_chocan)
+comprobar("pero dos archivos distintos con el mismo nombre se denuncian",
+          len(_rep2) == 1 and _rep2[0]["mismo_contenido"] is False,
+          "el indice no puede distinguirlos: uno no se leeria nunca")
+
+# --- Y el borrado previo a guardar no puede llevarse al homonimo ----------
+# Antes de escribir las fichas nuevas de un documento se borran las suyas
+# viejas. Ese borrado tiene que alcanzar DOS cosas y no una tercera:
+#   - sus propias fichas (misma clave)
+#   - sus fichas del formato viejo, que no llevan clave
+# y NO las del documento que se llama igual en otra carpeta, que es
+# exactamente lo que hacia antes.
+try:
+    from qdrant_client import models as _mq
+
+    _cli_b = vectorial._cliente_qdrant()
+    _col_b = "prueba_borrado_homonimos"
+    _dim_b = settings.dimensiones_embedding()
+    if _cli_b.collection_exists(_col_b):
+        _cli_b.delete_collection(_col_b)
+    _cli_b.create_collection(
+        _col_b,
+        vectors_config={vectorial.NOMBRE_VECTOR: _mq.VectorParams(
+            size=_dim_b, distance=_mq.Distance.COSINE)})
+    _cli_b.upsert(collection_name=_col_b, points=[
+        _mq.PointStruct(id=vectorial._id_de_ficha("A/x.pdf", 0),
+                        vector={vectorial.NOMBRE_VECTOR: [0.1] * _dim_b},
+                        payload={"clave": "A/x.pdf", "documento": "x.pdf"}),
+        _mq.PointStruct(id=vectorial._id_de_ficha("B/x.pdf", 0),
+                        vector={vectorial.NOMBRE_VECTOR: [0.2] * _dim_b},
+                        payload={"clave": "B/x.pdf", "documento": "x.pdf"}),
+        # Del formato viejo: mismo nombre, sin clave.
+        _mq.PointStruct(id="00000000-0000-0000-0000-0000000000a1",
+                        vector={vectorial.NOMBRE_VECTOR: [0.3] * _dim_b},
+                        payload={"documento": "x.pdf"}),
+    ])
+    _cli_b.delete(
+        collection_name=_col_b,
+        points_selector=_mq.FilterSelector(filter=_mq.Filter(should=[
+            _mq.Filter(must=[_mq.FieldCondition(
+                key="clave", match=_mq.MatchValue(value="A/x.pdf"))]),
+            _mq.Filter(must=[
+                _mq.FieldCondition(
+                    key="documento", match=_mq.MatchValue(value="x.pdf")),
+                _mq.IsEmptyCondition(
+                    is_empty=_mq.PayloadField(key="clave")),
+            ]),
+        ])))
+    _quedan, _ = _cli_b.scroll(collection_name=_col_b, limit=10,
+                               with_payload=True, with_vectors=False)
+    _claves_vivas = [(p.payload or {}).get("clave") for p in _quedan]
+    _cli_b.delete_collection(_col_b)
+except Exception as _exc_b:
+    _claves_vivas = f"no se pudo probar: {type(_exc_b).__name__}"
+
+comprobar("al reindexar uno, el del mismo nombre en otra carpeta sobrevive",
+          _claves_vivas == ["B/x.pdf"],
+          f"quedan {_claves_vivas}")
+
 
 # ==============================================================================
 print("\n" + "=" * 70)

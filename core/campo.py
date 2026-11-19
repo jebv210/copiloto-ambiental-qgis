@@ -572,6 +572,7 @@ def leer(ruta: str) -> dict:
                 nombres = [n for n in dentro if n.lower().endswith(se_leen)]
                 if not nombres:
                     return {"puntos": [], "capas": [], "formato": "zip",
+                            "propio": False,
                             "avisos": ["el .zip no trae GeoPackage, "
                                        "shapefile, CSV ni planilla que se "
                                        "pueda revisar"]}
@@ -594,13 +595,7 @@ def leer(ruta: str) -> dict:
                 # la calidad de ningun dato de campo. Conviene decirlo en
                 # vez de dejar que parezca una validacion de verdad.
                 internos = {n.rsplit("/", 1)[-1].lower() for n in z.namelist()}
-                if {"proyecto.qgs", "capas.gpkg"} <= internos:
-                    avisos.append(
-                        "Esto es el paquete de QGIS que genera el propio "
-                        "sistema, no datos que vengan de campo. Se revisa "
-                        "igual, pero lo que sale es el sistema comparandose "
-                        "consigo mismo: para validar una salida, sube el "
-                        ".zip que exporta QField")
+                propio = {"proyecto.qgs", "capas.gpkg"} <= internos
 
                 for nombre in nombres:
                     leido = leer(extraidos[nombre])
@@ -614,7 +609,7 @@ def leer(ruta: str) -> dict:
             import shutil
             shutil.rmtree(carpeta, ignore_errors=True)
         return {"puntos": puntos, "capas": capas, "avisos": avisos,
-                "formato": "zip"}
+                "formato": "zip", "propio": propio}
 
     if extension == ".gpkg":
         return {**_leer_gpkg(ruta), "formato": "gpkg"}
@@ -766,6 +761,50 @@ def revisar(lectura: dict) -> dict:
     problemas = []
     avisos = list(lectura.get("avisos") or [])
 
+    # LO QUE SALIO DE AQUI NO SE APRUEBA NI SE SUSPENDE
+    # -------------------------------------------------
+    # Esta pestana valida lo que VUELVE del campo. Cuando alguien sube el
+    # paquete de QGIS que entrega el agente, antes se revisaba igual y
+    # salia en rojo: "la informacion NO se puede dar por buena". Y era
+    # falso de dos maneras a la vez.
+    #
+    # Primero, porque no hay nada que aprobar: ese archivo lo escribio este
+    # mismo sistema, asi que compararlo con el area de estudio es el
+    # sistema midiendose consigo mismo.
+    #
+    # Y segundo, porque el paquete lleva dentro las capas nacionales
+    # recortadas con holgura -- areas protegidas, fallas geologicas -- y
+    # 360 de sus lineas empiezan fuera del municipio por definicion. Se
+    # medio en el paquete real: 645 "puntos", 361 fuera, y un rojo que no
+    # significaba nada.
+    #
+    # Un veredicto que no se puede fallar no es un veredicto. Se dice lo
+    # que es y para que sirve la pestana.
+    if lectura.get("propio"):
+        cuantas = len(lectura.get("capas") or [])
+        return {
+            "sirve": None,
+            "propio": True,
+            "problemas": [],
+            "explicacion": (
+                f"Este archivo lo generó el propio sistema: es el paquete "
+                f"de QGIS que entrega el agente, con {cuantas} capa(s) y "
+                f"{len(puntos)} geometrías puntuales. **No hay nada que "
+                f"aprobar aquí**, porque no viene del campo: todo lo que "
+                f"trae salió de este mismo proyecto." + chr(10) + chr(10) +
+                f"Esta pestaña sirve para lo que VUELVE de una salida. "
+                f"Para validar una, sube el `.zip` que exporta QField, o "
+                f"el `.gpkg`, `.xlsx` o `.csv` con las coordenadas que "
+                f"hayas recogido."),
+            "avisos": avisos,
+            "resumen": {"puntos": len(puntos),
+                        "validos": len(puntos),
+                        "capas": len(lectura.get("capas") or []),
+                        "formato": lectura.get("formato", ""),
+                        "hay_area": False},
+            "puntos": [],
+        }
+
     if not puntos:
         problemas.append("no se halló ni una coordenada legible")
         return {"sirve": False, "problemas": problemas, "avisos": avisos,
@@ -789,8 +828,6 @@ def revisar(lectura: dict) -> dict:
         avisos.append(veredicto["motivo"] + ". No se pudo comprobar la "
                                             "ubicación")
     elif veredicto["fuera"]:
-        lejos = max((d.get("km_fuera", 0) for d in veredicto["detalle"]
-                     if not d["dentro"]), default=0)
         # UN RECORRIDO QUE EMPIEZA FUERA NO ES UN ERROR
         # ---------------------------------------------
         # De una linea se toma su primer vertice, y una quebrada nace
@@ -805,6 +842,18 @@ def revisar(lectura: dict) -> dict:
                            if not d["dentro"] and not d.get("recorrido")]
         recorridos_fuera = veredicto["fuera"] - len(fuera_de_verdad)
 
+        # LA DISTANCIA ES LA DEL PUNTO QUE FALLA, NO LA DEL PEOR DE TODOS
+        # ---------------------------------------------------------------
+        # Se medía sobre TODOS los puntos de fuera, recorridos incluidos, y
+        # luego se nombraba junto al recuento de los que de verdad fallan.
+        # En el paquete real decía "1 punto cae FUERA, hasta 135,3 km del
+        # borde" cuando ese punto estaba a 2,4 km: los 135 eran de una
+        # falla geológica que la propia frase acababa de excluir.
+        #
+        # Una cifra cierta puesta al lado de la frase equivocada se lee
+        # como una cifra falsa, y manda a buscar un error que no existe.
+        lejos = max((d.get("km_fuera", 0) for d in fuera_de_verdad),
+                    default=0)
         if fuera_de_verdad:
             problemas.append(
                 f"{len(fuera_de_verdad)} de {veredicto['total']} punto(s) "
@@ -831,11 +880,38 @@ def revisar(lectura: dict) -> dict:
                     "estén cambiadas en el archivo de origen")
 
     # --- Puntos repetidos --------------------------------------------------
+    # SE COMPARA POR CASILLAS, NO TODOS CONTRA TODOS
+    # ----------------------------------------------
+    # La version anterior recorria cada punto contra todos los siguientes.
+    # Con las 112 fichas de una salida daba igual, pero el paquete del
+    # sistema trae 645 puntos y las capas nacionales pueden traer miles:
+    # 20.000 puntos son 200 millones de distancias y la pantalla se queda
+    # "Leyendo y revisando..." varios minutos, que desde fuera es
+    # exactamente igual que un cuelgue.
+    #
+    # Dos puntos a menos de 10 m caen en la misma casilla o en una vecina,
+    # asi que basta mirar nueve casillas por punto. El resultado es el
+    # mismo y el coste deja de crecer al cuadrado.
+    lado = METROS_DUPLICADO / 1000.0 / 111.32      # 10 m en grados
+    casillas = {}
+    for punto in validos:
+        clave = (int(punto["lat"] / lado), int(punto["lon"] / lado))
+        casillas.setdefault(clave, []).append(punto)
+
     repetidos = 0
-    for i, uno in enumerate(validos):
-        for otro in validos[i + 1:]:
+    for punto in validos:
+        fila = int(punto["lat"] / lado)
+        columna = int(punto["lon"] / lado)
+        vecinos = []
+        for df in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                vecinos.extend(casillas.get((fila + df, columna + dc), ()))
+        for otro in vecinos:
+            if otro is punto:
+                continue
             metros = area_estudio.distancia_km(
-                (uno["lon"], uno["lat"]), (otro["lon"], otro["lat"])) * 1000
+                (punto["lon"], punto["lat"]),
+                (otro["lon"], otro["lat"])) * 1000
             if metros < METROS_DUPLICADO:
                 repetidos += 1
                 break
@@ -856,14 +932,26 @@ def revisar(lectura: dict) -> dict:
         if capa.get("registros") == 0:
             avisos.append(f"la capa '{capa['nombre']}' llegó vacía")
 
+    # LOS NUMEROS DE ARRIBA Y EL VEREDICTO TIENEN QUE CUADRAR
+    # -------------------------------------------------------
+    # El panel marcaba "Fuera del area: 361" justo encima de "1 punto cae
+    # FUERA". Las dos cifras eran ciertas y contarlas juntas era
+    # incomprensible: 360 de esos 361 son recorridos que entran despues y
+    # el propio texto los daba por buenos. Se separan, y asi la suma
+    # cuadra: dentro + recorridos + fuera = leidos.
+    detalle = veredicto.get("detalle") or []
+    recorridos = sum(1 for d in detalle
+                     if not d.get("dentro") and d.get("recorrido"))
     resumen = {
         "puntos": len(puntos),
         "validos": len(validos),
         "dentro": veredicto.get("dentro", 0),
-        "fuera": veredicto.get("fuera", 0),
+        "fuera": veredicto.get("fuera", 0) - recorridos,
+        "recorridos_fuera": recorridos,
         "hay_area": veredicto.get("hay_area", False),
         "capas": len(lectura.get("capas") or []),
         "formato": lectura.get("formato", ""),
     }
-    return {"sirve": not problemas, "problemas": problemas, "avisos": avisos,
-            "resumen": resumen, "puntos": veredicto.get("detalle") or validos}
+    return {"sirve": not problemas, "propio": False,
+            "problemas": problemas, "avisos": avisos,
+            "resumen": resumen, "puntos": detalle or validos}

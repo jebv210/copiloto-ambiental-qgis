@@ -128,3 +128,6 @@ data/*
 data/capas_fuente/*
 !data/capas_fuente/LEEME.md
 !data/capas_fuente/area_proyecto_san_carlos.kmz
+
+# Scripts temporales de mantenimiento
+scratch/

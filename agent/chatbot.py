@@ -270,6 +270,12 @@ class ConesaAgent:
                 texto = (respuesta.text or "").strip()
 
             if texto:
+                # El apartado de Bases se comprueba contra lo que de verdad
+                # devolvieron las herramientas, no contra lo que el modelo
+                # dice haber consultado.
+                fuentes, usadas = _fuentes_del_turno(respuesta)
+                texto = _asegurar_bases(texto, fuentes, usadas)
+                texto = _asegurar_notas(texto, mensaje)
                 self._recordar("model", texto)
                 self._guardar_recuerdo_de_fondo(mensaje)
                 return texto
@@ -601,6 +607,13 @@ def estado() -> dict:
 #: "y esa especie?" sin que el historial le quite sitio a la bibliografia.
 TURNOS_RECORDADOS = settings.turnos_recordados()
 
+#: Cuantos turnos CON IMAGEN se siguen mandando al modelo.
+#:
+#: Dos, no treinta. Permite preguntar "y en la otra foto?" justo despues de
+#: pegar dos, que es el caso real, sin arrastrar en cada mensaje todas las
+#: capturas de la conversacion.
+TURNOS_CON_IMAGEN_RECORDADOS = 2
+
 
 #: Tipos de imagen que el modelo sabe mirar, por extension.
 TIPOS_IMAGEN = {
@@ -646,6 +659,210 @@ def _partes_de_imagen(imagenes) -> list:
     return partes
 
 
+# ==============================================================================
+# LAS BASES DE UNA RESPUESTA
+# ==============================================================================
+# El prompt pide tres apartados: Respuesta, Bases y Notas. El prompt es una
+# peticion, no una garantia: un modelo cumple un formato las primeras veces y
+# lo va soltando segun se alarga la conversacion.
+#
+# Esto es el respaldo. No reescribe lo que el modelo decidio decir; solo se
+# asegura de que el apartado de Bases EXISTA, y cuando falta lo construye con
+# las fuentes que las herramientas devolvieron DE VERDAD en ese turno. Nunca
+# con otras: de eso se trata precisamente.
+
+#: Como empieza la linea que las herramientas ponen debajo de cada fragmento.
+MARCA_FUENTE = "Fuente:"
+
+#: Titulo del apartado, tal como lo pide el prompt.
+TITULO_BASES = "### Bases"
+
+#: Cuantas fuentes distintas se listan como mucho.
+MAXIMO_FUENTES = 8
+
+
+def _fuentes_del_turno(respuesta) -> tuple:
+    """
+    Saca de la respuesta que documentos devolvieron las herramientas.
+
+    POR QUE DE AQUI Y NO DEL TEXTO DEL MODELO
+    -----------------------------------------
+    Porque el texto del modelo es justo lo que hay que poder comprobar. El
+    historial de llamadas automaticas trae lo que cada herramienta contesto,
+    palabra por palabra: esa es la unica lista de fuentes que no puede estar
+    inventada.
+
+    Args:
+        respuesta: Lo que devolvio `generate_content`.
+
+    Returns:
+        Tupla `(fuentes, herramientas)`. `fuentes` son las citas encontradas,
+        sin repetir y en el orden en que aparecieron; `herramientas`, los
+        nombres de las que se llamaron.
+    """
+    historial = getattr(respuesta, "automatic_function_calling_history", None)
+    fuentes, herramientas = [], []
+    for turno in historial or []:
+        for parte in (getattr(turno, "parts", None) or []):
+            llamada = getattr(parte, "function_call", None)
+            if llamada is not None and llamada.name not in herramientas:
+                herramientas.append(llamada.name)
+
+            devuelto = getattr(parte, "function_response", None)
+            if devuelto is None:
+                continue
+            texto = str(getattr(devuelto, "response", "") or "")
+            # El contenido viaja como un diccionario convertido a texto, con
+            # los saltos de linea escapados. Se deshace el escape para poder
+            # separar por lineas, que es como vienen las citas.
+            texto = texto.replace("\\n", "\n")
+            for linea in texto.split("\n"):
+                limpia = linea.strip()
+                if not limpia.startswith(MARCA_FUENTE):
+                    continue
+                # El contenido viene dentro de un diccionario convertido a
+                # texto, asi que la ultima cita arrastra el cierre: comillas
+                # y llave. Se quitan por el final, nunca el corchete, que es
+                # parte de la cita: "Guia.pdf, p. 60 [3_HOSPEDERAS]".
+                cita = limpia[len(MARCA_FUENTE):].strip()
+                cita = cita.strip("'\" ").rstrip("}'\" ,")
+                if cita and cita not in fuentes:
+                    fuentes.append(cita)
+    return fuentes, herramientas
+
+
+def _sin_encabezado_suelto(texto: str) -> str:
+    """
+    Quita el titulo de "Respuesta" cuando va solo, sin los demas apartados.
+
+    Args:
+        texto: La respuesta del modelo.
+
+    Returns:
+        El mismo texto, en prosa, si el encabezado era el unico.
+    """
+    marca = "### Respuesta"
+    sin_espacios = texto.lstrip()
+    if not sin_espacios.startswith(marca):
+        return texto
+    return sin_espacios[len(marca):].lstrip(chr(10)).lstrip()
+
+
+def _asegurar_bases(texto: str, fuentes: list, herramientas: list) -> str:
+    """
+    Anade el apartado de Bases cuando el modelo se lo dejo.
+
+    No toca el que ya exista. Si el modelo escribio sus bases, son las suyas:
+    corregirselas desde aqui seria mezclar dos voces en la misma respuesta y
+    dejar al usuario sin saber cual leer.
+
+    Args:
+        texto: La respuesta del modelo.
+        fuentes: Citas que devolvieron las herramientas en este turno.
+        herramientas: Nombres de las herramientas llamadas.
+
+    Returns:
+        La respuesta, con su apartado de Bases.
+    """
+    if not texto:
+        return texto
+
+    # Si ya tiene Bases, asegurar que fuentes devueltas por herramientas para especies similares
+    # no queden por fuera de la seccion
+    if TITULO_BASES.lower() in texto.lower():
+        if fuentes:
+            fuentes_faltantes = []
+            for f in fuentes:
+                doc_nom = f.split(",")[0].strip() if "," in f else f
+                if doc_nom.lower() not in texto.lower():
+                    fuentes_faltantes.append(f)
+            if fuentes_faltantes:
+                import re
+                lineas_extra = ["  - **Fuentes de Drive para especies similares / candidatas**:"]
+                for f in fuentes_faltantes[:5]:
+                    lineas_extra.append(f"    * {f}")
+                bloque_extra = "\n".join(lineas_extra)
+                if "### notas" in texto.lower():
+                    partes = re.split(r"(###\s*notas)", texto, flags=re.IGNORECASE)
+                    texto = partes[0].rstrip() + "\n" + bloque_extra + "\n\n" + "".join(partes[1:])
+                else:
+                    texto = texto.rstrip() + "\n" + bloque_extra
+        return texto
+
+    # SIN HERRAMIENTAS NO SE INVENTA UN APARTADO DE FUENTES
+    # -----------------------------------------------------
+    # Si el modelo no consulto nada, no hay nada que listar, y lo que salia
+    # era un aviso de relleno. Se vio en un "hola": debajo del saludo
+    # aparecia "conviene comprobarlo antes de usarlo en el informe", que no
+    # significa nada ahi y ensena a saltarse el apartado.
+    #
+    # Para las preguntas que SI afirman algo no hay riesgo de perderselo: la
+    # regla 8 del prompt obliga a consultar antes de responder, asi que esas
+    # llegan aqui con herramientas detras.
+    #
+    # De paso se quita el encabezado suelto. "### Respuesta" como unico
+    # titulo de una conversacion normal es media estructura: o estan los
+    # apartados o no esta ninguno.
+    if not herramientas:
+        return _sin_encabezado_suelto(texto)
+
+    lineas = ["", TITULO_BASES]
+    if fuentes:
+        for cita in fuentes[:MAXIMO_FUENTES]:
+            lineas.append(f"- **{cita}**")
+        if len(fuentes) > MAXIMO_FUENTES:
+            lineas.append(f"- …y {len(fuentes) - MAXIMO_FUENTES} fuente(s) "
+                          f"mas del mismo grupo.")
+    elif herramientas:
+        # Sin citas pero con herramientas: la respuesta sale de mirar el
+        # sistema, no de leer documentos. Es una base valida y hay que
+        # decirla asi, no dejar el hueco.
+        lineas.append(
+            "- No sale de la bibliografia: sale de consultar el propio "
+            "sistema (" + ", ".join(herramientas[:6]) + ").")
+    else:
+        lineas.append(
+            "- No sale de ningun documento ni de ninguna herramienta: es "
+            "razonamiento sobre lo que se dijo en esta conversacion. "
+            "Conviene comprobarlo antes de usarlo en el informe.")
+    return texto.rstrip() + "\n" + "\n".join(lineas)
+
+
+def _asegurar_notas(texto: str, mensaje: str = "") -> str:
+    """
+    Asegura que el apartado de Notas / Advertencias este presente en respuestas
+    relacionadas con identificacion de mariposas, fotografias o especies similares.
+    """
+    if not texto:
+        return texto
+
+    texto_l = texto.lower()
+    if "### notas" in texto_l or "### advertencias" in texto_l or "## notas" in texto_l or "## advertencias" in texto_l:
+        return texto
+
+    palabras_clave = (
+        "mariposa", "especie", "lepidoptera", "foto", "imagen", "observacion",
+        "similitud", "similares", "candidata", "candidatas", "oruga", "pupa",
+        "crisalida", "huevo", "ala", "alas", "genero", "familia"
+    )
+    es_biologico = any(p in texto_l or p in mensaje.lower() for p in palabras_clave)
+    if not es_biologico:
+        return texto
+
+    bloque_notas = (
+        "\n\n### Notas\n"
+        "- **Advertencias sobre similitudes y caracteres diagnosticos:** La identificacion basada en fotografias o "
+        "observaciones de campo es de caracter probable/tentativo. Diversas especies de Lepidoptera presentan "
+        "patrones mimeticos convergentes (mimetismo mulleriano/batesiano) o variabilidad individual. Para diferenciar "
+        "con certeza absoluta la especie observada de sus candidatas similares es necesario cotejar la cara ventral "
+        "y dorsal de las alas, los patrones de venacion alar y, en especies cripticas, el examen microscopico "
+        "de la genitalia.\n"
+        "- **Alcance territorial y conservacion:** Los registros citados corresponden al municipio de San Carlos "
+        "(Antioquia) y a los catalogos y normativas indexados en el repositorio de Drive del proyecto."
+    )
+    return texto.rstrip() + bloque_notas
+
+
 def _recordar(self, papel: str, texto: str, imagenes=None) -> None:
     """
     Anade un turno al historial que se le envia al modelo.
@@ -661,6 +878,28 @@ def _recordar(self, papel: str, texto: str, imagenes=None) -> None:
         self._historial = []
     partes = [types.Part(text=texto)] + _partes_de_imagen(imagenes)
     self._historial.append(types.Content(role=papel, parts=partes))
+
+    # LAS IMAGENES VIEJAS SE SUELTAN; EL TEXTO SE QUEDA
+    # -------------------------------------------------
+    # El historial guarda treinta turnos, y las imagenes se quedaban dentro
+    # de todos ellos. Cada pregunta nueva volvia a subir TODAS las capturas
+    # pegadas en la conversacion: con cuatro capturas de pantalla de 4 MB,
+    # el quinto mensaje mandaba 16 MB al modelo para preguntar "y esto?".
+    #
+    # Eso no es solo lento. Pasado cierto tamano la llamada falla o el
+    # modelo responde cualquier cosa, y desde fuera parece que el agente
+    # "dejo de poder con las imagenes" justo cuando mas se usaban.
+    #
+    # Lo que la imagen decia ya esta en la respuesta que el agente dio
+    # sobre ella, que SI se conserva. Se mantienen las de los ultimos
+    # turnos para que un "y en la otra foto?" siga funcionando.
+    con_imagen = [i for i, t in enumerate(self._historial)
+                  if len(t.parts) > 1]
+    for i in con_imagen[:-TURNOS_CON_IMAGEN_RECORDADOS]:
+        turno = self._historial[i]
+        self._historial[i] = types.Content(
+            role=turno.role,
+            parts=[p for p in turno.parts if getattr(p, "text", None)])
 
     # Se recorta por el principio, nunca por el final: lo reciente es lo que
     # da sentido a un "y eso?".

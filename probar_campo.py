@@ -15,6 +15,7 @@ import csv
 import os
 import shutil
 import sys
+import time
 import tempfile
 
 from core import ajustes as _ajustes_guardados
@@ -564,6 +565,129 @@ try:
 finally:
     campo.carpeta_capas_extra = _extra_real
     shutil.rmtree(_banco_capa, ignore_errors=True)
+
+# ==============================================================================
+print("")
+print("EL PAQUETE DEL PROPIO SISTEMA NO SE APRUEBA NI SE SUSPENDE")
+# ------------------------------------------------------------------------------
+# Pasaba esto: se le pedia al agente el .zip de QGIS, se subia a esta misma
+# pestana y salia en rojo, "la informacion NO se puede dar por buena". El
+# archivo estaba perfecto. Lo que fallaba era la pregunta: un paquete que
+# escribio este sistema no es una salida de campo, asi que no hay nada que
+# aprobar, y suspenderlo tapaba los veredictos que si significan algo.
+_banco_p = tempfile.mkdtemp(prefix="propio_")
+try:
+    import zipfile as _zp
+
+    _falso = os.path.join(_banco_p, "Area_estudio_QGIS.zip")
+    with _zp.ZipFile(_falso, "w") as _z:
+        _z.writestr("proyecto.qgs", "<qgis/>")
+        _z.writestr("LEEME.txt", "paquete de prueba")
+        # Un GeoPackage de verdad, escrito por el propio proyecto: asi la
+        # prueba no depende de un archivo inventado que el lector rechace.
+        from core import paquete_qgis as _pq
+        _gpkg = os.path.join(_banco_p, "capas.gpkg")
+        _pq.escribir_geopaquete(_gpkg, [{
+            "nombre": "sitios", "tipo": "Point",
+            "entidades": [
+                {"propiedades": {"nombre": "uno"},
+                 "coordenadas": [-74.9, 6.2]},
+                {"propiedades": {"nombre": "lejos"},
+                 "coordenadas": [-70.0, 2.0]},
+            ]}])
+        _z.write(_gpkg, "capas.gpkg")
+
+    _lec_p = campo.leer(_falso)
+    comprobar("se reconoce el paquete que genera el propio sistema",
+              _lec_p.get("propio") is True,
+              "por el proyecto.qgs y el capas.gpkg que lleva dentro")
+
+    _rev_p = campo.revisar(_lec_p)
+    comprobar("no se le pone veredicto: ni aprobado ni suspenso",
+              _rev_p["sirve"] is None and not _rev_p["problemas"],
+              f"sirve={_rev_p['sirve']!r}, {len(_rev_p['problemas'])} "
+              f"problemas")
+    comprobar("y se dice QUE es y que habria que subir en su lugar",
+              "QField" in _rev_p.get("explicacion", "")
+              and "no viene del campo" in _rev_p.get("explicacion", ""),
+              "en vez de un rojo que no significa nada")
+    comprobar("el punto que cae lejos ya no invalida nada",
+              not _rev_p["problemas"],
+              "aunque el paquete lleve geometria nacional fuera del area")
+
+    # Un .zip de campo normal SIGUE revisandose como siempre.
+    _normal = os.path.join(_banco_p, "salida.zip")
+    with _zp.ZipFile(_normal, "w") as _z:
+        _z.write(_gpkg, "datos.gpkg")
+    _rev_n = campo.revisar(campo.leer(_normal))
+    comprobar("un .zip que no es el paquete del sistema si se juzga",
+              _rev_n["sirve"] is not None,
+              f"sirve={_rev_n['sirve']!r}: el cambio no desactiva la "
+              f"revision de verdad")
+finally:
+    shutil.rmtree(_banco_p, ignore_errors=True)
+
+# ==============================================================================
+print("")
+print("LAS CIFRAS DEL VEREDICTO TIENEN QUE CUADRAR ENTRE SI")
+# ------------------------------------------------------------------------------
+# El panel decia "Fuera del area: 361" justo encima de "1 punto cae FUERA", y
+# la frase remataba "hasta 135,3 km del borde" cuando ese unico punto estaba a
+# 2,4 km: los 135 km eran de una linea que la misma frase acababa de excluir.
+# Tres numeros ciertos que juntos contaban una mentira.
+_ejemplo = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "data", "ejemplos_campo",
+                        "qfield_fuera_del_area.zip")
+if not os.path.exists(_ejemplo):
+    omitir("cifras coherentes en una salida real", "falta el ejemplo de campo")
+else:
+    _rev_e = campo.revisar(campo.leer(_ejemplo))
+    _re = _rev_e["resumen"]
+    _suma = (_re.get("dentro", 0) + _re.get("recorridos_fuera", 0)
+             + _re.get("fuera", 0))
+    comprobar("dentro + recorridos + fuera suma los puntos leidos",
+              _suma == _re.get("puntos"),
+              f"{_re.get('dentro')} + {_re.get('recorridos_fuera')} + "
+              f"{_re.get('fuera')} = {_suma} de {_re.get('puntos')}")
+
+    _fuera_real = [d for d in _rev_e["puntos"]
+                   if not d.get("dentro") and not d.get("recorrido")]
+    if _fuera_real and _rev_e["problemas"]:
+        _peor = max(d.get("km_fuera", 0) for d in _fuera_real)
+        _dicho = _rev_e["problemas"][0]
+        comprobar("la distancia que se nombra es la del punto que falla",
+                  f"{_peor} km" in _dicho,
+                  f"dice '{_peor} km', que es el peor de los que cuentan, "
+                  f"no el de un recorrido excluido")
+    else:
+        omitir("la distancia que se nombra es la del punto que falla",
+               "el ejemplo no tiene fichas fuera del area")
+
+# ==============================================================================
+print("")
+print("BUSCAR REPETIDOS NO PUEDE CRECER AL CUADRADO")
+# ------------------------------------------------------------------------------
+# Comparar todos contra todos son 200 millones de distancias con 20.000
+# puntos, y varios minutos de "Leyendo y revisando..." que desde fuera no se
+# distinguen de un cuelgue. Con casillas de 10 m el resultado es el mismo.
+_muchos = [{"lat": 6.1 + (i % 200) * 0.001,
+            "lon": -74.9 + (i // 200) * 0.001,
+            "titulo": f"p{i}", "nota": "", "fecha": "", "capa": "x"}
+           for i in range(4000)]
+# Dos pegados a proposito, para que el detector tenga algo que encontrar.
+_muchos.append({**_muchos[0], "titulo": "gemelo"})
+_arranque = time.time()
+_rev_m = campo.revisar({"puntos": _muchos, "capas": [], "avisos": [],
+                        "formato": "csv"})
+_tardo = time.time() - _arranque
+comprobar("4.001 puntos se revisan en un tiempo razonable",
+          _tardo < 20,
+          f"{_tardo:.1f} s")
+comprobar("y los pegados se siguen detectando",
+          any("menos de" in a for a in _rev_m["avisos"]),
+          next((a for a in _rev_m["avisos"] if "menos de" in a),
+               "no se detecto ninguno")[:70])
+
 
 # ==============================================================================
 print("\n" + "=" * 70)

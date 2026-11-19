@@ -340,6 +340,35 @@ core/fuentes.py  ──► Drive            (única fuente; se conecta desde la 
 api/server.py ───┴──► lo mismo, por HTTP  ◄── n8n
 ```
 
+### De un archivo a una capa del mapa
+
+Los documentos entran por un camino y el mapa sale por otro. Estos tres
+módulos son el cruce: lo que llega con geometría de verdad acaba en
+`capas_extra/`, que es de donde QGIS recoge las capas propias.
+
+```
+core/corpus.py (_leer_zip)
+        │
+        ├──► core/capas.py        decide qué se guarda y lo recorta al área
+        │         │
+        │         ├──► core/geometria.py    .shp  → GeoJSON en grados
+        │         └──► core/geodatabase.py  .gdb  → GeoJSON en grados
+        │
+        └──► capas_extra/fuente_*.geojson ──► cargar_capas_qgis.py ──► QGIS
+```
+
+Las dos cosas que conviene saber de este camino:
+
+* **No hay GDAL.** Las proyecciones se invierten a mano: Mercator esférica
+  (EPSG:3857, lo que descarga cualquier visor web) y Transversa de Mercator
+  (todas las zonas UTM y los orígenes de MAGNA-SIRGAS). Lo que no entre en
+  esas dos familias **no se dibuja** y se dice por qué, en vez de colocarlo
+  a ojo.
+* **Se recorta al área de estudio.** El RUNAP trae 1.882 áreas protegidas de
+  Colombia y el Atlas Geológico 7.067 fallas; la pregunta nunca es ésa. Se
+  guarda lo que cae cerca y cada entidad lleva escrito si TOCA el área o
+  sólo pasa al lado.
+
 ---
 
 ## Qué NO se usa, y por qué sigue estando
@@ -367,8 +396,12 @@ afirmara que el área cargada era esa.
 | Añadir documentos | `python -m core.importar <archivo> -c "Categoría"` |
 | De dónde salen los documentos | `FUENTE_CORPUS`, y rellena `FuenteDrive` |
 | Cómo se trocean | `TAMANO_FICHA` en `core/corpus.py`, y **reindexa** |
+| Cómo se lee un formato | El lector en `core/corpus.py`, **y sube su número en `VERSIONES_LECTURA`**: es lo que hace que los archivos ya indexados se vuelvan a leer sin tocarlos en Drive |
+| Qué proyecciones se saben situar | `conversion_de_wkt` en `core/geometria.py` |
+| Qué capa manda en el mapa entregado | `ARCHIVO_AREA` y `_simbolo_area()` en `core/paquete_qgis.py`: el límite del área va arriba del todo, sin relleno, y de él sale el encuadre y el título |
 | El modelo de embeddings | `MODELO_GEMINI_EMBEDDINGS` en `core/vectorial.py`, y sube `ESQUEMA_EMBEDDINGS` |
 | Los rangos de Conesa | `core/validator.py`, y solo ahí |
+| Cómo se estructura una respuesta | El bloque `FORMATO` de `agent/prompts.py` (respuesta, bases, notas). El respaldo que comprueba las bases contra lo que devolvieron las herramientas está en `_fuentes_del_turno` de `agent/chatbot.py` |
 
 Y después, siempre:
 

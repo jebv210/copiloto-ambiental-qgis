@@ -15,9 +15,8 @@ ORGANIZACION DE LA PANTALLA
         - Integracion con QGIS: descarga del script PyQGIS.
 
     Pestana 1  Chat con el agente.
-    Pestana 2  Calculo masivo de matrices de Conesa desde Excel/CSV.
-    Pestana 3  Diagnostico de linea base por coordenadas.
-    Pestana 4  Configuracion del area de estudio (carga del dataset y filtros).
+    Pestana 2  Configuracion del area de estudio y seguimiento de campo.
+    Pestana 3  Drive y estudio (fuente documental).
 
 FLUJO DE TRABAJO ESPERADO
 -------------------------
@@ -378,6 +377,20 @@ def _api(ruta: str, metodo: str = "GET", cuerpo=None, espera: int = 15):
         return 0, {"error": str(exc)}
 
 
+def _buzon() -> str:
+    """
+    Identificador del buzon de imagenes de esta pestana.
+
+    Returns:
+        El identificador, estable mientras la pestana siga abierta.
+    """
+    buzon = st.session_state.get("buzon_id")
+    if not buzon:
+        buzon = "buzon_" + str(int(time.time() * 1000))[-9:]
+        st.session_state["buzon_id"] = buzon
+    return buzon
+
+
 def _imagenes_pegadas(con_datos: bool = False) -> list:
     """
     Recoge las imagenes que esperan en el buzon de esta sesion.
@@ -392,18 +405,17 @@ def _imagenes_pegadas(con_datos: bool = False) -> list:
         `datos` en base64. Lista vacia si la API no responde: una imagen
         pegada nunca debe impedir escribir.
     """
-    sesion = st.session_state.get("session_id", "default")
+    buzon = _buzon()
     sufijo = "?con_datos=true" if con_datos else ""
-    codigo, datos = _api(f"/chat/imagenes/{sesion}{sufijo}", espera=10)
+    codigo, datos = _api(f"/chat/imagenes/{buzon}{sufijo}", espera=10)
     if codigo != 200:
         return []
     return datos.get("imagenes", [])
 
 
 def _vaciar_imagenes_pegadas() -> None:
-    """Descarta las imagenes en espera de esta sesion."""
-    sesion = st.session_state.get("session_id", "default")
-    _api(f"/chat/imagenes/{sesion}", metodo="DELETE", espera=10)
+    """Descarta las imagenes en espera de esta pestana."""
+    _api(f"/chat/imagenes/{_buzon()}", metodo="DELETE", espera=10)
 
 
 def _tamano_legible(cuantos_bytes: int) -> str:
@@ -529,8 +541,7 @@ def _quitar_imagen_pegada(indice: int) -> None:
     Args:
         indice: Posicion de la imagen, empezando en cero.
     """
-    sesion = st.session_state.get("session_id", "default")
-    _api(f"/chat/imagenes/{sesion}/{indice}", metodo="DELETE", espera=10)
+    _api(f"/chat/imagenes/{_buzon()}/{indice}", metodo="DELETE", espera=10)
 
 
 def _adjuntos_para_el_modelo() -> list:
@@ -684,16 +695,22 @@ def _responder_con_cronometro(pregunta: str, imagenes=None) -> str:
     """
     Pregunta al agente mostrando el tiempo que lleva pensando.
 
-    POR QUE YA NO PASA POR n8n
-    --------------------------
-    Antes esta funcion llamaba al webhook `copiloto-chat` y solo caia al agente
-    directo si n8n no respondia. Ese flujo se retiro porque no hacia nada que
-    la API no hiciera ya: validaba la pregunta, la reenviaba a `/agente/chat` y
-    anadia tres datos de adorno. Toda la memoria de la conversacion estaba, y
-    sigue estando, en el agente.
+    DOS CAMINOS, Y CUAL SEGUN QUE
+    -----------------------------
+    Con TEXTO la pregunta va por el webhook `copiloto-chat` de n8n, que la
+    reenvia a `/agente/chat` y escribe el intercambio en Qdrant en un nodo
+    aparte. Ese rodeo no aporta nada que la API no sepa hacer, pero deja el
+    paso de guardado a la vista en el flujo, que es para lo que esta.
 
-    Ademas el rodeo IMPEDIA pegar imagenes: el webhook solo transportaba texto,
-    asi que una imagen pegada se perdia por el camino.
+    Con IMAGENES se va derecho a la API. El webhook transporta solo texto, y
+    la API recoge las imagenes de un buzon cuyo nombre hay que decirle: por
+    n8n ese nombre no viaja, asi que el agente respondia sin haber visto
+    nada y contestaba que no puede mirar imagenes. Se midio con cuatro
+    capturas seguidas, todas perdidas por ese hueco.
+
+    Este comentario decia antes que la funcion ya NO usaba n8n, y el codigo
+    si lo usaba. Un comentario que miente sobre el camino que sigue el dato
+    cuesta mas que no tener comentario.
 
     Args:
         pregunta: Lo que escribio la persona.
@@ -705,6 +722,7 @@ def _responder_con_cronometro(pregunta: str, imagenes=None) -> str:
     """
     clave = st.session_state.api_key
     sesion = st.session_state.get("session_id", "default")
+    buzon = _buzon()
     salida = {}
 
     def _trabajo():
@@ -721,6 +739,36 @@ def _responder_con_cronometro(pregunta: str, imagenes=None) -> str:
         """
         import json
         import urllib.request
+
+        # CON IMAGENES NO SE PASA POR n8n, Y ESTO SI ES ASI AHORA
+        # ------------------------------------------------------
+        # El comentario de arriba decia que esta funcion ya no usaba el
+        # webhook. No era verdad: el codigo seguia llamandolo y solo caia a
+        # la API si n8n fallaba. Para texto da igual, pero el webhook lleva
+        # SOLO texto, y la API recoge las imagenes del buzon por su cuenta:
+        # con el nombre del buzon sin viajar en la peticion, buscaba en el
+        # sitio equivocado y el agente respondia sin haber visto nada.
+        #
+        # Asi que cuando hay imagenes se va derecho a la API, diciendole de
+        # que buzon leerlas. El intercambio se guarda igual en la memoria:
+        # lo hace el propio endpoint cuando nadie mas va a hacerlo.
+        if imagenes:
+            codigo, respuesta = _api(
+                "/agente/chat", "POST",
+                {"pregunta": pregunta, "session_id": sesion,
+                 "buzon_id": buzon, "api_key": clave or None,
+                 "guardar_memoria": True},
+                espera=240)
+            if codigo == 200 and (respuesta.get("respuesta") or "").strip():
+                salida["texto"] = (
+                    respuesta["respuesta"]
+                    + f"\n\n---\n*{len(imagenes)} imagen(es) miradas. "
+                      f"Respondido directamente por la API, sin pasar por "
+                      f"n8n: el webhook solo transporta texto.*")
+                return
+            salida["aviso_n8n"] = (
+                f"la API no respondio al enviar {len(imagenes)} imagen(es) "
+                f"(codigo {codigo})")
 
         n8n = os.environ.get(
             "N8N_URL",
@@ -759,6 +807,10 @@ def _responder_con_cronometro(pregunta: str, imagenes=None) -> str:
                 texto += (f"\n\n---\n*No se guardó en la memoria: "
                           f"{item['memoria_motivo']}*")
             salida["texto"] = texto
+            # Si el intento directo de mas arriba habia fallado y n8n si
+            # responde, el aviso de aquel ya no viene a cuento: contarlo
+            # mandaria a revisar algo que acabo funcionando.
+            salida.pop("aviso_n8n", None)
             return
         except Exception as exc:
             salida["aviso_n8n"] = str(exc)[:160]
@@ -801,6 +853,21 @@ def _responder_con_cronometro(pregunta: str, imagenes=None) -> str:
 _ESTADO_INICIAL = {
     # Chat
     "session_id": "sesion_" + str(int(time.time()))[-6:],
+    # EL BUZON DE IMAGENES NO ES LA CONVERSACION
+    # ------------------------------------------
+    # Colgaba del identificador de la charla, y ese identificador cambia:
+    # al abrir otra conversacion, al empezar una nueva. Pegabas una captura,
+    # el guion la guardaba bajo la charla de ese momento, y para cuando
+    # enviabas el mensaje la charla era otra: la imagen seguia en el
+    # servidor, bajo un nombre que ya no miraba nadie.
+    #
+    # Y no avisaba. El agente recibia la pregunta sin imagen y contestaba
+    # que no puede con imagenes, que es lo que se veia desde fuera: un
+    # sistema que "no sabe mirar fotos".
+    #
+    # El buzon pertenece a la PESTANA del navegador, que es donde esta el
+    # portapapeles. Este identificador se crea una vez y no cambia nunca.
+    "buzon_id": "buzon_" + str(int(time.time() * 1000))[-9:],
     "messages": [{
         "role": "assistant",
         "content": (
@@ -839,9 +906,147 @@ _ESTADO_INICIAL = {
     "columna_taxonomica": None,
 }
 
+# ==============================================================================
+# LA CHARLA VIVE EN LA DIRECCION, NO SOLO EN LA MEMORIA DE STREAMLIT
+# ==============================================================================
+# Streamlit guarda `session_state` por conexion de navegador, y esa conexion
+# se pierde mas a menudo de lo que parece: al dejar la pestana en segundo
+# plano un rato, al dormirse el equipo, al reiniciarse el servidor. Cuando
+# vuelve, Streamlit abre una sesion NUEVA y vacia.
+#
+# El efecto practico es el peor posible justo al pegar una imagen, porque
+# para tener una imagen hay que salir de la pestana a copiarla: vuelves,
+# pegas, y estas en otra charla en blanco. En el historial quedaron tres
+# conversaciones casi identicas -- "de que genero es esta mariposa?" a las
+# 00:54, a las 00:56 y a las 01:01 -- que son tres intentos del mismo
+# intento.
+#
+# Y con la charla se perdia el buzon de imagenes, asi que lo pegado antes
+# quedaba huerfano en el servidor bajo un identificador que ya no miraba
+# nadie.
+#
+# La direccion del navegador SI sobrevive a todo eso. Ahi se dejan los dos
+# identificadores, y al volver se recogen.
+def _recordar_en_la_direccion(session_id: str, buzon_id: str) -> None:
+    """
+    Deja la charla y el buzon anotados en la direccion del navegador.
+
+    Args:
+        session_id: Identificador de la conversacion abierta.
+        buzon_id: Identificador del buzon de imagenes de esta pestana.
+    """
+    from core import memoria as _memoria_url
+
+    # Guardia de salida: si lo que se iba a anotar no es un identificador, no
+    # se anota. Asi una etiqueta no puede llegar a la direccion ni aunque se
+    # cuele en el estado.
+    if not _memoria_url.es_identificador_de_sesion(session_id):
+        session_id = None
+    if not _memoria_url.es_identificador_de_sesion(buzon_id):
+        buzon_id = None
+
+    try:
+        # Se escribe solo si cambio. Escribir lo mismo en cada pasada provoca
+        # redibujados que no hacen falta.
+        if session_id and st.query_params.get("charla") != session_id:
+            st.query_params["charla"] = session_id
+        if buzon_id and st.query_params.get("buzon") != buzon_id:
+            st.query_params["buzon"] = buzon_id
+    except Exception:
+        pass  # sin direccion editable se sigue como antes; no es critico
+
+
+def _historial_con_bienvenida(guardados: list) -> list:
+    """
+    Compone los mensajes a pintar a partir de lo que hay guardado.
+
+    Args:
+        guardados: Mensajes recuperados de la memoria.
+
+    Returns:
+        El historial, con el saludo delante si no lo traia ya.
+    """
+    if not guardados:
+        return list(_ESTADO_INICIAL["messages"])
+    ya_saluda = any(
+        m.get("role") == "assistant" and "Copiloto" in m.get("content", "")
+        for m in guardados[:1])
+    if ya_saluda:
+        return list(guardados)
+    return list(_ESTADO_INICIAL["messages"]) + list(guardados)
+
+
+try:
+    _charla_en_la_url = st.query_params.get("charla")
+    _buzon_en_la_url = st.query_params.get("buzon")
+except Exception:
+    _charla_en_la_url = _buzon_en_la_url = None
+
+# LO QUE VIENE DE LA DIRECCION SE MIRA ANTES DE CREERSELO
+# -------------------------------------------------------
+# La direccion la puede editar cualquiera, y ademas arrastra lo que hubiera
+# ahi de antes. Si llega algo que no tiene forma de identificador -- por
+# ejemplo el texto "Charla actual (en curso)", que es una ETIQUETA de la
+# barra lateral y llego a grabarse como id de una conversacion real -- se
+# ignora y se empieza limpio. Meter a alguien en una charla de hace tres
+# dias porque la direccion traia una etiqueta es peor que no recuperar nada.
+from core import memoria as _memoria_ids
+
+if not _memoria_ids.es_identificador_de_sesion(_charla_en_la_url):
+    _charla_en_la_url = None
+if not _memoria_ids.es_identificador_de_sesion(_buzon_en_la_url):
+    _buzon_en_la_url = None
+
+# Se sustituyen ANTES de sembrar el estado: asi la sesion nueva nace ya con
+# la charla de antes en vez de con una recien inventada.
+if _charla_en_la_url:
+    _ESTADO_INICIAL["session_id"] = _charla_en_la_url
+if _buzon_en_la_url:
+    _ESTADO_INICIAL["buzon_id"] = _buzon_en_la_url
+
+_sesion_recien_abierta = "session_id" not in st.session_state
+
 for clave, valor in _ESTADO_INICIAL.items():
     if clave not in st.session_state:
         st.session_state[clave] = valor
+
+# Si la sesion se acaba de abrir y la direccion apuntaba a una charla, se
+# recupera lo que se dijo en ella. Sin esto el identificador volveria bien
+# pero la pantalla seguiria en blanco, que para quien mira es lo mismo que
+# haberla perdido.
+if _sesion_recien_abierta and _charla_en_la_url:
+    try:
+        from core import memoria as _memoria_vuelta
+
+        _rescatado = _memoria_vuelta.cargar_historial(_charla_en_la_url)
+        if _rescatado:
+            st.session_state.messages = _historial_con_bienvenida(_rescatado)
+    except Exception:
+        pass  # si la memoria no responde, se empieza en blanco como antes
+
+# UNA PESTANA YA ENVENENADA SE CURA SOLA
+# ---------------------------------------
+# El identificador vive en la memoria de la pestana, y esa memoria sobrevive
+# a que se arregle el codigo y a que se limpie la base de datos. Una pestana
+# abierta de antes siguio mandando el texto "Charla actual (en curso)" como
+# identificador durante una hora despues de estar todo corregido: cada
+# pregunta se respondia y ningun intercambio se guardaba, con un "HTTP Error
+# 500" por toda explicacion.
+#
+# Asi que se comprueba en cada pasada. Si lo que hay no vale, se cambia por
+# uno nuevo en vez de esperar a que la persona recargue -- que es algo que
+# no tiene por que saber que hace falta.
+if not _memoria_ids.es_identificador_de_sesion(
+        st.session_state.get("session_id")):
+    st.session_state.session_id = "sesion_" + str(int(time.time()))[-6:]
+    st.session_state["selector_sesiones_sb"] = st.session_state.session_id
+    st.session_state.messages = list(_ESTADO_INICIAL["messages"])
+if not _memoria_ids.es_identificador_de_sesion(
+        st.session_state.get("buzon_id")):
+    st.session_state.buzon_id = "buzon_" + str(int(time.time() * 1000))[-9:]
+
+_recordar_en_la_direccion(st.session_state.get("session_id"),
+                          st.session_state.get("buzon_id"))
 
 
 # ==============================================================================
@@ -862,14 +1067,19 @@ with st.sidebar:
     from core import memoria
 
     if st.button("Nueva charla", use_container_width=True, type="primary"):
-        st.session_state.session_id = "sesion_" + str(int(time.time()))[-6:]
+        nuevo_id = "sesion_" + str(int(time.time()))[-6:]
+        st.session_state.session_id = nuevo_id
+        st.session_state["selector_sesiones_sb"] = nuevo_id
         st.session_state.messages = list(_ESTADO_INICIAL["messages"])
         st.session_state.pregunta_pendiente = None
+        _recordar_en_la_direccion(nuevo_id, st.session_state.get("buzon_id"))
         st.session_state.pop("editando_sesion", None)
         st.session_state.pop("borrando_sesion", None)
         st.rerun()
 
-    lista_sesiones = memoria.listar_sesiones(limite=20)
+    # Cincuenta y no veinte: con una charla por pregunta, veinte se llenan
+    # en una tarde y las de ayer desaparecian del desplegable sin aviso.
+    lista_sesiones = memoria.listar_sesiones(limite=50)
     if lista_sesiones:
         opciones = {s["id"]: s for s in lista_sesiones}
         if st.session_state.session_id not in opciones:
@@ -899,18 +1109,29 @@ with st.sidebar:
             titulo = s.get("titulo") or clave
             return f"{titulo} ({fecha})" if fecha else titulo
 
+        def _al_cambiar_sesion():
+            sel = st.session_state.get("selector_sesiones_sb")
+            # El desplegable ensena TITULOS y devuelve IDENTIFICADORES. Si lo
+            # que vuelve no tiene forma de identificador, algo se cruzo por el
+            # camino y mudarse ahi seria llevar a la persona a una charla que
+            # no ha pedido.
+            if not memoria.es_identificador_de_sesion(sel):
+                sel = None
+            if sel and sel != st.session_state.session_id:
+                st.session_state.session_id = sel
+                st.session_state.messages = _historial_con_bienvenida(
+                    memoria.cargar_historial(sel))
+                _recordar_en_la_direccion(
+                    sel, st.session_state.get("buzon_id"))
+                st.session_state.pop("editando_sesion", None)
+                st.session_state.pop("borrando_sesion", None)
+
+        if st.session_state.get("selector_sesiones_sb") not in claves:
+            st.session_state["selector_sesiones_sb"] = st.session_state.session_id
+
         seleccionada = st.selectbox(
             "Cargar conversación:", options=claves, format_func=_etiqueta,
-            index=idx, key="selector_sesiones_sb")
-
-        if seleccionada != st.session_state.session_id:
-            st.session_state.session_id = seleccionada
-            cargados = memoria.cargar_historial(seleccionada)
-            st.session_state.messages = (
-                cargados if cargados else list(_ESTADO_INICIAL["messages"]))
-            st.session_state.pop("editando_sesion", None)
-            st.session_state.pop("borrando_sesion", None)
-            st.rerun()
+            index=idx, key="selector_sesiones_sb", on_change=_al_cambiar_sesion)
 
         # --- Renombrar y eliminar ------------------------------------------
         # Van en dos pasos a proposito. Un boton de borrar que borra al primer
@@ -974,7 +1195,11 @@ with st.sidebar:
                         f"{res['recuerdos']} recuerdos.")
                 # Se sale de la charla borrada: quedarse en ella mostraria el
                 # historial en pantalla de algo que ya no existe.
-                st.session_state.session_id = "sesion_" + str(int(time.time()))[-6:]
+                nuevo_id_del = "sesion_" + str(int(time.time()))[-6:]
+                st.session_state.session_id = nuevo_id_del
+                st.session_state.pop("selector_sesiones_sb", None)
+                _recordar_en_la_direccion(
+                    nuevo_id_del, st.session_state.get("buzon_id"))
                 st.session_state.messages = list(_ESTADO_INICIAL["messages"])
                 st.rerun()
             if c2.button("No, cancelar", use_container_width=True):
@@ -1115,7 +1340,7 @@ with st.sidebar:
     # --- De donde estudia el agente, siempre a la vista --------------------
     # Estaba enterrado en una pestana. Saber si el agente lee de Drive o de la
     # carpeta local condiciona todo lo demas -- que documentos ve, que pasa
-    # esta noche a las 02:00 -- asi que tiene que verse sin ir a buscarlo.
+    # en la proxima pasada del cron -- asi que tiene que verse sin ir a buscarlo.
     from core import conexion_drive as _cdrive
 
     _est_drive = _cdrive.estado()
@@ -1164,7 +1389,18 @@ with st.sidebar:
         # con Drive ni siquiera queda en disco.
         _bib = dict(_bib)
         _bib["fichas"] = (_est_bib.get("vectorial") or {}).get("fichas", 0)
+        # Ese numero SI esta contado: sale del indice, que lo sabe sin leer
+        # nada. Lo que no se cuenta es el corpus de la carpeta local.
+        _bib["fichas_contadas"] = True
     else:
+        # LA CAIDA A LOCAL NO PUEDE COSTAR MAS QUE LA PREGUNTA
+        # ----------------------------------------------------
+        # Si la API no contesta en 20 segundos se mira la carpeta, y eso esta
+        # bien mientras sea mirar. Durante un tiempo fue leer: `resumen()`
+        # reconstruia el corpus entero -- 3,26 GB -- dentro del proceso de la
+        # interfaz, que es de un solo hilo. La pagina se quedaba en blanco con
+        # el "Running" girando, y no por un cuelgue: estaba trabajando, solo
+        # que en algo que nadie habia pedido y que no terminaba nunca.
         _bib = _corpus.resumen()
 
     if _bib.get("disponible"):
@@ -1174,7 +1410,9 @@ with st.sidebar:
         st.markdown(
             _est.indicador(
                 f"{_bib['documentos']} documentos", "ok",
-                f"{_bib['fichas']:,} fichas".replace(",", ".")),
+                (f"{_bib['fichas']:,} fichas".replace(",", ".")
+                 if _bib.get("fichas_contadas", True)
+                 else "fichas sin contar")),
             unsafe_allow_html=True)
         # Las capas de datos, que se indexan de otra manera. Se nombran
         # aparte porque conviene saber a cuales NO se les puede preguntar
@@ -1213,7 +1451,7 @@ with st.sidebar:
         # una carpeta vacia: decirla ahi seria dar un dato falso con aire de
         # dato exacto. Se dice de donde salen los numeros, que es lo util.
         if (_bib.get("describe") or "local") == "local":
-            st.caption(f"Versión del corpus: `{_bib.get('version', '?')}`")
+            st.caption(f"Versión del corpus: `{_bib.get('version') or '?'}`")
         else:
             st.caption(f"Contado directamente en **{_bib['describe']}**; "
                        f"en el equipo no queda ningún documento.")
@@ -1256,7 +1494,7 @@ with st.sidebar:
 # ==============================================================================
 # AVISO DE CARGA, VISIBLE DESDE CUALQUIER PESTANA
 # ==============================================================================
-# La sincronizacion de las 10:30 la lanza n8n, no una persona. Si nadie esta
+# La sincronizacion de las 02:00 la lanza n8n, no una persona. Si nadie esta
 # mirando la pestana de Drive en ese momento, el trabajo ocurre sin que se vea
 # nada: se midio, y la pregunta que quedaba era "esta cargando o esta colgado".
 #
@@ -1265,6 +1503,77 @@ with st.sidebar:
 # banda y nada mas: la conversacion del chat no se recarga ni pierde el foco
 # del cuadro de texto, que es lo que pasaba al hacer `st.rerun()` de la pagina
 # entera.
+
+
+#: Fallos que se repiten y lo que de verdad significan. La clave es un trozo
+#: que aparece en el error tal como lo levanta Python; el valor, que paso y
+#: que hacer.
+#:
+#: POR QUE NO SE DEJA EL ERROR CRUDO Y YA
+#: ---------------------------------------
+#: "[Errno 2] No such file or directory: '...pdf.1-1326630830-496.parcial' ->
+#: '...pdf'" es exacto y no dice nada a quien lo lee. Lo que esa persona
+#: necesita saber es que el archivo se estaba bajando, que alguien borro la
+#: carpeta mientras tanto, y que volver a lanzar el estudio lo arregla. El
+#: texto crudo sigue estando, debajo, para quien tenga que mirarlo.
+EXPLICACIONES = (
+    (".parcial",
+     "Un archivo se estaba bajando de Drive y desapareció de la carpeta "
+     "antes de terminar. Casi siempre es que otra cosa borró la carpeta de "
+     "descargas mientras el estudio trabajaba: otro estudio a la vez, o una "
+     "batería de pruebas. Volver a lanzarlo lo arregla."),
+    ("RESOURCE_EXHAUSTED",
+     "Se agotó la cuota diaria del modelo que convierte el texto en números. "
+     "No se ha perdido nada de lo ya indexado: mañana continúa por donde iba."),
+    ("no llegaron a bajarse",
+     "Los documentos no estaban en el equipo cuando se fueron a leer. No es "
+     "un problema de lectura: es que la descarga no llegó a completarse. "
+     "Volver a lanzar el estudio lo arregla."),
+    ("File exists",
+     "Dos trabajos tocaron la carpeta de descargas a la vez. Volver a "
+     "lanzar el estudio lo arregla."),
+    ("se corto antes de terminar",
+     "El estudio no llegó al final porque el servicio se reinició o el "
+     "equipo se durmió. Lo ya indexado NO se pierde."),
+)
+
+
+def _en_cristiano(error: str) -> str:
+    """
+    Traduce un fallo de la API a algo que se pueda leer sin saber Python.
+
+    Args:
+        error: El texto del error tal como lo devuelve la API.
+
+    Returns:
+        La explicacion, o cadena vacia si ese fallo no esta reconocido.
+        Vacio significa "no se sabe", no "no pasa nada": quien llama sigue
+        enseñando el texto crudo.
+    """
+    for marca, explicacion in EXPLICACIONES:
+        if marca in (error or ""):
+            return explicacion
+    return ""
+
+
+def _cuando_fue(marca: str) -> str:
+    """
+    Pone una marca de tiempo ISO en castellano corriente.
+
+    Args:
+        marca: Fecha tipo "2026-11-10T00:35:59", como la guarda la API.
+
+    Returns:
+        Texto como "el 10/11/2026 a las 00:35". Vacio si no se entiende.
+    """
+    if not marca or "T" not in str(marca):
+        return ""
+    dia, hora = str(marca).split("T", 1)
+    try:
+        ano, mes, numero = dia.split("-")
+    except ValueError:
+        return ""
+    return f"el {numero}/{mes}/{ano} a las {hora[:5]}"
 
 
 def _tiempo_legible(segundos) -> str:
@@ -1304,7 +1613,7 @@ def _banda_de_carga() -> None:
     trabajo = trabajo or {}
     if not trabajo.get("ejecutando"):
         # Si el ultimo intento fallo, se dice aqui aunque ya no este en marcha:
-        # un fallo del cron de las 10:30 ocurre cuando nadie mira, y callarlo
+        # un fallo del cron de las 02:00 ocurre cuando nadie mira, y callarlo
         # equivale a no haberlo intentado.
         if trabajo.get("error"):
             # Se fecha. Un fallo sin fecha parece de ahora mismo, y este
@@ -1347,10 +1656,8 @@ _banda_de_carga()
 # PESTANAS
 # ==============================================================================
 
-tab_chat, tab_lote, tab_gps, tab_estudio, tab_drive = st.tabs([
+tab_chat, tab_estudio, tab_drive = st.tabs([
     "💬 Chat con el Agente",
-    "📊 Cálculo Masivo (Excel/CSV)",
-    "📍 Diagnóstico de Coordenadas",
     "⚙️ Área de Estudio",
     "☁️ Drive y Estudio",
 ])
@@ -1419,8 +1726,7 @@ with tab_chat:
         from core import pegado
 
         componentes.html(
-            pegado.guion(settings.api_url_navegador(),
-                         st.session_state.get("session_id", "default")),
+            pegado.guion(settings.api_url_navegador(), _buzon()),
             height=pegado.ALTO,
         )
 
@@ -1440,7 +1746,12 @@ with tab_chat:
         # portapapeles es siempre "image.png" y no dice nada: pegar dos
         # capturas distintas daba dos lineas identicas. Con la miniatura se
         # ve QUE se pego, y se puede quitar una sin tirar las demas.
-        pendientes_img = _imagenes_pegadas(con_datos=True)
+        # SIN `con_datos`: la galeria se pinta con la miniatura que la API
+        # ya calculo al guardar. Pedir las imagenes enteras aqui hacia
+        # viajar megabytes de la API a Streamlit en CADA redibujado de la
+        # pagina -- y la pagina se redibuja entera cada vez que se pega.
+        # La imagen completa se pide una sola vez, al enviar el mensaje.
+        pendientes_img = _imagenes_pegadas()
         if pendientes_img:
             peso = sum(i.get("bytes", 0) for i in pendientes_img)
             cabecera, boton = st.columns([5, 1])
@@ -1472,10 +1783,17 @@ with tab_chat:
             for _i, _img in enumerate(_a_la_vista):
                 with columnas[_i]:
                     try:
-                        # La miniatura se calcula aqui, no se deja al CSS:
-                        # ver `_miniatura`.
-                        st.image(_miniatura(_b64.b64decode(_img["datos"])),
-                                 use_container_width=True)
+                        # Ya viene hecha de la API. Si por lo que sea no
+                        # viniera, se cae al camino de antes en vez de
+                        # quedarse sin vista previa.
+                        _mini = _img.get("miniatura")
+                        if _mini:
+                            st.image(_b64.b64decode(_mini),
+                                     use_container_width=True)
+                        else:
+                            _entera = _imagenes_pegadas(con_datos=True)[_i]
+                            st.image(_miniatura(_b64.b64decode(
+                                _entera["datos"])), use_container_width=True)
                     except Exception:
                         # Una miniatura que no se puede pintar no debe
                         # impedir enviar la imagen: el modelo la mirara igual.
@@ -1489,6 +1807,35 @@ with tab_chat:
             if len(pendientes_img) > _CABEN:
                 st.caption(f"… y {len(pendientes_img) - _CABEN} más.")
 
+
+        # Selector nativo de archivo por si el portapapeles del navegador no responde
+        with st.popover("📎 Adjuntar archivo de imagen (PNG, JPG, WEBP)", use_container_width=False):
+            subida_chat = st.file_uploader(
+                "Selecciona una imagen",
+                type=["png", "jpg", "jpeg", "webp"],
+                key="uploader_imagen_chat_pop",
+                label_visibility="collapsed",
+            )
+            if subida_chat is not None:
+                clave_proc = f"_img_proc_{subida_chat.name}_{subida_chat.size}"
+                if not st.session_state.get(clave_proc):
+                    st.session_state[clave_proc] = True
+                    import base64 as _b64
+                    _datos_b64 = _b64.b64encode(subida_chat.getvalue()).decode("utf-8")
+                    _cod, _ = _api(
+                        "/chat/imagen",
+                        metodo="POST",
+                        cuerpo={
+                            "session_id": _buzon(),
+                            "nombre": subida_chat.name,
+                            "tipo": subida_chat.type or "image/png",
+                            "datos": _datos_b64,
+                        },
+                        espera=10,
+                    )
+                    if _cod == 200:
+                        st.toast(f"📷 Imagen '{subida_chat.name}' adjuntada con éxito")
+                        st.rerun()
 
         pregunta = st.chat_input(
             "Escribe tu pregunta (o pega una imagen con Ctrl+V)"
@@ -1557,266 +1904,6 @@ with tab_chat:
             "role": "user", "content": pregunta, "imagenes": _cuantas})
         st.session_state.pregunta_pendiente = pregunta
         st.rerun()
-
-
-# ------------------------------------------------------------------------------
-# PESTANA 2: CALCULO MASIVO
-# ------------------------------------------------------------------------------
-with tab_lote:
-    from core import estilos as _est_lote
-
-    st.markdown("## Cálculo masivo")
-    st.markdown(
-        '<div class="subtitulo">Sube tu matriz de valoraciones en Excel o CSV '
-        'y el sistema calcula la importancia y la severidad de cada fila, '
-        'con la metodología Conesa.</div>',
-        unsafe_allow_html=True)
-
-    # La plantilla de ejemplo se genera a partir de los rangos reales de la
-    # metodologia, no de una tabla escrita a mano en este archivo.
-    from core.validator import ConesaValidator
-
-    plantilla = pd.DataFrame([
-        {"id_valoracion": 1, "nombre_accion": "Ejemplo de acción",
-         "nombre_factor": "Ejemplo de factor", "signo": "-",
-         **{sigla: valores[0] for sigla, valores in ConesaValidator.RANGOS.items()}},
-        {"id_valoracion": 2, "nombre_accion": "Ejemplo de acción",
-         "nombre_factor": "Ejemplo de factor", "signo": "+",
-         **{sigla: valores[-1] for sigla, valores in ConesaValidator.RANGOS.items()}},
-    ])
-
-    with st.container(border=True):
-        st.markdown("#### 1 · La plantilla")
-        st.caption(
-            "Si es la primera vez, descarga la plantilla: trae las columnas "
-            "con los nombres exactos que el sistema espera y dos filas de "
-            "ejemplo con los valores extremos admitidos.")
-        columna_izq, columna_der = st.columns([1, 2])
-        with columna_izq:
-            st.download_button(
-                label="Descargar plantilla (.csv)",
-                data=plantilla.to_csv(index=False).encode("utf-8"),
-                file_name="plantilla_valoracion_conesa.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with columna_der:
-            with st.expander("Valores admitidos en cada parámetro"):
-                st.code(ConesaValidator.descripcion_rangos())
-
-    with st.container(border=True):
-        st.markdown("#### 2 · Tu matriz")
-        archivo_subido = st.file_uploader(
-            "Elige tu archivo Excel (.xlsx) o CSV", type=["xlsx", "csv"],
-            label_visibility="collapsed",
-        )
-
-        if archivo_subido is None:
-            # Estado vacio: decir QUE hacer, no solo que no hay nada.
-            st.caption(
-                "Arrastra aquí tu archivo, o pulsa para buscarlo. Nada se "
-                "envía fuera de este equipo: el archivo se procesa en el "
-                "servidor y se borra al terminar.")
-        else:
-            st.markdown(
-                _est_lote.indicador(archivo_subido.name, "ok",
-                                    _tamano_legible(archivo_subido.size)),
-                unsafe_allow_html=True)
-
-    if archivo_subido is not None:
-        if st.button("Calcular matriz de Conesa", type="primary",
-                     use_container_width=True):
-            with st.spinner("Procesando filas y validando parámetros..."):
-                # Los temporales van a la carpeta configurada, no al directorio
-                # de trabajo actual (que dependia de desde donde se lanzara).
-                carpeta = settings.carpeta_temporal()
-                extension = os.path.splitext(archivo_subido.name)[1]
-                ruta_entrada = os.path.join(carpeta, f"entrada{extension}")
-                ruta_salida = os.path.join(carpeta, f"resultado{extension}")
-
-                try:
-                    with open(ruta_entrada, "wb") as destino:
-                        destino.write(archivo_subido.getbuffer())
-
-                    from database.excel_connector import ExcelConnector
-                    resumen = ExcelConnector().procesar_archivo_evaluaciones(
-                        ruta_entrada, ruta_salida
-                    )
-
-                    st.markdown("#### 3 · Resultado")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Registros procesados", resumen["registros_procesados"])
-                    c2.metric("Cálculos exitosos", resumen["registros_exitosos"])
-                    c3.metric("Filas con error", resumen["registros_con_error"])
-
-                    if resumen["errores"]:
-                        with st.expander(
-                            f"Ver el detalle de las {len(resumen['errores'])} "
-                            f"filas rechazadas"
-                        ):
-                            st.dataframe(pd.DataFrame(resumen["errores"]))
-
-                    resultado = (
-                        pd.read_csv(ruta_salida)
-                        if ruta_salida.lower().endswith(".csv")
-                        else pd.read_excel(ruta_salida)
-                    )
-                    st.caption("Matriz calculada")
-                    st.dataframe(resultado, use_container_width=True)
-
-                    with open(ruta_salida, "rb") as fuente:
-                        st.download_button(
-                            label="Descargar resultados",
-                            use_container_width=True,
-                            data=fuente.read(),
-                            file_name=f"resultado_{archivo_subido.name}",
-                            mime=(
-                                "application/vnd.openxmlformats-officedocument"
-                                ".spreadsheetml.sheet"
-                                if ruta_salida.lower().endswith(".xlsx")
-                                else "text/csv"
-                            ),
-                        )
-
-                except Exception as exc:
-                    st.error(f"Error al procesar el archivo: {exc}")
-
-                finally:
-                    # Limpieza garantizada, haya funcionado o no.
-                    for temporal in (ruta_entrada, ruta_salida):
-                        if os.path.exists(temporal):
-                            try:
-                                os.remove(temporal)
-                            except OSError:
-                                pass
-
-
-# ------------------------------------------------------------------------------
-# PESTANA 3: DIAGNOSTICO DE COORDENADAS
-# ------------------------------------------------------------------------------
-with tab_gps:
-    from core import estilos as _est_gps
-
-    st.markdown("## Diagnóstico de coordenadas")
-    st.markdown(
-        '<div class="subtitulo">Introduce un punto para cruzarlo con la capa '
-        'municipal de tu área de estudio y con la Geodatabase.</div>',
-        unsafe_allow_html=True)
-
-    lat_defecto, lon_defecto = centro_del_area_de_estudio()
-    _hay_area = (lat_defecto, lon_defecto) != (0.0, 0.0)
-
-    with st.container(border=True):
-        if _hay_area:
-            st.markdown(
-                _est_gps.indicador(
-                    "Punto precargado", "ok",
-                    f"centro del área de estudio ({lat_defecto}, "
-                    f"{lon_defecto})"),
-                unsafe_allow_html=True)
-        else:
-            # Estado vacio que dice QUE hacer, no solo que falta algo.
-            st.markdown(
-                _est_gps.indicador("Sin área de estudio", "tibio",
-                                   "escribe las coordenadas a mano"),
-                unsafe_allow_html=True)
-            st.caption(
-                "Genera el área en la pestaña **Área de Estudio** y este "
-                "punto se precargará con su centro.")
-
-        col_lat, col_lon = st.columns(2)
-        latitud = col_lat.number_input("Latitud (WGS84)", value=lat_defecto,
-                                       format="%.5f")
-        longitud = col_lon.number_input("Longitud (WGS84)", value=lon_defecto,
-                                        format="%.5f")
-
-    if st.button("Consultar capas", type="primary",
-                 use_container_width=True):
-        with st.spinner("Proyectando el punto e intersectando polígonos..."):
-            try:
-                from database.gdb_connector import GDBConnector
-                diagnostico = GDBConnector().consultar_linea_base_coordenada(
-                    latitud, longitud
-                )
-
-                st.markdown("### Diagnóstico geográfico")
-
-                def _mostrar(valor):
-                    """
-                    Formatea un dato del diagnóstico para la tarjeta HTML.
-
-                    Args:
-                        valor: Dato leído del diagnóstico; puede ser None.
-
-                    Returns:
-                        El valor tal cual, o `<i>no determinado</i>` en
-                        cursiva. Nunca inventa un valor de relleno: un dato
-                        ausente debe verse distinto de un dato real.
-                    """
-                    return valor if valor else "<i>no determinado</i>"
-
-                st.markdown(f"""
-                <div class="card">
-                    <h4>📍 Ubicación</h4>
-                    <p><b>Departamento:</b> {_mostrar(diagnostico.get('departamento'))}</p>
-                    <p><b>Municipio:</b> {_mostrar(diagnostico.get('municipio'))}</p>
-                    <p><b>Vereda:</b> {_mostrar(diagnostico.get('vereda'))}</p>
-                    <p><b>Cuenca hidrográfica:</b> {_mostrar(diagnostico.get('cuenca'))}</p>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # --- Areas protegidas -----------------------------------------
-                # Tres estados posibles, y la diferencia importa: rojo = hay
-                # colisión, verde = se verificó y no hay, amarillo = NO se pudo
-                # verificar. La versión anterior pintaba verde también en el
-                # tercer caso, lo que equivalía a dar vía libre sin mirar.
-                protegidas = diagnostico.get("areas_protegidas")
-                if protegidas is None:
-                    st.warning(
-                        "⚠️ **Áreas protegidas (RUNAP): NO EVALUADO.** No hubo "
-                        "capa disponible para verificarlo. Esto **no** "
-                        "significa que el punto esté libre de restricciones."
-                    )
-                elif protegidas:
-                    st.error(
-                        "⛔ **COLISIÓN CON ÁREA PROTEGIDA (RUNAP):** "
-                        + ", ".join(protegidas)
-                    )
-                else:
-                    st.success(
-                        "✅ **Áreas protegidas:** verificado, el punto está "
-                        "fuera de áreas del RUNAP."
-                    )
-
-                # --- Paramos ---------------------------------------------------
-                paramo = diagnostico.get("paramo")
-                if paramo is None:
-                    st.warning(
-                        "⚠️ **Ecosistemas de páramo: NO EVALUADO.** No hubo "
-                        "capa disponible para verificarlo."
-                    )
-                elif paramo:
-                    st.error(
-                        "⛔ **COLISIÓN CON ECOSISTEMA DE PÁRAMO.** "
-                        "Restricciones ambientales muy severas."
-                    )
-                else:
-                    st.success(
-                        "✅ **Páramos:** verificado, el punto está fuera de "
-                        "complejos de páramo delimitados."
-                    )
-
-                if diagnostico.get("advertencias"):
-                    with st.expander("Notas técnicas del diagnóstico"):
-                        for nota in diagnostico["advertencias"]:
-                            st.write(f"- {nota}")
-
-                if diagnostico.get("fuentes"):
-                    with st.expander("¿De dónde salió cada dato?"):
-                        st.json(diagnostico["fuentes"])
-
-            except Exception as exc:
-                st.error(f"Error al consultar la información espacial: {exc}")
 
 
 # ------------------------------------------------------------------------------
@@ -1990,7 +2077,7 @@ with tab_estudio:
             # recoge las capas propias, asi que el mapa los muestra sin
             # tocar ese script.
             _capa_campo = None
-            if _revision["sirve"]:
+            if _revision["sirve"] is True:
                 _capa_campo = _campo.exportar_capa(_revision,
                                                    _subido_campo.name)
 
@@ -2025,20 +2112,45 @@ with tab_estudio:
                                        + ", ".join(_capa["columnas"][:14]))
 
             # --- El veredicto -------------------------------------------------
-            _m1, _m2, _m3 = st.columns(3)
-            _m1.metric("Puntos leídos", _r.get("puntos", 0))
-            _m2.metric("Dentro del área", _r.get("dentro", 0))
-            _m3.metric("Fuera del área", _r.get("fuera", 0))
-
-            if _revision["sirve"]:
-                st.success(
-                    "**La información es válida.** Todos los puntos caen "
-                    "dentro del área de estudio y las coordenadas son "
-                    "coherentes.")
+            # TRES CASOS, NO DOS
+            # ------------------
+            # Habia "vale" y "no vale", y el paquete que genera el propio
+            # sistema caia en el segundo: salia en rojo, "la informacion NO
+            # se puede dar por buena", por 361 puntos fuera del area que
+            # eran lineas de fallas geologicas nacionales. Suspender algo
+            # que uno mismo escribio no es un veredicto: es ruido que tapa
+            # los veredictos de verdad.
+            if _revision.get("propio"):
+                _m1, _m2 = st.columns(2)
+                _m1.metric("Capas que trae", _r.get("capas", 0))
+                _m2.metric("Geometrías puntuales", _r.get("puntos", 0))
+                st.info(_revision.get("explicacion", ""))
             else:
-                st.error("**La información NO se puede dar por buena.**")
-                for _problema in _revision["problemas"]:
-                    st.markdown(f"- {_problema}")
+                # Cuatro cifras y no tres: la suma tiene que cuadrar con lo
+                # que dice el veredicto justo debajo. Con "fuera: 361"
+                # encima de "1 punto cae fuera", el panel se contradecia a
+                # si mismo.
+                _m1, _m2, _m3, _m4 = st.columns(4)
+                _m1.metric("Puntos leídos", _r.get("puntos", 0))
+                _m2.metric("Dentro del área", _r.get("dentro", 0))
+                _m3.metric("Recorridos que entran",
+                           _r.get("recorridos_fuera", 0),
+                           help="Líneas que nacen fuera del área y entran "
+                                "después. Es lo normal en un cauce: no "
+                                "invalidan nada.")
+                _m4.metric("Fuera del área", _r.get("fuera", 0),
+                           help="Fichas tomadas fuera del área. Éstas sí "
+                                "impiden dar la información por buena.")
+
+                if _revision["sirve"]:
+                    st.success(
+                        "**La información es válida.** Todos los puntos "
+                        "caen dentro del área de estudio y las coordenadas "
+                        "son coherentes.")
+                else:
+                    st.error("**La información NO se puede dar por buena.**")
+                    for _problema in _revision["problemas"]:
+                        st.markdown(f"- {_problema}")
 
             for _aviso in _revision["avisos"]:
                 st.warning(_aviso)
@@ -2062,7 +2174,12 @@ with tab_estudio:
                             f"… y {len(_revision['puntos']) - 60} más.")
 
             # --- Guardar o no --------------------------------------------------
-            if _revision["sirve"]:
+            if _revision.get("propio"):
+                st.caption(
+                    "No se ofrece guardarlo como salida de campo validada "
+                    "porque no lo es. El paquete está bien: ábrelo en QGIS."
+                )
+            elif _revision["sirve"]:
                 if st.button("Guardar como validado", type="primary",
                              key="guardar_campo"):
                     _destino = os.path.join("data", "campo_validado")
@@ -2092,18 +2209,40 @@ with tab_estudio:
                         f"Área de estudio: "
                         f"{_vigente.get('nombre', 'sin fijar')}.",
                         f"Archivo: {_subido_campo.name} ({_r.get('formato')}).",
-                        f"Puntos: {_r.get('puntos')}, dentro "
-                        f"{_r.get('dentro')}, fuera {_r.get('fuera')}.",
                     ]
+                    if _revision.get("propio"):
+                        # No se le pide que interprete un veredicto que no
+                        # existe: se le dice QUE ES el archivo. Antes se le
+                        # mandaba "esta es la revisión de una salida de
+                        # campo" y el agente razonaba sobre una salida que
+                        # nunca hubo.
+                        _detalle.append(
+                            f"NO es una salida de campo: es el paquete de "
+                            f"QGIS que genera este mismo sistema, con "
+                            f"{_r.get('capas')} capas y {_r.get('puntos')} "
+                            f"geometrías puntuales.")
+                        _encargo = (
+                            "Le han subido a la pestaña de validación de "
+                            "campo un archivo que generó el propio sistema. "
+                            "No hay nada que validar. Explica en dos frases "
+                            "para qué sirve ese paquete y qué archivo sí "
+                            "habría que subir aquí.")
+                    else:
+                        _detalle.append(
+                            f"Puntos: {_r.get('puntos')}, dentro "
+                            f"{_r.get('dentro')}, recorridos que entran "
+                            f"{_r.get('recorridos_fuera')}, fuera "
+                            f"{_r.get('fuera')}.")
+                        _encargo = (
+                            "Esta es la revisión automática de una salida "
+                            "de campo. NO vuelvas a juzgar si es válida: "
+                            "eso ya está decidido. Explica qué implica para "
+                            "el estudio de impacto y qué conviene hacer.")
                     _detalle += [f"Problema: {x}"
                                  for x in _revision["problemas"]]
                     _detalle += [f"Aviso: {x}" for x in _revision["avisos"]]
-                    _pregunta = (
-                        "Esta es la revisión automática de una salida de "
-                        "campo. NO vuelvas a juzgar si es válida: eso ya está "
-                        "decidido. Explica qué implica para el estudio de "
-                        "impacto y qué conviene hacer.\n\n"
-                        + "\n".join(_detalle))
+                    _pregunta = (_encargo + chr(10) + chr(10)
+                                 + chr(10).join(_detalle))
                     _cod, _resp = _api("/agente/chat", "POST", {
                         "pregunta": _pregunta,
                         "sesion": st.session_state.session_id,
@@ -2142,7 +2281,7 @@ with tab_estudio:
 #
 #   1. Saber si la conexion con la fuente documental funciona ANTES de lanzar
 #      nada. Hasta ahora, si faltaba una credencial uno se enteraba cuando la
-#      sincronizacion de las 02:00 fallaba de madrugada.
+#      sincronizacion del cron fallaba de madrugada.
 #   2. Mandar al agente a estudiar cuando uno quiera, sin esperar al reloj.
 # ------------------------------------------------------------------------------
 
@@ -2182,9 +2321,17 @@ with tab_drive:
     _llave_vuelta = st.query_params.get("state")
     if _codigo and _llave_vuelta:
         _espera = conexion_drive.recoger_pendiente(_llave_vuelta)
-        # El codigo vale una sola vez: se limpia la direccion para que
+        # El codigo vale una sola vez: se quita de la direccion para que
         # recargar la pagina no intente canjearlo otra vez.
-        st.query_params.clear()
+        #
+        # Se quitan SOLO `code` y `state`. Antes se vaciaba la direccion
+        # entera, y ahi tambien viven `charla` y `buzon`: conectar Drive te
+        # dejaba en una conversacion nueva y en blanco.
+        for _sobra in ("code", "state"):
+            try:
+                del st.query_params[_sobra]
+            except KeyError:
+                pass
         if not _espera:
             st.error(
                 "Llegó una autorización de Google, pero ya había caducado o "
@@ -2252,6 +2399,11 @@ with tab_drive:
             )
             cda, cdb = st.columns([1, 1])
             if cda.button("Volver a probar", use_container_width=True):
+                # Ademas de probar la conexion, se le dice a la API que tire
+                # el inventario guardado. Si no, "volver a probar" decia que
+                # todo va bien y seguia enseniando el recuento de hace un
+                # rato, que es justo lo que se queria comprobar.
+                _api("/corpus/fuente?refrescar=true", espera=60)
                 _p = conexion_drive.probar_conexion(
                     conexion_drive.ruta_credencial(), _drive["carpeta_id"])
                 if _p["conecta"]:
@@ -2468,8 +2620,9 @@ with tab_drive:
     # La hora vive en un sitio solo, el nodo de n8n.
     st.caption(
         "Lo mismo que hace el estudio programado, pero cuando tú quieras. "
-        "Solo procesa lo que ha cambiado: si no hay nada nuevo, termina en "
-        "segundos."
+        "Lo lanza esta interfaz directamente contra la API; n8n solo se "
+        "encarga del estudio a su hora. Abajo se dice de dónde vino el "
+        "último."
     )
 
     # --- Aviso de lo que se va a PERDER ------------------------------------
@@ -2514,11 +2667,13 @@ with tab_drive:
     with st.expander("Opciones avanzadas"):
         forzar = st.checkbox(
             "Volver a estudiarlo todo, incluso lo que no ha cambiado",
-            help="Sin marcar, el botón solo lee lo que cambió en la fuente: "
-                 "lo demás ya está en el índice y se deja como está. "
-                 "Marcada, vuelve a leer TODO desde cero. Gasta mucha más "
-                 "cuota del modelo: úsala solo si sospechas que el índice "
-                 "quedó mal.",
+            help="NO es lo mismo que el botón a secas. Sin marcar se leen "
+                 "solo los archivos que cambiaron en Drive, más aquellos "
+                 "cuyo formato el sistema ha aprendido a leer mejor desde "
+                 "la última vez; lo demás ya está en el índice y se deja "
+                 "como está. Marcada, se relee TODO desde cero, y eso "
+                 "cuesta muchísima cuota del modelo. Sirve cuando se "
+                 "sospecha que el índice quedó mal.",
         )
     if forzar:
         st.caption(
@@ -2532,8 +2687,14 @@ with tab_drive:
     )
 
     if lanzar:
+        # Se dice QUIEN lo lanza. El registro ya guardaba ese dato y el
+        # boton no lo rellenaba nunca, asi que todo estudio hecho a mano
+        # quedaba como "sin identificar" y no habia forma de distinguirlo
+        # del que lanza n8n a su hora.
         codigo_s, respuesta = _api("/corpus/sincronizar", "POST",
-                                   {"forzar": bool(forzar)}, espera=30)
+                                   {"forzar": bool(forzar),
+                                    "origen": "boton de la interfaz"},
+                                   espera=30)
         if codigo_s == 409:
             st.warning("Ya hay un estudio en marcha. Abajo verás cómo va.")
         elif codigo_s != 200:
@@ -2555,10 +2716,45 @@ with tab_drive:
                        "servidor.")
             if st.button("Actualizar progreso", key="refrescar_sincro"):
                 st.rerun()
-        elif sincro.get("error"):
-            st.error("El último estudio falló: {}".format(sincro["error"]))
+        elif sincro.get("error") or (sincro.get("anterior")
+                                     or {}).get("error"):
+            # UN FALLO SIN FECHA PARECE DE AHORA MISMO
+            # ----------------------------------------
+            # Este aviso decia "El ultimo estudio fallo:" y pegaba el error de
+            # Python tal cual. Quien lo leia no podia saber si era de hace un
+            # minuto o de anteanoche, ni quien lo habia lanzado, ni que hacer.
+            # Y como el aviso se queda hasta que OTRO estudio termine bien, al
+            # relanzar seguia ahi y parecia que el fallo se repetia solo.
+            #
+            # Ademas se lee tambien el registro en disco, no solo lo que hay
+            # en memoria: al reiniciar la API, un fallo de media hora antes
+            # desaparecia de esta pestana y la pantalla decia "Sin estudios en
+            # esta sesion" sobre un estudio que si hubo y si fallo.
+            _antes = sincro.get("anterior") or {}
+            _fallo = sincro.get("error") or _antes.get("error") or ""
+            _fecha = _cuando_fue(_antes.get("cuando"))
+            _quien = _antes.get("origen") or sincro.get("origen") or ""
+            _cabeza = "⚠️ El último estudio falló"
+            if _fecha:
+                _cabeza += f" — empezó {_fecha}"
+            if _quien:
+                _cabeza += f", lo lanzó {_quien}"
+            _claro = _en_cristiano(_fallo)
+            _dos_lineas = chr(10) + chr(10)
+            st.error(_cabeza + (_dos_lineas + _claro if _claro
+                                else ": " + str(_fallo)[:300]))
+            st.caption("Es ese estudio, no uno de ahora: el aviso se queda "
+                       "hasta que otro termine bien. Si acabas de lanzar uno, "
+                       "míralo en la barra de progreso.")
+            with st.expander("Detalle técnico del fallo"):
+                st.code(str(_fallo), language="text")
+                if _antes.get("mensaje"):
+                    st.caption(_antes["mensaje"])
         else:
-            st.caption(sincro.get("mensaje") or "Sin estudios en esta sesión.")
+            _de = sincro.get("origen") or ""
+            _cola = f" · lo lanzó {_de}" if _de else ""
+            st.caption((sincro.get("mensaje")
+                        or "Sin estudios en esta sesión.") + _cola)
 
         _bloque = estado_api.get("corpus", {})
         _vect = estado_api.get("vectorial", {})

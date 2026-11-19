@@ -465,6 +465,113 @@ try:
               _con_fondo == 4,
               f"{_con_fondo}/4 esquinas con imagen de satelite")
 
+
+    # ==========================================================================
+    # EL AREA DE ESTUDIO, POR ENCIMA DE TODO
+    # ==========================================================================
+    # Este apartado nacio de una pantalla. El mapa traia doce capas -- areas
+    # protegidas, fallas, unidades geologicas, puntos de campo -- y no habia
+    # forma de saber de donde era: el limite del municipio era un poligono
+    # mas, dibujado en blanco, debajo de los otros 444 poligonos y fuera del
+    # encuadre, que abarcaba las capas nacionales recortadas con holgura.
+    #
+    # Un mapa de un area de estudio tiene que decir de que area es.
+    print("\n--- El area de estudio manda ---")
+
+    # El proyecto se reabre: los apartados anteriores lo movieron de carpeta
+    # y lo volvieron a leer, asi que las capas de mas arriba ya no existen.
+    _proyecto.clear()
+    _proyecto.read(os.path.join(_carpeta, "proyecto.qgs"))
+    _vivas = [c for c in _proyecto.mapLayers().values()
+              if isinstance(c, QgsVectorLayer)]
+    _orden = [c.name() for c in _proyecto.layerTreeRoot().layerOrder()]
+
+    _ficha = _pq.ficha_del_area()
+    comprobar("se sabe como se llama el area de estudio",
+              bool(_ficha.get("nombre")),
+              _ficha.get("nombre") or "no hay area fijada")
+
+    _nombre_area = _ficha.get("nombre", "")
+    _del_area = [c for c in _hecho["capas"] if c.get("destacada")]
+    comprobar("el paquete trae marcado el limite del area",
+              len(_del_area) == 1,
+              _del_area[0]["nombre"] if _del_area else "ninguna destacada")
+
+    if _del_area:
+        comprobar("la capa se llama como el area, no como el archivo",
+                  _nombre_area and _del_area[0]["nombre"].startswith(
+                      _nombre_area),
+                  f"{_del_area[0]['nombre']!r}, no 'Municipios filtrados'")
+
+        comprobar("va la PRIMERA del arbol, encima de todas las demas",
+                  _orden and _orden[0] == _del_area[0]["nombre"],
+                  f"arriba esta {_orden[0]!r}" if _orden else "arbol vacio")
+
+        _capa_area = next((c for c in _vivas
+                           if c.name() == _del_area[0]["nombre"]), None)
+        comprobar("QGIS la abre como capa valida",
+                  _capa_area is not None and _capa_area.isValid(),
+                  _del_area[0]["nombre"])
+
+        if _capa_area is not None:
+            _simbolo = _capa_area.renderer().symbol()
+            _capa_simbolo = _simbolo.symbolLayer(0)
+            _relleno = _capa_simbolo.color()
+            comprobar("no lleva relleno: estando arriba, taparia el resto",
+                      _relleno.alpha() == 0
+                      or _capa_simbolo.brushStyle() == 0,
+                      f"opacidad del relleno {_relleno.alpha()} de 255")
+
+            _borde = _capa_simbolo.strokeColor().name()
+            _otros = []
+            for _c in _vivas:
+                if _c is _capa_area:
+                    continue
+                try:
+                    _otros.append(_c.renderer().symbol().color().name())
+                    _otros.append(
+                        _c.renderer().symbol().symbolLayer(0)
+                        .strokeColor().name())
+                except Exception:
+                    pass
+            comprobar("su color no lo usa ninguna otra capa",
+                      _borde not in _otros,
+                      f"{_borde} frente a {len(set(_otros))} colores mas")
+
+            comprobar("lleva etiqueta, que es lo que DICE donde queda",
+                      _capa_area.labelsEnabled(),
+                      "el nombre se escribe sobre el mapa")
+
+    # El encuadre de salida: el area, no la suma de todo lo que haya.
+    with open(os.path.join(_carpeta, "proyecto.qgs"),
+              encoding="utf-8") as _fh:
+        _xml = _fh.read()
+    _caja = re.search(r"<mapcanvas.*?<extent>(.*?)</extent>", _xml, re.S)
+    _nums = [float(v) for v in re.findall(r">(-?[\d.]+)<", _caja.group(1))]
+    _ancho_vista = _nums[2] - _nums[0]
+    if _del_area:
+        _l = _del_area[0]["limites"]
+        _ancho_area = _l[2] - _l[0]
+        comprobar("el mapa se abre sobre el area, no sobre todo el pais",
+                  _ancho_vista < _ancho_area * 1.5,
+                  f"{_ancho_vista:.3f} grados de vista para un area de "
+                  f"{_ancho_area:.3f}")
+
+    comprobar("el titulo del proyecto nombra el area, y no va escrito a mano",
+              _nombre_area and _nombre_area in _xml,
+              f"el .qgs dice {_nombre_area!r}")
+
+    # Y entra aunque no se pida: un mapa que no dice de donde es obliga a
+    # adivinarlo por el relieve.
+    _sin_area = [r for r in _fuentes
+                 if os.path.basename(r) != _pq.ARCHIVO_AREA]
+    if _sin_area and len(_sin_area) < len(_fuentes):
+        _otro = _pq.construir(os.path.join(_banco, "sin_pedirla.zip"),
+                              _sin_area)
+        comprobar("el area entra aunque no se incluya en la lista",
+                  any(c.get("destacada") for c in _otro["capas"]),
+                  "se anade sola")
+
     _proyecto.clear()
 finally:
     shutil.rmtree(_banco, ignore_errors=True)

@@ -124,9 +124,53 @@ class GDBConnector:
         Returns:
             Lista de nombres. Vacia si no se pudo leer.
         """
+        return [c["capa"] for c in cls._inventario(ruta)]
+
+    @staticmethod
+    def _inventario(ruta: str) -> list:
+        """
+        Lista las capas de una Geodatabase con la herramienta que haya.
+
+        POR QUE HAY DOS CAMINOS
+        -----------------------
+        El rapido es pyogrio, que es GDAL por debajo y lee cualquier cosa.
+        No esta instalado en el contenedor -- son cientos de megas de
+        dependencias nativas -- asi que en la practica nunca se usaba, y
+        este modulo devolvia siempre una lista vacia sin decir por que.
+
+        El segundo es el lector propio del proyecto, en Python puro. Lee
+        menos cosas, pero lee las que llegan: el catalogo de capas, sus
+        campos y sus filas.
+
+        Args:
+            ruta: Ruta de la Geodatabase.
+
+        Returns:
+            Lista de diccionarios `{"capa", "geometria"}`.
+        """
         try:
             import pyogrio
-            return [nombre for nombre, _ in pyogrio.list_layers(ruta)]
+            return [{"capa": nombre, "geometria": geometria}
+                    for nombre, geometria in pyogrio.list_layers(ruta)]
+        except ImportError:
+            pass
+        except Exception:
+            return []
+
+        try:
+            from core import geodatabase
+            abierta = geodatabase.abrir(ruta)
+            if abierta.get("error"):
+                return []
+            salida = []
+            for tabla in abierta.get("tablas") or []:
+                leida = geodatabase.leer_tabla(tabla["archivo"], maximo=1)
+                salida.append({
+                    "capa": tabla["nombre"],
+                    "geometria": ("si" if (leida.get("geometria") or {})
+                                  else "sin geometria"),
+                })
+            return salida
         except Exception:
             return []
 
@@ -199,15 +243,11 @@ class GDBConnector:
         """
         if not self.disponible:
             return []
-
-        import pyogrio
-        try:
-            return [
-                {"capa": nombre, "geometria": geometria}
-                for nombre, geometria in pyogrio.list_layers(self.gdb_path)
-            ]
-        except Exception:
-            return []
+        # `import pyogrio` estaba FUERA del try, asi que en un equipo sin esa
+        # biblioteca esta llamada no devolvia una lista vacia: reventaba. No
+        # se habia notado porque hasta ahora nunca habia una .gdb en disco
+        # con la que llegar hasta aqui.
+        return self._inventario(self.gdb_path)
 
     def nombres_capas(self) -> list:
         """

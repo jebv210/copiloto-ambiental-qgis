@@ -109,7 +109,43 @@ Comprueba:
   puertas de entrada (local y Drive) están registradas, y una fuente
   desconocida se rechaza con un mensaje claro
 
-### 5. `probar_qgis.py` — 13 comprobaciones
+### 5. `probar_geometria.py` — 45 comprobaciones
+
+No necesita Docker ni red: los shapefiles de prueba se escriben byte a byte
+durante la propia batería, así que corre en una máquina recién clonada.
+
+```bash
+docker compose exec api python probar_geometria.py
+```
+
+Nació de un archivo concreto: un `.zip` de Drive con el Registro Único
+Nacional de Áreas Protegidas, 1.882 polígonos reales de Colombia, que el
+sistema leía entero, indexaba como texto y tiraba. Al preguntarle por él, el
+agente contestaba que no lo tenía analizado.
+
+Comprueba:
+
+- Que las **proyecciones** se invierten bien sin GDAL, contra valores que se
+  pueden verificar: el origen de Web Mercator cae en 0,0; media vuelta son 90
+  grados; el meridiano central de la zona UTM 18N es −75
+- Que una proyección **desconocida** se declara en vez de adivinarse, y que
+  sin `.prj` la capa **no se da por situada**
+- Que un polígono **con agujero** sigue siendo un polígono, y no dos
+- Que las coordenadas salen en **grados**, no en los metros de la proyección
+- Que **tocar** el área de estudio y **quedar cerca** no son lo mismo
+- Que los enteros de longitud variable de una geodatabase se leen con su
+  signo: `0x41` es −1, no 65
+- Que el filtro de nombres de columna rechaza lo que sale de empezar a leer
+  UTF-16 un byte tarde, que es lo que hacía perder cuatro de las seis
+  columnas del Atlas Geológico
+- Que una tabla de 50 filas **se resume** en 217 caracteres en vez de
+  gastarse el presupuesto de fichas repitiendo once palabras
+- Que subir la **versión de lectura** de un formato rehace sólo ese formato
+- Y, de punta a punta: que un `.zip` con un shapefile dentro acaba siendo un
+  `.geojson` en grados dentro de `capas_extra/`, con sus atributos indexados
+  **una sola vez** y no dos
+
+### 6. `probar_qgis.py` — 13 comprobaciones
 
 No necesita Docker, pero sí QGIS. Si QGIS no está instalado en la máquina, la
 batería **se omite** en vez de fallar.

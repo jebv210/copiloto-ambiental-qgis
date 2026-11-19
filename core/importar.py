@@ -378,7 +378,7 @@ def _consola() -> int:
 def _informar() -> None:
     """Imprime que fuentes importadas hay en el corpus."""
     filas = procedencias()
-    estado = corpus.resumen()
+    estado = corpus.resumen(reconstruir=True)
     print("CORPUS DEL AGENTE")
     print("=" * 74)
     print(f"  Carpeta    : {corpus.carpeta_corpus()}")

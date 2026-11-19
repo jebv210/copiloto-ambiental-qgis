@@ -62,6 +62,8 @@ import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
 
+from core import capas
+
 from config import settings
 
 
@@ -210,8 +212,8 @@ def carpeta_corpus() -> str:
     Ubicacion de la carpeta de documentos.
 
     Se puede mover por completo con la variable de entorno `RUTA_CORPUS`, igual
-    que el resto de rutas del proyecto. Si no se indica, se usa `corpus/` dentro
-    del proyecto.
+    que el resto de rutas del proyecto. Si no se indica y la fuente activa es
+    Drive, toma los documentos descargados de la carpeta temporal de Drive.
 
     Returns:
         Ruta absoluta de la carpeta. Puede no existir todavia; quien llame debe
@@ -220,6 +222,16 @@ def carpeta_corpus() -> str:
     indicada = settings.env("RUTA_CORPUS")
     if indicada:
         return os.path.abspath(os.path.expanduser(indicada))
+    if settings.fuente_corpus() == "drive":
+        try:
+            from core import fuentes
+            f = fuentes.obtener()
+            if hasattr(f, "carpeta_temporal"):
+                temp = f.carpeta_temporal()
+                if os.path.isdir(temp):
+                    return temp
+        except Exception:
+            pass
     return settings.ruta_proyecto(CARPETA_CORPUS_DEFECTO)
 
 
@@ -320,6 +332,90 @@ def categorias(documentos: list = None) -> list:
     return sorted(conteo.items())
 
 
+#: Resumen del contenido de cada archivo ya leido, para no volver a leerlo
+#: mientras no cambie. La clave lleva tamano y fecha: si el archivo cambia,
+#: cambia la clave y se vuelve a resumir. Ver `_huella_del_archivo`.
+_HUELLAS = {}
+
+#: Cuantos resumenes se guardan. Son unos 100 bytes cada uno; 20.000 archivos
+#: distintos ocupan 2 MB y cubren de sobra cualquier corpus real.
+MAXIMO_HUELLAS = 20000
+
+
+def _huella_del_archivo(doc: dict) -> bytes:
+    """
+    Resume el contenido de un documento, sin releerlo si ya se hizo.
+
+    POR QUE HIZO FALTA ACORDARSE
+    ----------------------------
+    `version_corpus` lee los documentos ENTEROS, y eso estaba bien cuando el
+    corpus eran 134 archivos de texto: 0,06 segundos medidos. Con Drive la
+    carpeta pasó a tener 424 archivos y 3,26 GB -- geodatabases, raster, zips
+    de capas --, y cada llamada volvia a leerselos todos.
+
+    Lo grave no era el gasto, sino donde ocurria: `/corpus/estado` llama a
+    `resumen()`, que llamaba aqui. Preguntar "cuantos documentos hay" leia 3,26
+    GB de disco y resumia byte a byte, y como la interfaz pregunta eso al
+    pintarse, la pagina se quedaba cargando indefinidamente. Se midio: el
+    endpoint no contestaba en 30 segundos, con el contenedor al 100 % de CPU.
+
+    No se cambia QUE se resume -- la huella sigue siendo del contenido, que es
+    lo que hace reproducible un informe --, solo se deja de releer lo que no ha
+    cambiado. Un archivo distinto tiene otro tamano o otra fecha, y entonces se
+    vuelve a leer de verdad.
+
+    LA FECHA HAY QUE MIRARLA AL NANOSEGUNDO
+    ---------------------------------------
+    El inventario guarda `modificado` en segundos enteros, y con eso la
+    memoria se equivocaba: editar un archivo sin cambiarle el tamano, dentro
+    del mismo segundo en que se leyo, daba la misma clave y devolvia el
+    resumen viejo. La version del corpus no cambiaba y el indice se quedaba
+    con la lectura anterior -- exactamente lo que `version_corpus` existe
+    para impedir, y lo que su prueba comprueba. Por eso aqui la fecha se pide
+    al sistema de archivos con toda su precision en vez de reutilizar la del
+    inventario.
+
+    Queda un supuesto, y conviene decirlo: se da por bueno que un archivo con
+    el mismo tamano y la misma fecha al nanosegundo tiene el mismo contenido.
+    Es lo mismo que suponen `make` o `rsync`, y solo falla si alguien restaura
+    la fecha a mano despues de editar.
+
+    Args:
+        doc: Documento del inventario, con `ruta` y `bytes`.
+
+    Returns:
+        Los bytes del resumen SHA-256 del contenido, o del tamano si el
+        archivo no se puede leer.
+    """
+    try:
+        fecha = os.stat(doc["ruta"]).st_mtime_ns
+    except OSError:
+        fecha = None
+    clave = (doc["ruta"], doc.get("bytes"), fecha)
+    guardado = _HUELLAS.get(clave)
+    if guardado is not None:
+        return guardado
+
+    resumen = hashlib.sha256()
+    try:
+        with open(doc["ruta"], "rb") as f:
+            while True:
+                trozo = f.read(1 << 20)
+                if not trozo:
+                    break
+                resumen.update(trozo)
+        huella = resumen.digest()
+    except OSError:
+        # Un archivo que no se puede leer entra por su tamano, para que su
+        # desaparicion o su cambio de tamano si alteren la version.
+        huella = str(doc["bytes"]).encode()
+
+    if len(_HUELLAS) >= MAXIMO_HUELLAS:
+        _HUELLAS.clear()  # al corpus siguiente se vuelve a aprender
+    _HUELLAS[clave] = huella
+    return huella
+
+
 def version_corpus(documentos: list = None) -> str:
     """
     Huella reproducible del conjunto de documentos.
@@ -382,17 +478,7 @@ def version_corpus(documentos: list = None) -> str:
     resumen = hashlib.sha256()
     for doc in sorted(inventario, key=_portable):
         resumen.update(_portable(doc).encode("utf-8", "replace"))
-        try:
-            with open(doc["ruta"], "rb") as f:
-                while True:
-                    trozo = f.read(1 << 20)
-                    if not trozo:
-                        break
-                    resumen.update(trozo)
-        except OSError:
-            # Un archivo que no se puede leer entra por su tamano, para que su
-            # desaparicion o su cambio de tamano si alteren la version.
-            resumen.update(str(doc["bytes"]).encode())
+        resumen.update(_huella_del_archivo(doc))
     return f"{len(inventario)}docs-{resumen.hexdigest()[:8]}"
 
 
@@ -525,6 +611,53 @@ def _leer_pdf(ruta: str) -> list:
     return paginas
 
 
+#: Con que version se leyo cada formato, para rehacer lo que cambio.
+#:
+#: EL PROBLEMA QUE RESUELVE
+#: ------------------------
+#: El indice se rehace solo cuando cambia el ARCHIVO: se compara su md5 con
+#: el que quedo guardado y, si es el mismo, no se vuelve a leer. Es lo
+#: correcto el 99% de las veces y es lo que hace que una sincronizacion
+#: termine en segundos.
+#:
+#: Pero hay un caso en que falla, y se vio en este proyecto: cuando lo que
+#: cambia no es el archivo sino la FORMA DE LEERLO. El .zip de areas
+#: protegidas llevaba semanas en Drive, sin tocarse, indexado como una ficha
+#: que decia "este documento existe y es muy grande". Al ensenarle al
+#: sistema a leer shapefiles de verdad, ese .zip habria seguido con su ficha
+#: vieja para siempre: su md5 no habia cambiado, asi que nadie lo iba a
+#: mirar otra vez. El codigo mejoraba y el indice se quedaba atras.
+#:
+#: Subiendo aqui el numero de un formato, todos los documentos de ese
+#: formato se vuelven a leer en la siguiente sincronizacion. Solo esos: no
+#: tiene sentido rehacer 13.000 fichas de PDF porque se haya arreglado la
+#: lectura de un .zip.
+VERSIONES_LECTURA = {
+    # 2: lee la geometria, no solo la tabla; entiende carpetas .gdb.
+    ".zip": 2,
+    ".shp": 2,
+    ".dbf": 2,
+}
+
+
+def sufijo_de_lectura(nombre: str) -> str:
+    """
+    Devuelve la marca de version con que se leyo un archivo.
+
+    Se pega a su huella. Dos archivos identicos leidos con versiones
+    distintas tienen huellas distintas, que es justo lo que hace que el
+    segundo se vuelva a leer.
+
+    Args:
+        nombre: Nombre o ruta del archivo.
+
+    Returns:
+        Cadena como "/l2", o vacia si ese formato va por la primera.
+    """
+    version = VERSIONES_LECTURA.get(os.path.splitext(nombre)[1].lower(), 1)
+    return f"/l{version}" if version > 1 else ""
+
+
 #: Cuanto se admite descomprimir de un solo .zip.
 #:
 #: Es la defensa contra una "bomba zip": un archivo de pocos kilobytes que al
@@ -618,10 +751,89 @@ def _leer_zip(ruta: str) -> list:
                         shutil.copyfileobj(origen, salida)
                     extraidos.append((miembro.filename, destino))
 
+                # LA GEOMETRIA PRIMERO, Y MANDA SOBRE EL RESTO
+                # ---------------------------------------------
+                # Un shapefile y una geodatabase no son archivos sueltos:
+                # son capas repartidas en varios binarios que solo
+                # significan algo juntos. Se leen como capa -- geometria
+                # incluida, que es lo que el recorrido por extensiones no
+                # podia hacer -- y los archivos que las componen quedan
+                # marcados para no volver a pasar por ellos.
+                #
+                # Importa el orden. Hacerlo despues dejaba la tabla de
+                # atributos indexada dos veces, una por el .dbf suelto y
+                # otra por el .shp que lo lee al lado: el doble de fichas
+                # para el mismo dato.
+                cosecha = capas.buscar_y_cosechar(
+                    carpeta, os.path.splitext(os.path.basename(ruta))[0])
+                cubiertos = set()
+                for una in cosecha:
+                    if una.get("error"):
+                        continue
+                    origen = os.path.relpath(una.get("origen", ""), carpeta)
+                    cubiertos.add(origen.replace(chr(92), "/"))
+                    for bloque in capas.paginas_de_cosecha(una):
+                        paginas.append(
+                            (len(paginas) + 1,
+                             f"[Dentro de {os.path.basename(ruta)}]"
+                             + chr(10) + bloque))
+
+                # Las capas que no se pudieron situar se leen a la antigua:
+                # su texto sigue valiendo aunque su geometria no se pueda
+                # colocar. Lo que no se repite nunca es el .dbf de un
+                # shapefile, porque su .shp ya lo lee.
+                for una in cosecha:
+                    if una.get("error"):
+                        continue
+                    base = os.path.splitext(una.get("origen", ""))[0]
+                    for hermano in (".dbf", ".shx", ".prj", ".cpg"):
+                        cubiertos.add(os.path.relpath(
+                            base + hermano, carpeta).replace(chr(92), "/"))
+                for interno, destino in extraidos:
+                    if not interno.lower().endswith(".dbf"):
+                        continue
+                    if os.path.exists(os.path.splitext(destino)[0] + ".shp"):
+                        cubiertos.add(interno.replace(chr(92), "/"))
+
+                # Una geodatabase cuyas capas ya se cosecharon no se
+                # vuelve a volcar fila por fila: la cosecha deja el resumen
+                # del archivo entero y el detalle completo de lo que cae en
+                # el area, que es mejor y ocupa una decima parte. Solo se
+                # vuelca entera la que no se pudo leer como capa, para que
+                # al menos su texto entre.
+                fallidas = {}
+                for una in cosecha:
+                    origen = una.get("origen", "")
+                    if os.path.isdir(origen):
+                        fallidas[origen] = (fallidas.get(origen, False)
+                                            or bool(una.get("error")))
+                for nodo in sorted(os.listdir(carpeta)):
+                    completo = os.path.join(carpeta, nodo)
+                    if not (os.path.isdir(completo)
+                            and nodo.lower().endswith(".gdb")):
+                        continue
+                    if fallidas.get(completo) is False:
+                        for dentro, _d in extraidos:
+                            plano = dentro.replace(chr(92), "/")
+                            if plano.startswith(nodo + "/"):
+                                cubiertos.add(plano)
+                        continue
+                    for indice, texto in _leer_geodatabase(completo):
+                        paginas.append(
+                            (len(paginas) + 1,
+                             f"[Dentro de {os.path.basename(ruta)}: "
+                             f"{nodo}]" + chr(10) + texto))
+                    for dentro, _d in extraidos:
+                        plano = dentro.replace(chr(92), "/")
+                        if plano.startswith(nodo + "/"):
+                            cubiertos.add(plano)
+
                 leidos = 0
                 for interno, destino in extraidos:
                     if leidos >= MAXIMO_DENTRO_DEL_ZIP:
                         break
+                    if interno.replace(chr(92), "/") in cubiertos:
+                        continue
                     extension = os.path.splitext(interno)[1].lower()
                     if extension == ".zip" or extension not in LECTORES:
                         continue
@@ -637,12 +849,379 @@ def _leer_zip(ruta: str) -> list:
                         # Un archivo roto dentro del paquete no invalida el
                         # resto.
                         anotar_fallo_de_lectura(f"{ruta}::{interno}", exc)
+
+                resumen = capas.contar(cosecha)
+                if resumen:
+                    paginas.append(
+                        (len(paginas) + 1,
+                         f"[Capas de {os.path.basename(ruta)} listas para "
+                         f"QGIS]" + chr(10) + resumen))
             finally:
                 shutil.rmtree(carpeta, ignore_errors=True)
     except zipfile.BadZipFile as exc:
         anotar_fallo_de_lectura(ruta, exc)
         return []
     return paginas
+
+
+#: Cuantas filas de una tabla de geodatabase se escriben en las fichas.
+#:
+#: Una capa del Atlas Geologico trae 9.830 unidades y cada una es un dato
+#: con valor propio. Por encima de este tope se corta y SE DICE, igual que
+#: con la tabla de un shapefile.
+MAXIMO_FILAS_GDB = 3000
+
+
+def _leer_geodatabase(carpeta: str) -> list:
+    """
+    Lee una geodatabase de Esri y la devuelve como texto indexable.
+
+    POR QUE ES UNA CARPETA Y NO UN ARCHIVO
+    --------------------------------------
+    Porque una .gdb lo es: decenas de binarios con nombres numerados. Llega
+    siempre dentro de un .zip, y antes de esto el proyecto la descomprimia,
+    no reconocia ni una de sus extensiones y daba el archivo por vacio. En
+    el informe salia como "no dio texto, queda pendiente", que sugiere un
+    fallo pasajero cuando era una carencia: por muchas veces que se
+    reintentara, nunca iba a leer nada.
+
+    Args:
+        carpeta: Ruta de la carpeta .gdb.
+
+    Returns:
+        Lista de tuplas `(indice, texto)`, una por tabla y sus filas.
+    """
+    from core import geodatabase
+
+    abierta = geodatabase.abrir(carpeta)
+    if abierta.get("error"):
+        anotar_fallo_de_lectura(carpeta, abierta["error"])
+        return []
+
+    nombre = os.path.basename(carpeta)
+    tablas = abierta.get("tablas") or []
+    if not tablas:
+        anotar_fallo_de_lectura(
+            carpeta, "la geodatabase no trae ninguna capa de usuario")
+        return []
+
+    portada = [f"[Geodatabase {nombre}]",
+               f"{len(tablas)} capas: "
+               + ", ".join(t["nombre"] for t in tablas) + "."]
+    paginas = []
+
+    for tabla in tablas:
+        leida = geodatabase.leer_tabla(tabla["archivo"],
+                                       maximo=MAXIMO_FILAS_GDB)
+        if leida.get("error") and not leida.get("filas"):
+            portada.append(f"La capa {tabla['nombre']} no se pudo leer: "
+                           f"{leida['error']}")
+            continue
+
+        campos = [c for c in leida["campos"] if c["codigo"] != 7]
+        cabeza = [f"[Capa {tabla['nombre']} de {nombre}]",
+                  f"{leida['total']} registros y {len(leida['campos'])} "
+                  f"campos.",
+                  "Campos: " + ", ".join(c["nombre"] for c in campos)]
+        srs = (leida.get("geometria") or {}).get("srs")
+        if srs:
+            cabeza.append(f"Lleva geometria, en el sistema de referencia "
+                          f"{srs}.")
+        if leida["total"] > len(leida["filas"]):
+            cabeza.append(f"Se escriben los primeros {len(leida['filas'])} "
+                          f"registros de {leida['total']}.")
+        paginas.append((len(paginas) + 2, chr(10).join(cabeza)))
+
+        bloque = []
+        for fila in leida["filas"]:
+            texto = " | ".join(f"{k}: {v}" for k, v in fila.items()
+                               if k != (leida.get("geometria") or {}).get(
+                                   "campo"))
+            if texto:
+                bloque.append(texto)
+            if len(bloque) >= 200:
+                paginas.append((len(paginas) + 2, chr(10).join(bloque)))
+                bloque = []
+        if bloque:
+            paginas.append((len(paginas) + 2, chr(10).join(bloque)))
+
+    return [(1, chr(10).join(portada))] + paginas
+
+
+def _leer_pptx(ruta: str) -> list:
+    """
+    Lee una presentacion .pptx sin dependencias externas.
+
+    POR QUE NO SE USA python-pptx
+    -----------------------------
+    Porque no hace falta. Un .pptx es un ZIP con un XML por diapositiva, y
+    el texto son los nodos `<a:t>`, igual que un .docx guarda los suyos en
+    `<w:t>`. El proyecto ya lee .docx asi; anadir una dependencia nativa
+    para repetir la misma operacion solo complicaria la instalacion.
+
+    CADA DIAPOSITIVA ES UNA PAGINA
+    ------------------------------
+    Y es la decision importante. Una cita que diga "diapositiva 7" se puede
+    ir a comprobar; una que diga "la presentacion" no. Se ordenan por su
+    numero y no por como los lista el ZIP, que devuelve la 10 antes que la 2.
+
+    Las notas del ponente entran tambien. En una presentacion de catalogo
+    suelen llevar el nombre cientifico completo que en la diapositiva no
+    cabe, que es justo el dato que alguien va a buscar.
+
+    Args:
+        ruta: Ruta del archivo .pptx.
+
+    Returns:
+        Lista de tuplas `(numero de diapositiva, texto)`.
+    """
+    espacio = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+
+    def texto_de(datos):
+        """
+        Saca el texto de un XML de diapositiva.
+
+        Args:
+            datos: Bytes del XML.
+
+        Returns:
+            El texto, con un salto de linea por parrafo.
+        """
+        try:
+            arbol = ET.fromstring(datos)
+        except ET.ParseError:
+            return ""
+        lineas = []
+        for parrafo in arbol.iter(f"{espacio}p"):
+            trozos = [n.text for n in parrafo.iter(f"{espacio}t") if n.text]
+            if trozos:
+                lineas.append("".join(trozos))
+        return chr(10).join(lineas)
+
+    def numero_de(nombre):
+        """
+        Saca el numero de diapositiva de su nombre de archivo.
+
+        Args:
+            nombre: Ruta dentro del ZIP, como "ppt/slides/slide12.xml".
+
+        Returns:
+            El numero, o 0 si no se pudo leer.
+        """
+        cifras = "".join(c for c in os.path.basename(nombre) if c.isdigit())
+        return int(cifras) if cifras else 0
+
+    try:
+        with zipfile.ZipFile(ruta) as zf:
+            dentro = zf.namelist()
+            diapositivas = sorted(
+                (n for n in dentro
+                 if n.startswith("ppt/slides/slide") and n.endswith(".xml")),
+                key=numero_de)
+            if not diapositivas:
+                anotar_fallo_de_lectura(
+                    ruta, "el .pptx no trae ninguna diapositiva")
+                return []
+
+            paginas = []
+            for nombre in diapositivas:
+                numero = numero_de(nombre)
+                cuerpo = texto_de(zf.read(nombre))
+
+                # Las notas del ponente viven en otro archivo con el mismo
+                # numero. Van detras del texto de la diapositiva, marcadas,
+                # para que una cita no confunda lo proyectado con lo dicho.
+                notas = f"ppt/notesSlides/notesSlide{numero}.xml"
+                if notas in dentro:
+                    texto_notas = texto_de(zf.read(notas))
+                    # El numero de diapositiva se cuela como un parrafo
+                    # suelto en las notas; no aporta nada repetirlo.
+                    if texto_notas and texto_notas.strip() != str(numero):
+                        cuerpo += (chr(10) + "[Notas de la diapositiva "
+                                   + str(numero) + "] " + texto_notas)
+                if cuerpo.strip():
+                    paginas.append((numero or len(paginas) + 1, cuerpo))
+            return paginas
+    except (zipfile.BadZipFile, OSError, KeyError) as exc:
+        anotar_fallo_de_lectura(ruta, exc)
+        return []
+
+
+#: Etiquetas de un archivo RIS, con lo que significan.
+#:
+#: RIS es el formato en que los gestores bibliograficos exportan una
+#: referencia. Son dos letras y un valor por linea, y sin traducirlas el
+#: texto indexado seria "TY  - JOUR / AU  - Perez, J.", que no se parece a
+#: nada que alguien vaya a preguntar.
+ETIQUETAS_RIS = {
+    "TY": "Tipo", "TI": "Titulo", "T1": "Titulo", "AU": "Autor",
+    "A1": "Autor", "PY": "Ano", "Y1": "Ano", "AB": "Resumen",
+    "N2": "Resumen", "JO": "Publicado en", "JF": "Publicado en",
+    "T2": "Publicado en", "PB": "Editorial", "KW": "Palabra clave",
+    "DO": "DOI", "UR": "Enlace", "SN": "ISSN/ISBN", "VL": "Volumen",
+    "IS": "Numero", "SP": "Pagina inicial", "EP": "Pagina final",
+    "LA": "Idioma", "N1": "Nota",
+}
+
+
+def _leer_ris(ruta: str) -> list:
+    """
+    Lee una referencia bibliografica exportada en RIS.
+
+    Pesan cero kilobytes y son faciles de despreciar, pero no son basura:
+    cada uno es la ficha completa de un articulo -- titulo, autores, ano,
+    resumen y DOI. Cuatro de ellos estaban entre los archivos que el
+    sistema apartaba por "no hay lector", y con ellos se iba el resumen de
+    cuatro articulos cientificos.
+
+    Args:
+        ruta: Ruta del archivo .ris.
+
+    Returns:
+        Lista con una tupla `(1, texto)` por cada referencia del archivo.
+    """
+    try:
+        with open(ruta, encoding="utf-8-sig", errors="replace") as fh:
+            crudo = fh.read()
+    except OSError as exc:
+        anotar_fallo_de_lectura(ruta, exc)
+        return []
+
+    referencias, actual = [], {}
+    for linea in crudo.splitlines():
+        if len(linea) < 6 or linea[2:6] != "  - ":
+            # Una linea sin etiqueta continua el valor anterior: los
+            # resumenes largos vienen partidos en varias.
+            if actual and linea.strip() and actual.get("_ultima"):
+                actual[actual["_ultima"]][-1] += " " + linea.strip()
+            continue
+        etiqueta, valor = linea[:2], linea[6:].strip()
+        if etiqueta == "ER":
+            if actual:
+                referencias.append(actual)
+            actual = {}
+            continue
+        nombre = ETIQUETAS_RIS.get(etiqueta, etiqueta)
+        actual.setdefault(nombre, []).append(valor)
+        actual["_ultima"] = nombre
+    if actual:
+        referencias.append(actual)
+
+    paginas = []
+    for numero, ref in enumerate(referencias, start=1):
+        lineas = [f"[Referencia bibliografica de "
+                  f"{os.path.basename(ruta)}]"]
+        for campo, valores in ref.items():
+            if campo.startswith("_"):
+                continue
+            lineas.append(f"{campo}: {'; '.join(valores)}")
+        if len(lineas) > 1:
+            paginas.append((numero, chr(10).join(lineas)))
+    if not paginas:
+        anotar_fallo_de_lectura(ruta, "el .ris no trae ninguna referencia")
+    return paginas
+
+
+#: Como empieza cada formato por dentro, para reconocerlo sin su nombre.
+#:
+#: El orden importa: un .docx y un .pptx son los dos ZIP y empiezan igual,
+#: asi que la firma no basta y hay que mirar que lleva dentro. Eso lo
+#: resuelve `_formato_por_dentro`.
+FIRMAS = (
+    (b"%PDF-", ".pdf"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"GIF8", ".gif"),
+    (b"II*\x00", ".tif"),
+    (b"MM\x00*", ".tif"),
+    (b"RIFF", ".webp"),
+    (b"{\\rtf", ".rtf"),
+    (b"\xd0\xcf\x11\xe0", ".doc"),
+)
+
+#: Extensiones que NO dicen nada del contenido y obligan a mirar dentro.
+#:
+#: `.crdownload` es lo que deja Chrome cuando una descarga no se cerro del
+#: todo, y es exactamente lo que habia en la carpeta: un PDF de 8 MB y otro
+#: de 26,8 MB que el sistema apartaba por "no hay lector para
+#: '.crdownload'". El contenido estaba entero; lo unico raro era el nombre.
+EXTENSIONES_SIN_PISTA = {".crdownload", ".download", ".part", ".partial",
+                         ".tmp", ".bin", ".dat", ""}
+
+
+def _formato_por_dentro(ruta: str) -> str:
+    """
+    Averigua que formato es un archivo mirando sus primeros bytes.
+
+    POR QUE NO BASTA EL NOMBRE
+    --------------------------
+    Porque el nombre lo pone quien descarga, y se equivoca. Un PDF a medio
+    bajar se llama `.crdownload`, una foto guardada desde el navegador
+    puede acabar sin extension, y un informe renombrado a mano pierde la
+    suya. En los tres casos el contenido es perfectamente legible y el
+    sistema lo apartaba por el nombre.
+
+    Args:
+        ruta: Archivo ya descargado.
+
+    Returns:
+        La extension que le corresponde por su contenido, o cadena vacia si
+        no se reconoce.
+    """
+    try:
+        with open(ruta, "rb") as fh:
+            cabeza = fh.read(8)
+    except OSError:
+        return ""
+
+    for firma, extension in FIRMAS:
+        if cabeza.startswith(firma):
+            return extension
+
+    # Los formatos de Office son ZIP por fuera y se distinguen por dentro.
+    if cabeza.startswith(b"PK\x03\x04"):
+        try:
+            with zipfile.ZipFile(ruta) as zf:
+                dentro = zf.namelist()
+        except (zipfile.BadZipFile, OSError):
+            return ""
+        if "word/document.xml" in dentro:
+            return ".docx"
+        if any(n.startswith("ppt/slides/") for n in dentro):
+            return ".pptx"
+        if "xl/workbook.xml" in dentro:
+            return ".xlsx"
+        return ".zip"
+    return ""
+
+
+def _leer_lo_que_sea(ruta: str) -> list:
+    """
+    Lee un archivo cuyo nombre no dice de que formato es.
+
+    Args:
+        ruta: Archivo ya descargado.
+
+    Returns:
+        Lo que devuelva el lector del formato reconocido, o lista vacia.
+    """
+    extension = _formato_por_dentro(ruta)
+    lector = LECTORES.get(extension)
+    if lector is None:
+        anotar_fallo_de_lectura(
+            ruta, f"el nombre no dice el formato y por dentro tampoco se "
+                  f"reconoce {'(' + extension + ')' if extension else ''}")
+        return []
+
+    paginas = lector(ruta) or []
+    if not paginas:
+        return []
+    # Se deja dicho que el nombre mentia. Quien lea la cita vera un archivo
+    # .crdownload y tiene que saber por que se pudo leer.
+    aviso = (f"[{os.path.basename(ruta)} no lleva extension util; por su "
+             f"contenido es un {extension}]")
+    primera = paginas[0]
+    return [(primera[0], aviso + chr(10) + primera[1])] + list(paginas[1:])
 
 
 #: Tipos de geometria de un shapefile, por su codigo en la cabecera.
@@ -815,8 +1394,21 @@ def _leer_shapefile(ruta: str) -> list:
         codigo = struct.unpack("<i", cabecera[32:36])[0]
         xmin, ymin, xmax, ymax = struct.unpack("<dddd", cabecera[36:68])
         lineas.append(f"Geometria: {TIPOS_SHAPEFILE.get(codigo, codigo)}.")
-        lineas.append(f"Ocupa de {ymin:.5f} a {ymax:.5f} de latitud y de "
-                      f"{xmin:.5f} a {xmax:.5f} de longitud.")
+        # LLAMAR LATITUD A LO QUE NO LO ES
+        # --------------------------------
+        # El rectangulo de la cabecera viene en las unidades de la capa, y
+        # la mayoria de la cartografia oficial llega proyectada en metros.
+        # Aqui se escribia "de -426737 a 1693576 de latitud", que no existe:
+        # es un numero que nadie puede comprobar y que el agente repetia tal
+        # cual. Ahora se dice en grados cuando se sabe convertir, y cuando
+        # no, se dice que son unidades de la proyeccion.
+        if -180 <= xmin <= 180 and -90 <= ymin <= 90:
+            lineas.append(f"Ocupa de {ymin:.5f} a {ymax:.5f} de latitud y de "
+                          f"{xmin:.5f} a {xmax:.5f} de longitud.")
+        else:
+            lineas.append(f"Ocupa de {xmin:.1f} a {xmax:.1f} en X y de "
+                          f"{ymin:.1f} a {ymax:.1f} en Y, en las unidades "
+                          f"de su proyeccion: no son grados.")
     except (OSError, struct.error) as exc:
         anotar_fallo_de_lectura(ruta, exc)
         return []
@@ -1292,6 +1884,10 @@ LECTORES = {
     ".xlsx": _leer_excel,
     ".xls": _leer_excel,
     ".zip": _leer_zip,
+    ".pptx": _leer_pptx,
+    ".ppsx": _leer_pptx,
+    ".ris": _leer_ris,
+    ".bib": _leer_ris,
     ".shp": _leer_shapefile,
     ".dbf": _leer_dbf,
     ".qgs": _leer_proyecto_qgis,
@@ -1301,6 +1897,16 @@ LECTORES = {
 }
 LECTORES.update({ext: _leer_imagen for ext in TIPOS_IMAGEN})
 
+EXTENSIONES_LEIBLES.update(LECTORES)
+
+# LO QUE NO DICE SU NOMBRE TAMBIEN SE BAJA
+# ----------------------------------------
+# El filtro de la fuente mira la extension ANTES de descargar, asi que un
+# archivo sin extension util ni siquiera llegaba al equipo y no habia forma
+# de mirar lo que tenia dentro. Se le deja pasar para poder olfatearlo; si
+# por dentro tampoco se reconoce, se descarta entonces y se dice por que.
+for _sin_pista in EXTENSIONES_SIN_PISTA:
+    LECTORES.setdefault(_sin_pista, _leer_lo_que_sea)
 EXTENSIONES_LEIBLES.update(LECTORES)
 
 
@@ -1955,23 +2561,77 @@ def buscar_binomio(binomio: str, limite: int = 12) -> list:
     return resultados
 
 
-def resumen() -> dict:
+def _lo_que_ya_se_sabe() -> dict:
+    """
+    Lo que se sabe del corpus sin abrir ni un documento.
+
+    Returns:
+        Diccionario con `version`, `fichas`, `ilegibles` y `al_dia`, que dice
+        si esas cuentas corresponden al contenido actual de la carpeta.
+    """
+    guardado = _memoria["corpus"]
+    if guardado is not None:
+        return {"version": guardado.get("version"),
+                "fichas": guardado.get("fichas", []),
+                "ilegibles": guardado.get("ilegibles", []),
+                "al_dia": True}
+    return {"version": None, "fichas": [], "ilegibles": [], "al_dia": False}
+
+
+def resumen(reconstruir: bool = False) -> dict:
     """
     Estado del corpus, para mostrarlo en la interfaz o en un diagnostico.
 
+    POR QUE NO LEE LOS DOCUMENTOS
+    -----------------------------
+    Porque lo hacia, y por eso la interfaz se quedaba cargando. Esta funcion
+    llamaba a `cargar()`, que cuando la version no coincide RECONSTRUYE el
+    corpus entero: leer y trocear los 424 archivos de la carpeta, 3,26 GB. Y
+    antes de eso llamaba a `version_corpus()`, que resume el contenido de esos
+    mismos 3,26 GB.
+
+    Durante un estudio la carpeta cambia cada pocos segundos -- se bajan
+    archivos y se borran segun se leen --, asi que la version NUNCA coincidia y
+    cada pregunta por el estado disparaba una reconstruccion completa. Medido:
+    `/corpus/estado` sin contestar en 30 segundos, API al 98 % de CPU, y la
+    interfaz, que llama a ese endpoint al pintarse y cae a leer la carpeta en
+    local si tarda, al 100 % haciendo lo mismo por su cuenta. La pagina en
+    blanco con el "Running" girando era eso.
+
+    Informar de cuantos documentos hay se hace mirando la carpeta
+    (`inventariar`, que solo consulta el sistema de archivos). Las fichas se
+    dicen si ya se saben, y si no se dice que no se sabe -- `fichas_contadas`
+    en False --, que es mas honesto y muchisimo mas barato que averiguarlo a
+    la fuerza. Quien de verdad necesite las fichas construidas lo pide:
+    `resumen(reconstruir=True)`.
+
+    Args:
+        reconstruir: True lee los documentos y reconstruye las fichas si hace
+            falta. Solo para informes y utilidades de linea de comandos, nunca
+            desde la interfaz ni desde un endpoint.
+
     Returns:
         Diccionario con `carpeta`, `disponible`, `version`, `documentos`,
-        `fichas`, `categorias` (lista de tuplas) e `ilegibles`.
+        `fichas`, `fichas_contadas`, `categorias` (lista de tuplas) e
+        `ilegibles`.
     """
     inventario = inventariar()
-    corpus = cargar() if inventario else {"version": version_corpus([]),
-                                          "fichas": [], "ilegibles": []}
+    if reconstruir:
+        corpus = cargar() if inventario else {"version": version_corpus([]),
+                                              "fichas": [], "ilegibles": []}
+        corpus["al_dia"] = True
+    else:
+        corpus = _lo_que_ya_se_sabe()
     return {
         "carpeta": carpeta_corpus(),
         "disponible": bool(inventario),
         "version": corpus["version"],
         "documentos": len(inventario),
         "fichas": len(corpus["fichas"]),
+        # Cero fichas y "no se han contado" no son lo mismo, y quien lea esto
+        # tiene que poder distinguirlo: lo primero dice que no hay nada que
+        # consultar, lo segundo que nadie ha mirado todavia.
+        "fichas_contadas": bool(corpus["al_dia"]),
         "categorias": categorias(inventario),
         "ilegibles": corpus.get("ilegibles", []),
         # Documentos que fallaron al leerse en esta pasada, con el motivo. Un
@@ -1994,7 +2654,7 @@ def resumen() -> dict:
 
 
 if __name__ == "__main__":
-    estado = resumen()
+    estado = resumen(reconstruir=True)
     print("CORPUS DOCUMENTAL")
     print("=" * 70)
     print(f"  Carpeta    : {estado['carpeta']}")

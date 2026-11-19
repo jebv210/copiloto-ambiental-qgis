@@ -325,7 +325,7 @@ if __name__ == "__main__":
         print(f"  apartados: {salida['descartados']}   movidos: {salida['movidos']}")
         for error in salida["errores"]:
             print(f"  ERROR {error}")
-        estado = corpus.resumen()
+        estado = corpus.resumen(reconstruir=True)
         print(f"\n  Corpus ahora: {estado['documentos']} documentos, "
               f"{estado['fichas']} fichas, version {estado['version']}")
         for nombre, cuantos in estado["categorias"]:

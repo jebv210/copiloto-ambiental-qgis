@@ -330,7 +330,7 @@ else:
            "la fuente actual no aparto ninguna")
 
 # La prueba de fuego: sin texto en el equipo, pero con indice, hay que BUSCAR.
-_fichas_locales = _c.resumen().get("fichas", 0)
+_fichas_locales = _c.resumen(reconstruir=True).get("fichas", 0)
 if _vista.get("se_puede_buscar"):
     _respuesta = _t.consultar_corpus("cuenca")
     comprobar("busca aunque la carpeta local este vacia",
@@ -395,6 +395,254 @@ else:
     comprobar("la ruta de la capa no mezcla barras",
               not ("/" in _linea_ruta and chr(92) in _linea_ruta),
               _linea_ruta[:88] or "no se nombra la capa")
+
+# ==============================================================================
+print("")
+print("LA FORMA DE LA RESPUESTA - respuesta, bases y notas")
+# ------------------------------------------------------------------------------
+# Una respuesta sin procedencia obliga a creersela. El agente contesta ahora en
+# tres apartados: lo que se preguntaba, de donde sale, y que conviene mirar con
+# recelo. El tercero solo cuando haya algo; un aviso que sale siempre deja de
+# leerse.
+#
+# Lo que se prueba aqui es la parte que NO depende de que el modelo obedezca:
+# el respaldo que construye las bases con lo que las herramientas devolvieron
+# de verdad. Un apartado de fuentes es una promesa de que se pueden ir a
+# comprobar, y una sola cita inventada convierte las demas en sospechosas.
+from agent import chatbot as _cb
+from agent import prompts as _pr
+
+
+class _Parte:
+    """Una parte de un turno, como la devuelve el cliente de Gemini."""
+
+    def __init__(self, llamada=None, devuelto=None):
+        """
+        Guarda la llamada o la respuesta de una herramienta.
+
+        Args:
+            llamada: Objeto con `name`, si la parte es una llamada.
+            devuelto: Objeto con `name` y `response`, si es una respuesta.
+        """
+        self.function_call = llamada
+        self.function_response = devuelto
+        self.text = None
+
+
+class _Simple:
+    """Objeto con los atributos que se le pasen."""
+
+    def __init__(self, **campos):
+        """
+        Args:
+            **campos: Atributos a fijar.
+        """
+        self.__dict__.update(campos)
+
+
+def _respuesta_falsa(salidas):
+    """
+    Arma una respuesta del modelo con el historial de herramientas dado.
+
+    Args:
+        salidas: Lista de pares `(herramienta, texto que devolvio)`.
+
+    Returns:
+        Un objeto con `automatic_function_calling_history`.
+    """
+    partes = []
+    for nombre, devuelve in salidas:
+        partes.append(_Parte(llamada=_Simple(name=nombre)))
+        partes.append(_Parte(devuelto=_Simple(
+            name=nombre, response={"result": devuelve})))
+    return _Simple(automatic_function_calling_history=[_Simple(parts=partes)])
+
+
+_SALIDA = (
+    "Encontrado en lo estudiado (drive):" + chr(10) + chr(10)
+    + "[1] Las larvas se alimentan de Passiflora." + chr(10)
+    + "    Fuente: Guia de plantas hospederas.pdf, p. 60 [3_HOSPEDERAS]"
+    + chr(10) + chr(10)
+    + "[2] Se registro en la vereda El Jardin." + chr(10)
+    + "    Fuente: Mariposas Cordillera Central.pdf, p. 12 [5_INVENTARIOS]"
+)
+
+_fuentes, _usadas = _cb._fuentes_del_turno(_respuesta_falsa(
+    [("consultar_corpus", _SALIDA)]))
+comprobar("las fuentes salen de lo que devolvio la herramienta",
+          _fuentes == ["Guia de plantas hospederas.pdf, p. 60 [3_HOSPEDERAS]",
+                       "Mariposas Cordillera Central.pdf, p. 12 "
+                       "[5_INVENTARIOS]"],
+          f"{len(_fuentes)} citas, con documento y pagina")
+comprobar("y se sabe que herramientas se usaron",
+          _usadas == ["consultar_corpus"], ", ".join(_usadas))
+
+_texto = "### Respuesta" + chr(10) + "Se alimentan de Passiflora."
+_con_bases = _cb._asegurar_bases(_texto, _fuentes, _usadas)
+comprobar("si el modelo se deja las bases, se le ponen",
+          "### Bases" in _con_bases
+          and "Guia de plantas hospederas.pdf" in _con_bases,
+          "con las citas reales, no con otras")
+
+_suyas = (_texto + chr(10) + "### Bases" + chr(10)
+          + "- **Lo que yo quiera.pdf**")
+comprobar("si el modelo SI escribio las suyas, no se le tocan",
+          _cb._asegurar_bases(_suyas, _fuentes, _usadas) == _suyas,
+          "dos voces en la misma respuesta serian peores que una")
+
+# Sin citas pero con herramienta: la respuesta sale de mirar el sistema.
+_sin_citas = _cb._asegurar_bases(
+    "### Respuesta" + chr(10) + "Hay 12 capas.", [], ["datos_para_qgis"])
+comprobar("sin citas pero con herramienta, se dice de donde sale",
+          "no sale de la bibliografia" in _sin_citas.lower()
+          and "datos_para_qgis" in _sin_citas,
+          "mirar el sistema tambien es una base, y se nombra")
+
+# Sin nada detras no se fabrica un aviso de relleno.
+_saludo = _cb._asegurar_bases(
+    "### Respuesta" + chr(10) + "Hola, soy tu copiloto. " * 30, [], [])
+comprobar("un saludo no se adorna con un apartado de fuentes",
+          "### Bases" not in _saludo
+          and not _saludo.lstrip().startswith("###"),
+          "ni encabezado suelto: o estan los apartados o no esta ninguno")
+
+# Y el prompt tiene que pedirlo, no solo el respaldo.
+_prompt = _pr.construir_system_prompt({})
+comprobar("el prompt pide los tres apartados por su nombre",
+          all(t in _prompt for t in ("### Respuesta", "### Bases",
+                                     "### Notas")),
+          "respuesta, bases y notas")
+comprobar("y prohibe inventarse las fuentes",
+          "LAS BASES NO SE INVENTAN" in _prompt,
+          "solo documentos que haya devuelto una herramienta en ese turno")
+# Se comprueba la INSTRUCCION, no su redaccion exacta. La version
+# anterior exigia la frase entera y se puso en rojo en cuanto alguien
+# amplio la regla: una prueba que se rompe al mejorar el texto ensena a
+# no tocar el texto.
+comprobar("con una foto, manda BUSCAR lo que vio, no deducirlo",
+          "BUSCA ESE NOMBRE" in _prompt,
+          "ver una mariposa no demuestra que el corpus la documente")
+comprobar("las notas solo salen si hay algo que decir",
+          "NO ESCRIBAS EL APARTADO" in _prompt,
+          "un aviso que sale siempre deja de leerse")
+
+
+# ==============================================================================
+print("")
+print("EL INVENTARIO DEL DRIVE - lo que HAY, no solo lo que se leyo")
+# ------------------------------------------------------------------------------
+# El agente negaba documentos que estaban en el Drive. Preguntado por la Ley
+# 611 de 2000 y por la Resolucion 1402 de 2018 contesto que no estaban en el
+# corpus: las dos estaban ahi -- la 1402 por duplicado, en dos carpetas -- y
+# lo unico cierto era que todavia no se habian indexado. Quien pregunto
+# entendio que faltaba subirlas.
+#
+# Son dos preguntas distintas y necesitaban dos herramientas distintas.
+_doc = (tools.inventario_de_la_fuente.__doc__ or "")
+comprobar("la herramienta se describe para cuando preguntan QUE HAY",
+          "que documentos tienes" in _doc and "antes de decir que un" in _doc,
+          "el modelo elige la herramienta leyendo esto")
+comprobar("y deja clara la diferencia con el estado del corpus",
+          "estado_del_corpus" in _doc and "indexado" in _doc,
+          "resumen de lo leido frente a lista de lo que hay")
+comprobar("el estado del corpus manda al inventario y no contesta por el",
+          "inventario de la" in (tools.estado_del_corpus.__doc__ or ""),
+          "para no negar archivos que estan esperando a ser leidos")
+
+_prompt_inv = _pr.construir_system_prompt({})
+comprobar("el prompt obliga a mirar el Drive antes de negar un archivo",
+          "HERRAMIENTA DE INVENTARIO DE LA FUENTE" in _prompt_inv,
+          "regla 11")
+comprobar("y distingue las tres respuestas posibles",
+          all(t in _prompt_inv for t in ("esta y lo he leido",
+                                         "no lo he leido todavia",
+                                         "no esta en el Drive")),
+          "estan, estan sin leer, o no estan: tres cosas distintas")
+
+comprobar("el inventario esta registrado entre las herramientas",
+          tools.inventario_de_la_fuente in tools.HERRAMIENTAS,
+          "si no, el modelo no puede llamarla por mucho que el prompt lo diga")
+
+_salida = tools.inventario_de_la_fuente()
+if "No puedo mirar la fuente" in _salida or "No hay ninguna fuente" in _salida:
+    omitir("el inventario lista la carpeta real", "la fuente no esta conectada")
+else:
+    import re as _re_inv
+    # LAS MARCAS SE LLAMAN COMO SE LLAMAN AHORA
+    # -----------------------------------------
+    # Esta prueba buscaba [estudiado] y [pendiente], que es como se marcaba
+    # antes. La herramienta dejo de usar esas palabras porque no las podia
+    # sostener: la marca se decidia por la extension del archivo, no por lo
+    # que hubiera en el indice, asi que llamaba "estudiado" a cualquier PDF.
+    # La prueba siguio contando palabras que ya no aparecian y daba cero de
+    # todo sin que eso significara nada.
+    _disponibles = len(_re_inv.findall(r"\[disponible", _salida))
+    _sin = len(_re_inv.findall(r"\[sin lector", _salida))
+    comprobar("lista archivos de verdad, con su estado",
+              _disponibles + _sin > 0,
+              f"{_disponibles} disponibles, {_sin} sin lector")
+    comprobar("y promete solo lo que puede cumplir",
+              "[estudiado" not in _salida and "[pendiente" not in _salida,
+              "no llama estudiado a un archivo por su extension")
+
+    _filtrado = tools.inventario_de_la_fuente(buscar="zzz-no-existe-nada")
+    comprobar("un filtro sin resultados no dice que el Drive este vacio",
+              "pero ninguno coincide" in _filtrado,
+              "dice cuantos hay y que el filtro no encontro")
+
+
+# ==============================================================================
+print("\nUN TURNO DEL CHAT NO PUEDE LEER NI BAJAR GIGABYTES")
+# ==============================================================================
+# La carpeta del corpus local y la de descargas de Drive son LA MISMA:
+# `data/copiloto_drive`. Fuera de un estudio esta vacia, y mientras un
+# estudio corre tiene los 3,2 GB recien bajados.
+#
+# Por eso una herramienta del agente no puede permitirse ninguna de estas
+# dos cosas dentro de un turno:
+#
+#   - `corpus.resumen(reconstruir=True)`, que abre y trocea TODOS los
+#     documentos de la carpeta. Medido: mas de 400 segundos sin terminar.
+#     Su propio docstring ya lo dice -- "nunca desde la interfaz ni desde un
+#     endpoint" -- y `buscar_especie_exacta` lo llamaba igual.
+#   - `asegurar_descargado`, que BAJA de Drive lo que falte. Con seis
+#     candidatos y archivos de 36 MB, una pregunta arrastraba cientos de
+#     megas antes de contestar.
+#
+# Las dos se disparaban juntas al preguntar "y esas como se llaman?" sobre
+# una foto, y la pantalla se quedaba en "Pensando... 53 s" subiendo.
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "agent", "tools.py"), encoding="utf-8") as _fh_t:
+    _TOOLS = _fh_t.read()
+
+_codigo = [l for l in _TOOLS.splitlines()
+           if not l.lstrip().startswith("#")]
+
+comprobar("ninguna herramienta reconstruye el corpus entero",
+          not any("resumen(reconstruir=True)" in l for l in _codigo),
+          "reconstruirlo lee la carpeta de descargas de Drive al completo")
+
+# Bajar UN documento que la persona ha pedido por su nombre si vale: es
+# justo lo que hace la herramienta de leer un archivo del Drive, y quien lo
+# pide sabe que esta pidiendo ese archivo. Lo que no vale es bajar seis a
+# ciegas por si acaso, que es lo que hacia la busqueda directa.
+_bloque_directo = _TOOLS[_TOOLS.index("def _buscar_directo_en_documentos"):]
+_bloque_directo = _bloque_directo[:_bloque_directo.index("def consultar_corpus")]
+_lineas_directo = [l for l in _bloque_directo.splitlines()
+                   if not l.lstrip().startswith("#")]
+
+comprobar("la busqueda a ciegas no baja nada de Drive",
+          not any("asegurar_descargado" in l for l in _lineas_directo),
+          "mira solo lo que ya esta en el equipo, que es gratis")
+
+comprobar("y bajar un documento solo se hace cuando se pide por su nombre",
+          sum(1 for l in _codigo if "asegurar_descargado" in l) == 1,
+          "una sola puerta, y es la que la persona abre a proposito")
+
+comprobar("si la fuente no deja los documentos aqui, se dice y ya",
+          "if not vista.get(\"local\")" in _TOOLS,
+          "la respuesta se decide por como es la fuente, sin tocar el disco")
+
 
 # ==============================================================================
 print("\n" + "=" * 70)

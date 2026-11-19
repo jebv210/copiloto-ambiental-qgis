@@ -489,12 +489,162 @@ def escribir_geopaquete(ruta: str, capas: list) -> dict:
 
             escritas.append({"nombre": capa["nombre"], "tabla": tabla,
                              "tipo": tipo, "entidades": len(entidades),
-                             "columnas": columnas, "limites": limites})
+                             "columnas": columnas, "limites": limites,
+                             # Se arrastra hasta aqui porque quien escribe
+                             # el .qgs necesita saber cual es el limite del
+                             # area: va arriba del todo y con otro estilo.
+                             "destacada": bool(capa.get("destacada")),
+                             "etiqueta": capa.get("etiqueta", "")})
         con.commit()
     finally:
         con.close()
 
     return {"capas": escritas, "bytes": os.path.getsize(ruta)}
+
+
+#: Archivo del que sale el limite del area de estudio.
+#:
+#: Lo genera la pestana "Area de Estudio" al subir el .kmz que la delimita.
+#: Aqui no se da por hecho que ese limite sea ningun municipio concreto: el
+#: nombre se lee del archivo, porque el dia que el area sea otra el mapa
+#: tiene que decir la otra.
+ARCHIVO_AREA = "municipios_filtrados.geojson"
+
+#: Color del limite del area de estudio.
+#:
+#: Magenta, y a proposito. La paleta de poligonos es blanco, amarillo y
+#: naranja, y el limite del municipio salia en blanco entre las 129 areas
+#: protegidas y las 322 unidades geologicas: estaba dibujado y no se veia.
+#: Un color que no usa ninguna otra capa es lo que lo hace reconocible sin
+#: tener que leer la leyenda.
+COLOR_AREA = "255,0,122,255"
+
+#: Grosor del limite del area, en milimetros.
+ANCHO_AREA = 1.0
+
+
+def ficha_del_area() -> dict:
+    """
+    Lee como se llama el area de estudio y cuanto mide.
+
+    Returns:
+        Diccionario con `nombre` y `km2`. Vacio si todavia no hay area
+        fijada, en cuyo caso no se inventa ningun nombre.
+    """
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        with open(os.path.join(base, "data", "area_estudio.json"),
+                  encoding="utf-8") as fh:
+            guardado = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    nombre = str(guardado.get("nombre") or "").strip()
+    return {"nombre": nombre, "km2": guardado.get("km2")} if nombre else {}
+
+
+def _es_el_area(ruta: str) -> bool:
+    """
+    Dice si un archivo es el limite del area de estudio.
+
+    Args:
+        ruta: Ruta del .geojson.
+
+    Returns:
+        True si es el archivo del area.
+    """
+    return os.path.basename(ruta).lower() == ARCHIVO_AREA
+
+
+def _etiquetado(campo: str) -> str:
+    """
+    Devuelve el XML que hace que QGIS escriba un campo sobre el mapa.
+
+    POR QUE SE ETIQUETA SOLO ESTA CAPA
+    ----------------------------------
+    Porque es la unica a la que se le pide que DIGA algo. Etiquetar las
+    fallas o las areas protegidas llenaria el mapa de texto encima del
+    satelite; etiquetar el limite del area pone una palabra, y es la
+    palabra que contesta "donde queda esto".
+
+    El texto lleva un halo blanco detras. Sin el, sobre una ortofoto con
+    nubes y cultivos claros, un rotulo oscuro desaparece y uno claro
+    tambien, segun por donde caiga.
+
+    Args:
+        campo: Nombre del campo cuyo valor se escribe.
+
+    Returns:
+        El fragmento XML de etiquetado.
+    """
+    # LA FUENTE SE NOMBRA, NO SE DA POR SUPUESTA
+    # ------------------------------------------
+    # Sin `fontFamily`, QGIS coge la que le parezca. Dibujado en un equipo
+    # sin entorno grafico salio una barra de cuadrados: la etiqueta estaba,
+    # pero no habia con que escribirla. Se nombran dos familias presentes en
+    # cualquier Windows y en casi cualquier Linux.
+    #
+    # `placement="4"` es horizontal dentro del poligono. Las colocaciones
+    # pensadas para puntos dejan el rotulo colgando de una esquina.
+    return (
+        '<labeling type="simple">'
+        '<settings>'
+        f'<text-style fieldName="{campo}" isExpression="0" '
+        f'fontFamily="Arial" fontFamilies="Arial,DejaVu Sans,Liberation Sans" '
+        f'namedStyle="Bold" fontSize="14" fontSizeUnit="Point" '
+        f'fontWeight="75" fontItalic="0" textOpacity="1" '
+        f'textColor="{COLOR_AREA}" previewBkgrdColor="0,0,0,0" '
+        f'multilineHeight="1" allowHtml="0" capitalization="0" '
+        f'blendMode="0" fontLetterSpacing="0" fontWordSpacing="0">'
+        '<text-buffer bufferDraw="1" bufferSize="1.6" '
+        'bufferSizeUnits="MM" bufferColor="255,255,255,255" '
+        'bufferOpacity="1" bufferJoinStyle="128" bufferNoFill="0" '
+        'bufferBlendMode="0"/>'
+        '<background shapeDraw="0"/>'
+        '<shadow shadowDraw="0"/>'
+        '</text-style>'
+        '<text-format autoWrapLength="0" plussign="0" addDirectionSymbol="0" '
+        'formatNumbers="0" useMaxLineLengthForAutoWrap="1" '
+        'multilineAlign="0" wrapChar=""/>'
+        '<placement placement="4" placementFlags="10" '
+        'centroidWhole="0" centroidInside="1" fitInPolygonOnly="0" '
+        'overrunDistance="0" dist="0" repeatDistance="0" '
+        'priority="10" predefinedPositionOrder="TR,TL,BR,BL,R,L,TSR,BSR" '
+        'xOffset="0" yOffset="0" rotationAngle="0"/>'
+        '<rendering scaleVisibility="0" drawLabels="1" '
+        'obstacle="0" labelPerPart="0" displayAll="1" '
+        'mergeLines="0" upsidedownLabels="0"/>'
+        '<dd_properties><Option type="Map">'
+        '<Option name="name" type="QString" value=""/>'
+        '<Option name="properties"/>'
+        '<Option name="type" type="QString" value="collection"/>'
+        '</Option></dd_properties>'
+        '</settings>'
+        '</labeling>')
+
+
+def _simbolo_area() -> str:
+    """
+    Devuelve el estilo con que se dibuja el limite del area de estudio.
+
+    Sin relleno, no casi sin relleno: es la capa que va ARRIBA DEL TODO y
+    cualquier velo, por tenue que sea, lo pone sobre el satelite y sobre
+    todas las demas capas a la vez. Lo que se quiere ver es la raya.
+
+    Returns:
+        El fragmento XML del `renderer-v2`.
+    """
+    return (
+        '<renderer-v2 type="singleSymbol" symbollevels="0">'
+        '<symbols><symbol name="0" type="fill" alpha="1">'
+        '<layer class="SimpleFill">'
+        '<Option type="Map">'
+        '<Option name="color" type="QString" value="0,0,0,0"/>'
+        '<Option name="style" type="QString" value="no"/>'
+        f'<Option name="outline_color" type="QString" value="{COLOR_AREA}"/>'
+        f'<Option name="outline_width" type="QString" value="{ANCHO_AREA}"/>'
+        '<Option name="outline_style" type="QString" value="solid"/>'
+        '</Option></layer>'
+        '</symbol></symbols></renderer-v2>')
 
 
 def _simbolo(tipo: str, indice: int = 0) -> str:
@@ -580,10 +730,27 @@ def escribir_proyecto(ruta: str, capas: list, nombre_gpkg: str,
         nombre_gpkg: Nombre del .gpkg, que va en las rutas relativas.
         titulo: Titulo del proyecto.
     """
+    # EL LIMITE DEL AREA, POR ENCIMA DE TODO
+    # --------------------------------------
+    # Va fuera del reparto por tipo de geometria. Es un poligono, asi que le
+    # tocaria el fondo, y ahi es donde estaba: en el mapa real quedaba
+    # debajo de 129 areas protegidas, 342 fallas y 322 unidades geologicas,
+    # una raya blanca entre rayas amarillas y naranjas. La capa que dice
+    # DONDE ESTAMOS no puede ser la que menos se ve.
     orden = {"Polygon": 0, "LineString": 1, "Point": 2}
-    de_abajo_a_arriba = sorted(capas, key=lambda c: orden.get(c["tipo"], 9))
+    de_abajo_a_arriba = sorted(
+        capas, key=lambda c: (3 if c.get("destacada")
+                              else orden.get(c["tipo"], 9)))
 
-    limites = [c["limites"] for c in capas if c.get("limites")]
+    # EL ENCUADRE TAMBIEN SE MANDA DESDE EL AREA
+    # ------------------------------------------
+    # Antes la vista inicial abarcaba TODAS las capas juntas. Con capas
+    # nacionales recortadas con medio grado de holgura, eso son unos 110 km
+    # de lado y el municipio se abria como una manchita en el centro. El
+    # mapa es de un area de estudio: tiene que abrirse sobre ella.
+    del_area = [c["limites"] for c in capas
+                if c.get("destacada") and c.get("limites")]
+    limites = del_area or [c["limites"] for c in capas if c.get("limites")]
     if limites:
         xmin = min(l[0] for l in limites)
         ymin = min(l[1] for l in limites)
@@ -591,10 +758,11 @@ def escribir_proyecto(ruta: str, capas: list, nombre_gpkg: str,
         ymax = max(l[3] for l in limites)
     else:
         xmin, ymin, xmax, ymax = -75.2, 6.0, -74.8, 6.4
-    # Un margen del 5% para que lo dibujado no quede pegado al borde.
+    # Un margen del 8% para que el limite no quede pegado al borde y se vea
+    # un poco de lo que hay justo al otro lado.
     ancho, alto = (xmax - xmin) or 0.1, (ymax - ymin) or 0.1
-    xmin, xmax = xmin - ancho * 0.05, xmax + ancho * 0.05
-    ymin, ymax = ymin - alto * 0.05, ymax + alto * 0.05
+    xmin, xmax = xmin - ancho * 0.08, xmax + ancho * 0.08
+    ymin, ymax = ymin - alto * 0.08, ymax + alto * 0.08
 
     srs = (
         '<spatialrefsys>'
@@ -613,6 +781,7 @@ def escribir_proyecto(ruta: str, capas: list, nombre_gpkg: str,
     for capa in de_abajo_a_arriba:
         vistos[capa["tipo"]] = vistos.get(capa["tipo"], -1) + 1
         indice_color = vistos[capa["tipo"]]
+        destacada = bool(capa.get("destacada"))
         ident = f"{capa['tabla']}_capa"
         fuente = (f"./{nombre_gpkg}|layername={capa['tabla']}")
         arbol.append(
@@ -631,8 +800,11 @@ def escribir_proyecto(ruta: str, capas: list, nombre_gpkg: str,
             f'<layername>{capa["nombre"]}</layername>'
             f'<srs>{srs}</srs>'
             f'<provider encoding="UTF-8">ogr</provider>'
-            f'{_simbolo(capa["tipo"], indice_color)}'
-            f'</maplayer>')
+            + (_simbolo_area() if destacada
+               else _simbolo(capa["tipo"], indice_color))
+            + (_etiquetado(capa["etiqueta"])
+               if destacada and capa.get("etiqueta") else "")
+            + '</maplayer>')
 
     # EL MAPA BASE VA DEBAJO DE TODO
     # ------------------------------
@@ -717,34 +889,61 @@ def capas_desde_geojson(rutas: list) -> list:
         except (OSError, ValueError):
             continue
 
-        base = os.path.splitext(os.path.basename(ruta))[0].replace("_", " ")
+        area = ficha_del_area() if _es_el_area(ruta) else {}
+        if area:
+            # "Municipios filtrados" no le dice nada a nadie, y es el nombre
+            # del proceso que lo genero, no el del sitio. En la leyenda tiene
+            # que poner como se llama el area de estudio.
+            base = area["nombre"]
+            if area.get("km2"):
+                base += f" (area de estudio, {area['km2']} km2)"
+        else:
+            base = os.path.splitext(
+                os.path.basename(ruta))[0].replace("_", " ")
         por_tipo = {}
         for entidad in datos.get("features") or []:
             geometria = entidad.get("geometry") or {}
             tipo = geometria.get("type")
             if tipo not in ESTILOS:
                 continue
+            propiedades = entidad.get("properties") or {}
+            # Si no es la capa del limite del area de estudio,
+            # filtramos para asegurar que pertenezca exclusivamente a San Carlos,
+            # descartando lo que es del resto del departamento ("cerca" o "no").
+            if not area:
+                contacto = propiedades.get("en_el_area")
+                if contacto in ("cerca", "no", "sin geometria"):
+                    continue
             por_tipo.setdefault(tipo, []).append({
-                "propiedades": entidad.get("properties") or {},
+                "propiedades": propiedades,
                 "coordenadas": geometria.get("coordinates"),
             })
 
         for tipo, entidades in por_tipo.items():
+            if not entidades:
+                continue
             nombre = base if len(por_tipo) == 1 else f"{base} ({tipo})"
-            capas.append({"nombre": nombre.strip().capitalize(),
-                          "tipo": tipo, "entidades": entidades})
+            # El nombre del area se respeta tal cual. `capitalize()` pasa a
+            # minuscula todo lo que no sea la primera letra, y convertia
+            # "San Carlos" en "San carlos".
+            capas.append({"nombre": nombre.strip() if area
+                          else nombre.strip().capitalize(),
+                          "tipo": tipo, "entidades": entidades,
+                          "destacada": bool(area) and tipo == "Polygon",
+                          "etiqueta": "nombre" if area else ""})
     return capas
 
 
 def construir(destino: str, rutas_geojson: list,
-              titulo: str = "Area de estudio - San Carlos") -> dict:
+              titulo: str = "") -> dict:
     """
     Arma el paquete completo y lo deja en un .zip.
 
     Args:
         destino: Ruta del .zip a crear.
         rutas_geojson: Capas de origen.
-        titulo: Titulo del proyecto de QGIS.
+        titulo: Titulo del proyecto de QGIS. Si se omite, sale del nombre
+            del area de estudio que haya fijada.
 
     Returns:
         Diccionario con `zip`, `capas`, `entidades` y `bytes`.
@@ -754,6 +953,24 @@ def construir(destino: str, rutas_geojson: list,
     """
     import shutil
     import tempfile
+
+    # EL AREA DE ESTUDIO ENTRA SIEMPRE
+    # --------------------------------
+    # Da igual que capas pidan: un mapa que no dice de donde es obliga a
+    # adivinarlo por el relieve. Si quien llama no la incluyo, se anade.
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    del_area = os.path.join(base, "data", ARCHIVO_AREA)
+    rutas_geojson = list(rutas_geojson)
+    if os.path.exists(del_area) and not any(_es_el_area(r)
+                                            for r in rutas_geojson):
+        rutas_geojson.append(del_area)
+
+    # El titulo no se escribe a mano. Estaba fijo como "Area de estudio -
+    # San Carlos" y habria seguido diciendolo con otra area cargada.
+    if not titulo:
+        ficha = ficha_del_area()
+        titulo = (f"Area de estudio - {ficha['nombre']}" if ficha
+                  else "Area de estudio")
 
     capas = capas_desde_geojson(rutas_geojson)
     if not capas:

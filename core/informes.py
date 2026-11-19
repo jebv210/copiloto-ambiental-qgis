@@ -274,7 +274,7 @@ def reporte_taxonomico(binomio: str) -> str:
     Returns:
         El informe completo como texto plano.
     """
-    estado = corpus.resumen()
+    estado = corpus.resumen(reconstruir=True)
     if not estado["disponible"]:
         return _sin_corpus(estado)
 
@@ -388,7 +388,7 @@ def ficha_de_especie(binomio: str) -> str:
     Returns:
         La ficha como texto plano.
     """
-    estado = corpus.resumen()
+    estado = corpus.resumen(reconstruir=True)
     if not estado["disponible"]:
         return _sin_corpus(estado)
 
@@ -463,7 +463,7 @@ def informe_cientifico(tema: str) -> str:
     Returns:
         El informe completo como texto plano.
     """
-    estado = corpus.resumen()
+    estado = corpus.resumen(reconstruir=True)
     if not estado["disponible"]:
         return _sin_corpus(estado)
 

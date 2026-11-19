@@ -39,6 +39,9 @@ BATERIAS = [
     ("probar_drive.py",
      "Fuente de Google Drive: carpetas, categorias, imagenes e incremental",
      False),
+    ("probar_geometria.py",
+     "Geometria: shapefiles, geodatabases, proyecciones y capas para QGIS",
+     False),
 ]
 
 

@@ -20,7 +20,9 @@ Este modulo resuelve los dos niveles de memoria a largo plazo:
 import datetime
 import json
 import os
+import re
 import sqlite3
+import threading
 import uuid
 from typing import List, Dict, Optional
 
@@ -84,6 +86,44 @@ def _conectar_sqlite() -> sqlite3.Connection:
 # 1. PERSISTENCIA DE CHATS (SESIONES Y MENSAJES)
 # ==============================================================================
 
+#: Como tiene que ser el identificador de una conversacion: letras, digitos,
+#: guiones y guiones bajos. Ni espacios, ni parentesis, ni acentos.
+#:
+#: POR QUE ESTO MERECE UNA COMPROBACION PROPIA
+#: -------------------------------------------
+#: En la base de datos aparecio una conversacion de verdad -- 42 mensajes y
+#: 19 recuerdos, titulada "generame QGIS" -- cuyo IDENTIFICADOR era el texto
+#: "Charla actual (en curso)". Ese texto es la ETIQUETA que la barra lateral
+#: le pone a la charla que todavia no se ha guardado; en algun momento llego
+#: hasta aqui como si fuera un identificador y se grabo.
+#:
+#: Mientras el identificador solo vivia en memoria casi no se notaba. Desde
+#: que la charla abierta viaja en la direccion del navegador, ese registro
+#: se volvio pegajoso: cualquier pestana nueva acababa dentro de esa
+#: conversacion de hace tres dias. "Pegue una imagen en un chat nuevo y me
+#: llevo a un chat anterior."
+#:
+#: Un identificador se GENERA, no se escribe. Si llega uno que un humano
+#: podria haber leido en pantalla, es que se colo una etiqueta por una
+#: puerta que no era, y eso hay que verlo, no arreglarlo en silencio.
+IDENTIFICADOR_DE_SESION = re.compile(r"^[A-Za-z0-9_-]{3,120}$")
+
+
+def es_identificador_de_sesion(sesion_id) -> bool:
+    """
+    Dice si algo tiene forma de identificador de conversacion.
+
+    Args:
+        sesion_id: Lo que se quiere usar como identificador.
+
+    Returns:
+        True si vale. False para cualquier cosa con espacios, acentos o
+        simbolos, que es como se reconoce una etiqueta disfrazada.
+    """
+    return bool(sesion_id and isinstance(sesion_id, str)
+                and IDENTIFICADOR_DE_SESION.match(sesion_id))
+
+
 def registrar_sesion(sesion_id: str, titulo: Optional[str] = None) -> dict:
     """
     Crea o actualiza los metadatos de una conversacion.
@@ -96,6 +136,16 @@ def registrar_sesion(sesion_id: str, titulo: Optional[str] = None) -> dict:
     Returns:
         Los datos de la sesion, ya creada o actualizada.
     """
+    if not es_identificador_de_sesion(sesion_id):
+        # Se levanta en vez de apanarlo. Guardar los mensajes bajo un
+        # identificador inventado aqui los separaria de la conversacion que
+        # quien escribe esta viendo, y eso se descubre semanas despues.
+        raise ValueError(
+            f"'{sesion_id}' no tiene forma de identificador de conversacion. "
+            f"Los identificadores se generan (sesion_123456), no se escriben: "
+            f"si aqui llega un texto con espacios es que se colo una etiqueta "
+            f"de la pantalla.")
+
     ahora = datetime.datetime.now().isoformat()
     conn = _conectar_sqlite()
     try:
@@ -405,10 +455,11 @@ def _escribir_recuerdo(texto: str, sesion_id: str, tipo: str) -> tuple:
         cliente = vectorial._cliente_qdrant()
         asegurar_coleccion_memoria(cliente)
 
-        # Con reintentos: un corte de red es pasajero, y volver a intentarlo
-        # es justo lo que lo arregla. Antes iba con `reintentar=False`.
+        # En interacciones en vivo (chat/memoria) no debemos bloquear
+        # la peticion con reintentos largos (132s). Si hay 429 o lentitud,
+        # reintentar=False permite archivarlo en disco en pendientes() de inmediato.
         vectores = vectorial.embeber([texto], "RETRIEVAL_DOCUMENT",
-                                     reintentar=True)
+                                     reintentar=False)
         if not vectores or vectores[0] is None:
             return False, "la API de embeddings no devolvio vector"
 
@@ -504,10 +555,9 @@ def guardar_recuerdo_detallado(texto: str, sesion_id: str = "default",
 
     logrado, motivo = _escribir_recuerdo(texto, sesion_id, tipo)
     if logrado:
-        # Aprovechando que la red responde, se intenta colar lo que estaba
-        # esperando: es el momento con mas probabilidades de exito.
+        # Reintentar pendientes en hilo daemon para no retrasar la respuesta HTTP del usuario.
         try:
-            reintentar_pendientes(limite=10)
+            threading.Thread(target=reintentar_pendientes, args=(10,), daemon=True).start()
         except Exception:
             pass
         return {"a_salvo": True, "en_indice": True,

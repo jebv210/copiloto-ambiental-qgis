@@ -22,7 +22,7 @@
         -640,
         300
       ],
-      "notes": "Hora de la carga diaria desde Drive. Se cambia AQUI, en 'Trigger at Hour' y 'Trigger at Minute'.\nEl nombre del nodo no dice la hora a proposito: antes decia 'las 10:30' mientras disparaba a las 10:50, y el nombre no se actualiza solo al cambiar la regla.",
+      "notes": "Hora de la carga diaria desde Drive. Se cambia AQUI, en 'Trigger at Hour' y 'Trigger at Minute'.\nEl nombre del nodo no dice la hora a proposito: antes decia 'las 10:30' mientras disparaba a las 10:50, y el nombre no se actualiza solo al cambiar la regla.\n\nLA HORA DE VERDAD ES ESTA, Y EL VALOR BUENO SON LAS 02:00.\nSi la cambias para hacer pruebas, cambia TAMBIEN el texto 'origen' del nodo siguiente: ese texto es lo que la aplicacion ensena en pantalla cuando un estudio falla, y si no coincide, el aviso dice una hora que no es.",
       "notesInFlow": false
     },
     {
@@ -31,7 +31,7 @@
         "url": "={{ $env.COPILOTO_API }}/corpus/sincronizar",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\"forzar\": false, \"origen\": \"cron de las 10:30\"}",
+        "jsonBody": "={\"forzar\": false, \"origen\": \"cron de las 2 de la mañana\"}",
         "options": {
           "timeout": 20000,
           "response": {
@@ -223,7 +223,7 @@
         480
       ],
       "webhookId": "sincronizar-ahora",
-      "notes": "Mismo trabajo que el cron, pero cuando uno quiera:\ncurl -X POST http://localhost:5678/webhook/sincronizar-ahora\nExiste para poder PROBAR la sincronizacion sin esperar a las 10:30 ni reiniciar nada.",
+      "notes": "Mismo trabajo que el cron, pero cuando uno quiera:\ncurl -X POST http://localhost:5678/webhook/sincronizar-ahora\nExiste para poder PROBAR la sincronizacion sin esperar a las 02:00 ni reiniciar nada.",
       "notesInFlow": true
     }
   ],

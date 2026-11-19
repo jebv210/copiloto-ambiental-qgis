@@ -76,6 +76,11 @@ def guion(url_api: str, session_id: str) -> str:
   const CFG = __CONFIG__;
   const ETIQUETA = __ETIQUETA__;
 
+  // Milisegundos que se espera antes de pedirle a Streamlit que redibuje,
+  // por si vienen mas imagenes detras. Suficiente para agrupar un pegado
+  // multiple y corto para que no se note al pegar una sola.
+  const ESPERA_AGRUPAR = 450;
+
   // El iframe comparte origen con la pagina de fuera, asi que se puede
   // escuchar alli. Si no se pudiera, se avisa por consola y se deja estar.
   let doc;
@@ -85,6 +90,9 @@ def guion(url_api: str, session_id: str) -> str:
     console.warn("[pegar] sin acceso a la pagina principal:", e);
     return;
   }
+
+  // Actualizar la configuracion activa (buzon y api) en cada redibujado
+  doc.__pegadoCfg = CFG;
 
   // Un solo oyente aunque Streamlit vuelva a dibujar el componente.
   if (doc.__pegadoCopiloto) { return; }
@@ -138,11 +146,13 @@ def guion(url_api: str, session_id: str) -> str:
       // El resultado viene como "data:image/png;base64,AAAA..."; la API
       // espera solo la parte de despues de la coma.
       const base64 = String(lector.result).split(",")[1] || "";
-      fetch(CFG.api + "/chat/imagen", {
+      const buzonActivo = (doc.__pegadoCfg && doc.__pegadoCfg.sesion) || CFG.sesion;
+      const apiActiva = (doc.__pegadoCfg && doc.__pegadoCfg.api) || CFG.api;
+      fetch(apiActiva + "/chat/imagen", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          session_id: CFG.sesion,
+          session_id: buzonActivo,
           nombre: nombrar(archivo),
           tipo: archivo.type || "image/png",
           datos: base64
@@ -156,9 +166,19 @@ def guion(url_api: str, session_id: str) -> str:
       })
       .then(function (d) {
         avisar("Imagen pegada (" + d.en_espera + " en espera)", "#1f7a3f");
-        if (!redibujar()) {
-          avisar("Imagen pegada. Escribe y envia.", "#1f7a3f");
-        }
+        // UN REDIBUJADO PARA TODAS, NO UNO POR IMAGEN
+        // -------------------------------------------
+        // Pegar dos capturas a la vez disparaba dos redibujados de la
+        // pagina entera, uno detras de otro, y el segundo tiraba a la
+        // basura el trabajo del primero. Se espera un momento: si llegan
+        // mas imagenes mientras tanto, el contador se reinicia y al final
+        // se redibuja UNA vez con todas dentro.
+        clearTimeout(doc.__pegadoEspera);
+        doc.__pegadoEspera = setTimeout(function () {
+          if (!redibujar()) {
+            avisar("Imagen pegada. Escribe y envia.", "#1f7a3f");
+          }
+        }, ESPERA_AGRUPAR);
       })
       .catch(function (e) {
         avisar("No se pudo pegar: " + e.message, "#9b2226");

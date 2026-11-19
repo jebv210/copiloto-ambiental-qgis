@@ -102,27 +102,94 @@ from core import ajustes as _ajustes_guardados
 _ajustes_guardados.aplicar()
 
 
-# Al arrancar no puede haber ninguna sincronizacion en curso en este proceso,
-# asi que cualquier documento que quede en la carpeta temporal es resto de una
-# ejecucion anterior que se corto a la mitad (o de un contenedor que se
-# reinicio mientras leia). El compromiso es que nada se conserva en el equipo,
-# y ese compromiso no puede depender de que la vez anterior terminara bien.
-try:
-    from core import vectorial as _vectorial_arranque
+# IMPORTAR ESTE ARCHIVO NO PUEDE BORRAR NADA
+# ===========================================
+# Aqui vivian, al nivel del modulo, tres cosas que se hacen al arrancar: la
+# limpieza de lo que quedara descargado, el reintento de los recuerdos sin
+# vector y el calentado del inventario de Drive.
+#
+# La limpieza hace `rmtree` de la carpeta de descargas. Y un modulo no se
+# ejecuta solo cuando uvicorn lo sirve: se ejecuta tambien cuando CUALQUIERA
+# lo importa. La bateria de despliegue carga `api/server.py` con
+# `exec_module` para poder probar sus funciones puras -- algo perfectamente
+# razonable --, y al hacerlo borraba los 3,2 GB que un estudio en marcha
+# acababa de bajar.
+#
+# Paso cuatro veces en dos dias. La ultima quedo cronometrada por el
+# vigilante de la pasada:
+#
+#     desapariciones: [{'cuando': '2026-11-10T20:23:29Z',
+#                       'habia': 425, 'quedan': 0}]
+#
+# y un segundo despues, a las 20:23:30, aparecen en el registro las primeras
+# peticiones de la bateria. No era un fantasma: era un `import`.
+#
+# El sitio de lo que pasa al arrancar es el arranque de la APLICACION, no el
+# del archivo. Con esto, importar `api.server` es inofensivo por
+# construccion, y no por que el cartel del estudio llegue a tiempo.
+#: Lo que se encontro al arrancar. Se rellenan en `al_arrancar()`.
+_RESTOS_AL_ARRANCAR: dict = {"estado": "sin arrancar todavia"}
+_MEMORIA_AL_ARRANCAR: dict = {"estado": "sin arrancar todavia"}
 
-    _RESTOS_AL_ARRANCAR = _vectorial_arranque.limpiar_descargas()
-except Exception as _exc:  # pragma: no cover - arranque, nunca debe tumbarlo
-    _RESTOS_AL_ARRANCAR = {"error": str(_exc)[:120]}
+
+def _calentar_la_fuente():
+    """
+    Lista Drive una vez, para que el primero que pregunte no espere.
+
+    Listar la carpeta cuesta once segundos y el resultado se guarda un
+    cuarto de hora. El problema es QUIEN paga la primera vez: sin esto,
+    quien hiciera la primera pregunta despues de arrancar. Se midio 14,5 s
+    la primera consulta al corpus y 0,23 s la siguiente, la misma pregunta.
+    """
+    try:
+        from core import fuentes as _fu_calentar
+
+        _fu_calentar.estado()
+    except Exception:
+        pass  # si no se puede, se pagara a la primera pregunta, como antes
 
 
-# Recuerdos que se quedaron sin vector por un corte de red. Al arrancar hay
-# conexion recien hecha, que es el mejor momento para colocarlos.
-try:
-    from core import memoria as _memoria_arranque
+@app.on_event("startup")
+def al_arrancar() -> None:
+    """
+    Lo que hay que hacer cuando la aplicacion empieza a servir.
 
-    _MEMORIA_AL_ARRANCAR = _memoria_arranque.reintentar_pendientes()
-except Exception as _exc:  # pragma: no cover
-    _MEMORIA_AL_ARRANCAR = {"error": str(_exc)[:120]}
+    Se ejecuta UNA vez, y solo cuando uvicorn levanta la aplicacion de
+    verdad. Importar el modulo no dispara nada de esto, que es justo el
+    punto: ver la nota de arriba.
+    """
+    global _RESTOS_AL_ARRANCAR, _MEMORIA_AL_ARRANCAR
+
+    # Al arrancar no puede haber ninguna sincronizacion en curso en este
+    # proceso, asi que cualquier documento que quede en la carpeta temporal
+    # es resto de una ejecucion anterior que se corto a la mitad (o de un
+    # contenedor que se reinicio mientras leia). El compromiso es que nada se
+    # conserva en el equipo, y ese compromiso no puede depender de que la vez
+    # anterior terminara bien.
+    try:
+        from core import vectorial as _vectorial_arranque
+
+        _RESTOS_AL_ARRANCAR = _vectorial_arranque.limpiar_descargas()
+    except Exception as _exc:  # pragma: no cover
+        _RESTOS_AL_ARRANCAR = {"error": str(_exc)[:120]}
+
+    # Recuerdos que se quedaron sin vector por un corte de red. Al arrancar
+    # hay conexion recien hecha, que es el mejor momento para colocarlos.
+    try:
+        from core import memoria as _memoria_arranque
+
+        _MEMORIA_AL_ARRANCAR = _memoria_arranque.reintentar_pendientes()
+    except Exception as _exc:  # pragma: no cover
+        _MEMORIA_AL_ARRANCAR = {"error": str(_exc)[:120]}
+
+    # En un hilo aparte: ni bloquea el arranque ni se lo encuentra nadie.
+    try:
+        import threading as _hilos_arranque
+
+        _hilos_arranque.Thread(target=_calentar_la_fuente,
+                               daemon=True).start()
+    except Exception:
+        pass
 
 
 #: Conector espacial. Ya no lanza excepcion si falta la Geodatabase: se
@@ -444,7 +511,7 @@ _SINCRONIZACION = {
     "error": None,
     # Sin estos tres, un "Estudiando..." en pantalla no se distingue de un
     # trabajo colgado: no se sabe si empezo hace diez segundos o hace una
-    # hora, ni si lo lanzo el cron de las 10:30 o alguien desde la interfaz.
+    # hora, ni si lo lanzo el cron de las 02:00 o alguien desde la interfaz.
     "arranco": None,
     "origen": "",
     "documento": "",
@@ -490,6 +557,39 @@ def _archivo_ultima_sincronizacion() -> str:
     return _os.path.join(carpeta, "ultima_sincronizacion.json")
 
 
+def _sin_sustitutos(valor):
+    """
+    Deja un valor en condiciones de escribirse como UTF-8.
+
+    POR QUE UN NOMBRE DE ARCHIVO PUEDE TUMBAR EL INFORME
+    ----------------------------------------------------
+    Cuando Python lee un nombre de archivo cuyos bytes no son UTF-8 valido
+    -- y en un montaje de Windows pasa -- mete "sustitutos" sueltos en la
+    cadena. Esa cadena se puede manejar, pero NO se puede escribir:
+    `json.dump` levanta "UnicodeEncodeError: surrogates not allowed".
+
+    El dano no es el error, es donde cae: el informe del estudio se escribe
+    al terminar, y si revienta ahi la pasada entera se queda sin constancia.
+    Al volver, la pantalla dice "Sin estudios en esta sesion" sobre un
+    estudio que si hubo y que puede haber durado horas.
+
+    Args:
+        valor: Cualquier cosa que vaya a json.dump.
+
+    Returns:
+        Lo mismo, con los sustitutos cambiados por un interrogante. Se
+        prefiere un nombre con un interrogante a no tener informe.
+    """
+    if isinstance(valor, str):
+        return valor.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(valor, dict):
+        return {_sin_sustitutos(k): _sin_sustitutos(v)
+                for k, v in valor.items()}
+    if isinstance(valor, (list, tuple)):
+        return [_sin_sustitutos(v) for v in valor]
+    return valor
+
+
 def _dejar_constancia(estado: dict) -> None:
     """
     Guarda en disco como acabo la sincronizacion.
@@ -515,18 +615,229 @@ def _dejar_constancia(estado: dict) -> None:
     import json as _json
 
     try:
+        cuerpo = {
+            "cuando": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+            "origen": estado.get("origen", ""),
+            "mensaje": estado.get("mensaje", ""),
+            "error": estado.get("error"),
+            "resultado": estado.get("resultado"),
+            # SIN ESTO, UN ESTUDIO MUERTO SE LEE COMO UNO TERMINADO
+            # -----------------------------------------------------
+            # Se anota si quedo cerrado. La constancia se escribia solo al
+            # final, asi que un estudio que moria a mitad -- la API
+            # reiniciada, el equipo dormido -- no dejaba ninguna linea: al
+            # volver, el sistema decia "sin sincronizaciones en esta sesion",
+            # igual que si el cron no se hubiera disparado nunca.
+            #
+            # Y n8n hacia lo mismo: su bucle sale en cuanto la API deja de
+            # decir "ejecutando", y una API recien arrancada dice exactamente
+            # eso. Tres estudios muertos quedaron marcados como `success`.
+            "terminado": not estado.get("ejecutando", False),
+        }
         with open(_archivo_ultima_sincronizacion(), "w",
                   encoding="utf-8") as fh:
-            _json.dump({
-                "cuando": time.strftime("%Y-%m-%dT%H:%M:%S",
-                                        time.localtime()),
-                "origen": estado.get("origen", ""),
-                "mensaje": estado.get("mensaje", ""),
-                "error": estado.get("error"),
-                "resultado": estado.get("resultado"),
-            }, fh, ensure_ascii=False, indent=2)
-    except OSError:
+            _json.dump(_sin_sustitutos(cuerpo), fh, ensure_ascii=False,
+                       indent=2)
+    except Exception:
+        # Se traga CUALQUIER fallo, no solo los de disco. Antes solo miraba
+        # OSError, y un UnicodeEncodeError por un nombre de archivo raro
+        # subia hasta el hilo del estudio y lo dejaba sin informe.
         pass
+
+
+def _con_lo_que_paso_la_vez_anterior(trabajo: dict) -> dict:
+    """
+    Adjunta al estado el registro del ultimo estudio que hubo.
+
+    Lo usan los DOS endpoints de estado. Cuando solo lo hacia uno, la misma
+    aplicacion daba dos versiones del mismo hecho segun la pestana: la banda
+    del chat fechaba el fallo y la pestana de Drive lo pintaba en rojo sin
+    decir de cuando era.
+
+    Args:
+        trabajo: El bloque de seguimiento en memoria.
+
+    Returns:
+        El mismo diccionario con `anterior` y con la marca de si el estudio
+        anterior quedo a medias.
+    """
+    import json as _json
+
+    try:
+        with open(_archivo_ultima_sincronizacion(), encoding="utf-8") as fh:
+            trabajo["anterior"] = _json.load(fh)
+    except (OSError, ValueError):
+        trabajo["anterior"] = None
+
+    return _marcar_si_quedo_a_medias(trabajo)
+
+
+def _marcar_si_quedo_a_medias(trabajo: dict) -> dict:
+    """
+    Declara que el estudio anterior se corto, si asi fue.
+
+    UN ESTUDIO INTERRUMPIDO NO ES "NINGUN ESTUDIO"
+    ----------------------------------------------
+    Si el ultimo quedo sin cerrar y ahora no hay nada en marcha, es que
+    murio por el camino: la API se reinicio, el equipo se durmio. Antes eso
+    se leia como "Sin sincronizaciones en esta sesion", exactamente igual
+    que si el cron no se hubiera disparado nunca -- y de ahi la pregunta
+    razonable de "el cron no esta funcionando?" sobre un cron que se
+    disparaba todos los dias.
+
+    n8n cometia el mismo error por su cuenta: su bucle sale en cuanto la
+    API deja de decir "ejecutando", y una API recien arrancada dice justo
+    eso. Tres estudios muertos quedaron marcados como `success`.
+
+    Args:
+        trabajo: El bloque de seguimiento, ya con su clave `anterior`.
+
+    Returns:
+        El mismo diccionario, con `interrumpida` y, si procede, el motivo.
+    """
+    anterior = trabajo.get("anterior") or {}
+    if (trabajo.get("ejecutando") or not anterior
+            or anterior.get("terminado") is not False):
+        trabajo["interrumpida"] = False
+        return trabajo
+
+    trabajo["interrumpida"] = True
+    trabajo["mensaje"] = (
+        f"El estudio que empezo el {anterior.get('cuando', '?')} "
+        f"({anterior.get('origen') or 'sin identificar'}) se corto antes de "
+        f"terminar: la API se reinicio o el equipo se durmio. Lo que alcanzo "
+        f"a indexar NO se pierde; al volver a estudiar sigue por donde iba.")
+    if trabajo.get("error") is None:
+        trabajo["error"] = trabajo["mensaje"]
+    return trabajo
+
+
+def _resumen_de_la_pasada(resultado: dict) -> str:
+    """
+    Redacta en una linea como fue la sincronizacion.
+
+    LO QUE IMPORTA VA PRIMERO
+    -------------------------
+    El mensaje empezaba por los documentos intentados, y eso se lee como un
+    exito aunque no haya entrado ni una ficha al indice: "367 documentos" y
+    cero fichas es una pasada fallida, no una buena.
+
+    Lo que hay que mirar para saber si una pasada sirvio de algo es
+    cuantas fichas entraron, y eso es lo que va primero.
+
+    Args:
+        resultado: Lo que devolvio la indexacion.
+
+    Returns:
+        El mensaje para la interfaz y para n8n.
+    """
+    fichas = resultado.get("fichas", 0)
+    trozos = [f"{fichas} fichas nuevas en el indice"]
+    trozos.append(f"{resultado.get('nuevos', 0)} documentos leidos")
+    if resultado.get("sin_cambios"):
+        trozos.append(f"{resultado['sin_cambios']} sin cambios")
+    if resultado.get("borrados"):
+        trozos.append(f"{resultado['borrados']} borrados")
+    # Un documento que desaparecio del equipo y se volvio a pedir NO es un
+    # fallo, pero tampoco es un no-evento: si pasa, hay algo que mirar.
+    if resultado.get("rebajados"):
+        trozos.append(f"{resultado['rebajados']} hubo que volver a bajarlos "
+                      f"porque desaparecieron del equipo")
+
+    pendientes = []
+    if resultado.get("sin_descargar"):
+        pendientes.append(f"{len(resultado['sin_descargar'])} no llegaron a "
+                          f"bajarse")
+    if resultado.get("sin_contenido"):
+        pendientes.append(f"{len(resultado['sin_contenido'])} no dieron "
+                          f"texto")
+    if resultado.get("incompletos"):
+        _huecos = sum(d.get("sin_vector", 0)
+                      for d in resultado["incompletos"])
+        pendientes.append(f"{len(resultado['incompletos'])} entraron "
+                          f"incompletos ({_huecos} fichas sin vector)")
+    if resultado.get("fallidos"):
+        pendientes.append(f"{len(resultado['fallidos'])} fallaron")
+
+    mensaje = "Listo: " + ", ".join(trozos) + "."
+    if pendientes:
+        mensaje += " Quedan fuera: " + ", ".join(pendientes) + "."
+    return mensaje
+
+
+def _lo_que_salio_mal(resultado: dict) -> str:
+    """
+    Decide si una pasada que no revento merece contarse como fallida.
+
+    UNA PASADA QUE NO INDEXA NADA NO ES UNA PASADA BUENA
+    ----------------------------------------------------
+    No levanta ninguna excepcion -- cada documento fallo por su cuenta y se
+    anoto --, asi que llegaba hasta aqui con `error: None` y se pintaba en
+    verde. n8n tambien la daba por buena, porque lo unico que mira es el
+    error. Dos sitios distintos informando de que todo fue bien sobre un
+    indice que no crecio ni una ficha.
+
+    Args:
+        resultado: Lo que devolvio la indexacion.
+
+    Returns:
+        El motivo, o cadena vacia si la pasada fue sana.
+    """
+    sin_bajar = len(resultado.get("sin_descargar") or [])
+    intentados = resultado.get("nuevos", 0) + resultado.get("actualizados", 0)
+
+    # SE BAJARON Y DESAPARECIERON NO ES LO MISMO QUE NO SE BAJARON
+    # -------------------------------------------------------------
+    # El aviso decia "la descarga no llego a completarse" sobre pasadas que
+    # SI habian bajado los 3,2 GB enteros: lo que paso es que algo vacio la
+    # carpeta entre la descarga y la lectura. Mandar a alguien a mirar su
+    # conexion cuando el problema es otro cuesta horas.
+    #
+    # El vigilante de la pasada apunta la hora exacta en que la carpeta se
+    # quedo sin archivos. Si hay constancia de eso, se dice eso.
+    _desapariciones = resultado.get("desapariciones") or []
+    if sin_bajar and _desapariciones:
+        _primera = _desapariciones[0]
+        _hora = str(_primera.get("cuando", "?")).replace("T", " a las ")[:19]
+        _pico = resultado.get("maximo_en_disco") or _primera.get("habia", 0)
+        return (
+            f"{sin_bajar} documentos se habian bajado y ya no estaban cuando "
+            f"les llego el turno de leerse. NO es un problema de conexion ni "
+            f"de Drive: llegaron a haber {_pico} archivos en el equipo y la "
+            f"carpeta se vacio el {_hora} (quedaron "
+            f"{_primera.get('quedan', 0)}). Algo ajeno al estudio la borro "
+            f"mientras trabajaba. Vuelve a lanzarlo y, si se repite, mira que "
+            f"habia corriendo a esa hora.")
+
+    if sin_bajar and sin_bajar >= max(1, intentados // 2):
+        # EL MOTIVO QUE MAS SE REPITE, DICHO
+        # ----------------------------------
+        # Decia solo cuantos faltaban. Eso basta para saber que la pasada
+        # esta mal y no basta para arreglarla: un 403 de Drive y una carpeta
+        # borrada a mitad se leian exactamente igual. Ahora se cuenta cual
+        # fue el tropiezo mas frecuente y se pone en el aviso.
+        import collections as _col
+
+        _motivos = _col.Counter(
+            (d.get("motivo") or "").split(":")[0].strip()
+            for d in (resultado.get("sin_descargar") or [])
+            if d.get("motivo"))
+        _comun = ""
+        if _motivos:
+            _nombre, _veces = _motivos.most_common(1)[0]
+            if _nombre and _nombre != "no estaba en el equipo al ir a leerlo":
+                _comun = (f" El tropiezo mas repetido fue '{_nombre}' "
+                          f"({_veces} veces).")
+        return (f"{sin_bajar} de {intentados} documentos no llegaron a "
+                f"bajarse del Drive, asi que no se pudieron leer. No es un "
+                f"problema de lectura: es que los archivos no estaban en el "
+                f"equipo.{_comun} Vuelve a lanzar el estudio.")
+
+    if intentados and not resultado.get("fichas"):
+        return (f"Se procesaron {intentados} documentos y no entro NI UNA "
+                f"ficha al indice. Algo impidio leerlos o vectorizarlos; "
+                f"mira el detalle de los que quedaron fuera.")
+    return ""
 
 
 def _trabajo_sincronizar(forzar: bool) -> None:
@@ -554,17 +865,19 @@ def _trabajo_sincronizar(forzar: bool) -> None:
             # esta leyendo ahora mismo sin tener que descomponer el texto.
             _SINCRONIZACION["documento"] = mensaje.split("] ", 1)[-1].strip()
 
+    # Se firma la entrada antes de empezar. Si esto es lo ultimo que queda
+    # escrito, es que el trabajo no llego al final, y eso es justo lo que
+    # hay que poder saber luego.
+    with _CERROJO:
+        _dejar_constancia(_SINCRONIZACION)
+
     try:
         resultado = vectorial.indexar(forzar=forzar, progreso=avanzar)
         with _CERROJO:
             _SINCRONIZACION.update({
-                "resultado": resultado, "error": None, "avance": 1.0,
-                "mensaje": (
-                    f"Listo: {resultado['nuevos']} nuevos, "
-                    f"{resultado['actualizados']} actualizados, "
-                    f"{resultado['sin_cambios']} sin cambios, "
-                    f"{resultado['borrados']} borrados."
-                ),
+                "resultado": resultado, "avance": 1.0,
+                "mensaje": _resumen_de_la_pasada(resultado),
+                "error": _lo_que_salio_mal(resultado),
             })
     except Exception as exc:
         with _CERROJO:
@@ -710,14 +1023,7 @@ def estado_sincronizacion():
     # Va en una clave aparte y no mezclada: una cosa es lo que esta pasando
     # ahora y otra lo que paso la ultima vez. Confundirlas haria creer que
     # hay trabajo en marcha cuando no lo hay.
-    import json as _json
-
-    try:
-        with open(_archivo_ultima_sincronizacion(), encoding="utf-8") as fh:
-            trabajo["anterior"] = _json.load(fh)
-    except (OSError, ValueError):
-        trabajo["anterior"] = None
-    return trabajo
+    return _con_lo_que_paso_la_vez_anterior(trabajo)
 
 
 @app.get("/corpus/estado", summary="Estado del corpus y del indice vectorial")
@@ -748,6 +1054,18 @@ def estado_corpus():
         trabajo["segundos"] = round(time.time() - trabajo["arranco"], 1)
     else:
         trabajo["segundos"] = None
+
+    # AQUI TAMBIEN HACE FALTA SABER COMO ACABO LA ANTERIOR
+    # ----------------------------------------------------
+    # `/corpus/sincronizacion` adjunta el registro del ultimo estudio y este
+    # no lo hacia, asi que la pestana "Drive y Estudio" -- que lee de aqui --
+    # pintaba un aviso rojo SIN fecha, sin saber quien lo habia lanzado y,
+    # tras un reinicio, directamente decia "Sin sincronizaciones en esta
+    # sesion" sobre un estudio que habia fallado media hora antes.
+    #
+    # Dos pantallas de la misma aplicacion contaban cosas distintas del
+    # mismo hecho. Ahora las dos leen lo mismo.
+    trabajo = _con_lo_que_paso_la_vez_anterior(trabajo)
 
     fuente = fuentes.estado()
 
@@ -864,6 +1182,17 @@ class AgenteChatInput(BaseModel):
             "Si se recogen las imagenes que esa sesion haya dejado pegadas. "
             "Asi una imagen pegada llega al modelo venga la pregunta por "
             "donde venga, sin tener que viajar en el cuerpo de la peticion."))
+    buzon_id: str | None = Field(
+        None,
+        description=(
+            "De que buzon recoger las imagenes pegadas. EL BUZON NO ES LA "
+            "CONVERSACION: la conversacion cambia al abrir otra o al empezar "
+            "una nueva, y el buzon pertenece a la PESTANA del navegador, que "
+            "es donde esta el portapapeles. Cuando colgaban del mismo "
+            "identificador, pegabas una captura, el guion la guardaba bajo la "
+            "charla de ese momento y para cuando enviabas el mensaje la "
+            "charla era otra: la imagen seguia en el servidor, bajo un nombre "
+            "que ya no miraba nadie. Si no se indica, se usa `session_id`."))
 
 
 _SESIONES_AGENTE: dict = {}
@@ -927,6 +1256,28 @@ def agente_chat(payload: AgenteChatInput):
     clave = payload.api_key or settings.api_key_gemini()
     session_id = payload.session_id or "default"
 
+    # UNA PETICION MAL FORMADA NO ES UNA CAIDA DEL SERVIDOR
+    # -----------------------------------------------------
+    # Si el identificador no vale, `guardar_mensaje` levanta y FastAPI lo
+    # convierte en un 500. Eso le dice a n8n "el servidor se rompio" cuando
+    # lo que pasa es que la peticion venia mal, y de paso la pregunta de
+    # quien escribio se pierde con un aviso que no explica nada.
+    #
+    # Se vio asi: una pestana abierta de antes seguia mandando el texto
+    # "Charla actual (en curso)" como identificador. La respuesta del agente
+    # llegaba bien, pero el intercambio no se guardaba y la pantalla decia
+    # "El orquestador de n8n no respondio (HTTP Error 500)". El 500 era
+    # nuestro, y el motivo real no aparecia por ningun lado.
+    if not memoria.es_identificador_de_sesion(session_id):
+        raise HTTPException(
+            status_code=400,
+            detail=(f"El identificador de conversacion '{session_id}' no "
+                    f"vale: lleva espacios o simbolos, asi que es una "
+                    f"etiqueta de pantalla y no un identificador. Recarga la "
+                    f"pagina para empezar una conversacion con uno nuevo; lo "
+                    f"que ya estaba guardado no se pierde."),
+        )
+
     # 1. Guardar mensaje del usuario en base de datos SQLite
     memoria.guardar_mensaje(session_id, "user", payload.pregunta)
 
@@ -943,9 +1294,19 @@ def agente_chat(payload: AgenteChatInput):
                 agente._recordar(m["role"], m["content"])
         _SESIONES_AGENTE[session_id] = agente
 
-    # 3. Las imagenes que se hayan pegado en esta sesion viajan con la
-    #    pregunta. Se consumen al leerlas: una imagen se mira una vez.
-    adjuntas = (_imagenes_de_la_sesion(session_id)
+    # 3. Las imagenes que se hayan pegado viajan con la pregunta. Se consumen
+    #    al leerlas: una imagen se mira una vez.
+    #
+    #    EL BUZON NO ES LA CONVERSACION
+    #    ------------------------------
+    #    Colgaba del identificador de la charla, y ese identificador cambia:
+    #    al abrir otra conversacion, al empezar una nueva. Pegabas una
+    #    captura, se guardaba bajo la charla de ese momento, y para cuando
+    #    enviabas el mensaje la charla era otra: la imagen seguia en el
+    #    servidor bajo un nombre que ya no miraba nadie, y el agente
+    #    contestaba que no puede con imagenes.
+    buzon = payload.buzon_id or session_id
+    adjuntas = (_imagenes_de_la_sesion(buzon)
                 if payload.con_imagenes else [])
 
     # El agente guarda recuerdos por su cuenta en un hilo de fondo. Cuando
@@ -1029,6 +1390,45 @@ TOPE_IMAGEN_BYTES = 12 * 1024 * 1024
 #: Cuantas imagenes se guardan a la vez por sesion.
 TOPE_IMAGENES_POR_SESION = 6
 
+#: Alto en pixeles de la vista previa que se guarda de cada imagen pegada.
+#:
+#: La vista previa existe porque el portapapeles entrega casi siempre un
+#: archivo llamado "image.png": pegar tres capturas distintas daba tres
+#: lineas identicas en pantalla y no habia forma de saber cual era cual.
+ALTO_MINIATURA_PEGADA = 90
+
+
+def _miniatura_base64(crudo: bytes) -> str:
+    """
+    Reduce una imagen a una vista previa diminuta, en base64.
+
+    Se guarda WEBP y no PNG: con una captura de 1920x1080 se midio 12,2 kB
+    en PNG frente a 0,7 kB en WEBP, con la misma pinta.
+
+    Args:
+        crudo: La imagen original, en bytes.
+
+    Returns:
+        La miniatura en base64, o cadena vacia si no se pudo hacer. Que
+        falle no puede impedir pegar: el modelo mira la imagen completa, la
+        miniatura es solo para verla en pantalla.
+    """
+    import base64
+    import io
+
+    from PIL import Image
+
+    try:
+        imagen = Image.open(io.BytesIO(crudo))
+        imagen.thumbnail((ALTO_MINIATURA_PEGADA * 4, ALTO_MINIATURA_PEGADA))
+        if imagen.mode not in ("RGB", "RGBA"):
+            imagen = imagen.convert("RGB")
+        chico = io.BytesIO()
+        imagen.save(chico, "WEBP", quality=70)
+        return base64.b64encode(chico.getvalue()).decode("utf-8")
+    except Exception:
+        return ""
+
 
 class ImagenPegadaInput(BaseModel):
     """Una imagen que alguien acaba de pegar en el chat."""
@@ -1076,7 +1476,11 @@ def guardar_imagen_pegada(entrada: ImagenPegadaInput):
                 detail=f"Ya hay {len(cola)} imagenes en espera. Envia el "
                        f"mensaje o quitalas antes de pegar mas.")
         cola.append({"nombre": entrada.nombre, "tipo": entrada.tipo,
-                     "bytes": len(crudo), "datos": entrada.datos})
+                     "bytes": len(crudo), "datos": entrada.datos,
+                     # La vista previa va aqui y no se calcula al pintar: si
+                     # se hiciera en cada pasada de la interfaz, pegar una
+                     # captura costaria redimensionarla una y otra vez.
+                     "miniatura": _miniatura_base64(crudo)})
         return {"estado": "guardada", "en_espera": len(cola)}
 
 
@@ -1157,7 +1561,7 @@ def borrar_imagenes_pegadas(session_id: str):
 # ==============================================================================
 
 @app.get("/corpus/fuente", summary="Diagnostico de la fuente documental")
-def diagnostico_fuente():
+def diagnostico_fuente(refrescar: bool = False):
     """
     Cuenta si la fuente esta conectada y que trae, sin indexar nada.
 
@@ -1169,6 +1573,15 @@ def diagnostico_fuente():
         `por_categoria`, `por_formato` e `imagenes`.
     """
     from core import corpus, fuentes
+
+    # EL BOTON DE "VOLVER A PROBAR" TIENE QUE PODER SALTARSE LA CAJA
+    # --------------------------------------------------------------
+    # El inventario de Drive se guarda un cuarto de hora, porque recorrerlo
+    # cuesta once segundos y entre dos preguntas del chat no cambia nada.
+    # Pero quien acaba de subir un archivo no quiere esperar quince minutos
+    # para verlo contado, y sin esta puerta no tendria forma de forzarlo.
+    if refrescar:
+        fuentes.olvidar_estado()
 
     base = fuentes.estado()
     detalle = {"por_categoria": [], "por_formato": [], "imagenes": 0,

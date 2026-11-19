@@ -50,6 +50,50 @@ from core import corpus, fuentes
 #: seguridad: con el regulador de ritmo de mas abajo casi nunca se usan.
 ESPERAS_REINTENTO = [2, 5, 15, 40, 70]
 
+#: Cuantos lotes seguidos tienen que chocar con la cuota para dar el dia por
+#: perdido y dejar de esperarla.
+#:
+#: POR QUE HAY QUE RENDIRSE, Y PRONTO
+#: -----------------------------------
+#: Cada lote que choca con la cuota cuesta 2+5+15+40+70 = 132 segundos de
+#: espera antes de rendirse. Con una cuota diaria agotada y cuatrocientos
+#: documentos por delante, eso son HORAS de no hacer nada, documento a
+#: documento, para acabar fallando igual.
+#:
+#: Y mientras tanto no se indexa lo que SI es gratis: los vectores que ya
+#: estan en la cache local de dias anteriores, que no necesitan la API para
+#: nada. Se midio en vivo: el indice llevaba 45 segundos clavado en 1.865
+#: fichas, esperando, con miles de vectores ya pagados esperando turno.
+#:
+#: Tres lotes seguidos no es mala suerte: es que hoy ya no hay cuota. A
+#: partir de ahi se sirve solo de la cache, se declara lo que falta y la
+#: pasada termina en minutos en vez de en horas. Manana hay cuota nueva y
+#: se empieza con el contador a cero.
+LOTES_PARA_RENDIRSE = 3
+
+#: Cuantos lotes seguidos han chocado con la cuota en esta pasada.
+_CUOTA = {"seguidos": 0}
+
+
+def olvidar_el_mal_dia() -> None:
+    """Vuelve a dar por buena la cuota. Se llama al empezar cada pasada."""
+    _CUOTA["seguidos"] = 0
+
+
+def _es_de_cuota(error) -> bool:
+    """
+    Dice si un error es "se acabo la cuota" y no otra cosa.
+
+    Args:
+        error: La excepcion que levanto la llamada.
+
+    Returns:
+        True si el mensaje habla de cuota. Un fallo de red NO cuenta: ese se
+        reintenta, porque la red vuelve y la cuota diaria no.
+    """
+    texto = str(error).upper()
+    return "429" in texto or "RESOURCE_EXHAUSTED" in texto or "QUOTA" in texto
+
 #: Tokens por minuto que se asume disponibles.
 #:
 #: MEDIDO, NO SUPUESTO: enviando lotes de 32 fichas de ~900 caracteres sin
@@ -83,7 +127,7 @@ ESPERAS_REINTENTO = [2, 5, 15, 40, 70]
 #: acortaria las sincronizaciones un 40% sin pagar nada; pasarse solo
 #: provoca 429 y reintentos de 40 y 70 segundos, que es MAS lento que ir
 #: frenado.
-TOKENS_POR_MINUTO = int(os.environ.get("TOKENS_POR_MINUTO") or 20000)
+TOKENS_POR_MINUTO = int(os.environ.get("TOKENS_POR_MINUTO") or 40000)
 
 #: Estimacion de tokens a partir de caracteres. Para texto en espanol, cuatro
 #: caracteres por token se queda corto por poco, que es el lado seguro.
@@ -380,7 +424,8 @@ def _clave_cache(texto: str, tarea: str) -> str:
 
 
 def embeber(textos: list, tarea: str = "RETRIEVAL_DOCUMENT",
-            progreso=None, reintentar: bool = True) -> list:
+            progreso=None, reintentar: bool = True,
+            permitir_huecos: bool = False) -> list:
     """
     Convierte una lista de textos en vectores.
 
@@ -394,6 +439,10 @@ def embeber(textos: list, tarea: str = "RETRIEVAL_DOCUMENT",
             No es cosmetico: el modelo coloca la pregunta y el documento en
             espacios distintos, y acertar aqui mejora lo que se recupera.
         progreso: Callback opcional `f(hechos, total)`.
+        permitir_huecos: Si True, devuelve `None` en los fragmentos que no se
+            pudieron vectorizar en vez de levantar. Quien llama se queda con
+            lo que si hay y TIENE QUE declarar lo que falta. Ver el motivo en
+            el cuerpo de la funcion.
 
     Returns:
         Lista de vectores, en el mismo orden que `textos`.
@@ -450,7 +499,23 @@ def embeber(textos: list, tarea: str = "RETRIEVAL_DOCUMENT",
     for inicio in range(0, len(pendientes), tamano):
         lote = pendientes[inicio:inicio + tamano]
         regulador.reservar(_tokens_de(lote))
-        vectores = _embeber_lote(cliente, lote, config, reintentar=reintentar)
+        # Si hoy ya no queda cuota, no se vuelve a preguntar: cada intento
+        # cuesta mas de dos minutos de espera para acabar en el mismo sitio.
+        if permitir_huecos and _CUOTA["seguidos"] >= LOTES_PARA_RENDIRSE:
+            continue
+        try:
+            vectores = _embeber_lote(cliente, lote, config,
+                                     reintentar=reintentar)
+            _CUOTA["seguidos"] = 0
+        except Exception as exc:
+            # Con huecos permitidos, un lote que no sale adelante deja sus
+            # fragmentos sin vector y se sigue con los demas. Sin huecos,
+            # el error sube como siempre.
+            if _es_de_cuota(exc):
+                _CUOTA["seguidos"] += 1
+            if not permitir_huecos:
+                raise
+            continue
 
         for texto, vec in zip(lote, vectores):
             for i in unicos[texto]:
@@ -485,10 +550,37 @@ def embeber(textos: list, tarea: str = "RETRIEVAL_DOCUMENT",
         except Exception:
             pass
 
-    # Si algo quedo sin vector (fallo raro), se devuelve un vector nulo en vez
-    # de None: Qdrant rechazaria el None y tumbaria toda la indexacion.
-    return [v if v is not None else [0.0] * dimensiones_efectivas()
-            for v in resultado]
+    # ANTES AQUI SE RELLENABA CON CEROS, Y ESO ERA EL DESASTRE
+    # --------------------------------------------------------
+    # El razonamiento parecia prudente: Qdrant rechaza un None y tumbaria la
+    # indexacion entera, asi que se ponia un vector de ceros y se seguia. El
+    # problema es lo que significa un vector de ceros en una busqueda por
+    # significado: no se parece a NADA. La ficha entra al indice, cuenta en
+    # los totales, se ve en el panel... y no aparece nunca en una respuesta.
+    #
+    # Un documento que falla y lo dice se arregla. Un documento que falla en
+    # silencio se descubre meses despues, preguntandose por que el agente no
+    # encuentra lo que tiene delante.
+    # PERO QUEDARSE CON LO QUE SI HAY NO ES LO MISMO QUE RELLENAR CON CEROS
+    # ----------------------------------------------------------------------
+    # Un vector de ceros MIENTE: la ficha entra, cuenta en los totales y no
+    # aparece jamas en una busqueda. Omitirla no miente: esa ficha no esta, y
+    # quien llama lo dice en el informe.
+    #
+    # La diferencia importa el dia que la cuota se agota a mitad. Un
+    # documento de 100 fichas con 90 ya en la cache fallaba ENTERO por las 10
+    # que faltaban, y se perdian tambien las 90 que no costaban nada. Con el
+    # indice recien reconstruido eso es la diferencia entre recuperar lo que
+    # el sistema ya sabia y no recuperarlo.
+    faltan_ahora = [i for i, v in enumerate(resultado) if v is None]
+    if faltan_ahora and permitir_huecos and len(faltan_ahora) < len(textos):
+        return resultado
+    if faltan_ahora:
+        raise RuntimeError(
+            f"{len(faltan_ahora)} de {len(textos)} fragmentos se quedaron "
+            f"sin vector. No se indexan en ceros: una ficha con vector nulo "
+            f"no sale jamas en una busqueda y nadie se entera")
+    return resultado
 
 
 def _embeber_lote(cliente, lote: list, config, reintentar: bool = True) -> list:
@@ -512,15 +604,34 @@ def _embeber_lote(cliente, lote: list, config, reintentar: bool = True) -> list:
     for intento, espera in enumerate(esperas, start=1):
         try:
             r = cliente.models.embed_content(
-                model=MODELO_EMBEDDINGS, contents=lote, config=config)
-            return [list(e.values) for e in r.embeddings]
+                model=MODELO_EMBEDDINGS, contents=_como_documentos(lote),
+                config=config)
+            vectores = [list(e.values) for e in (r.embeddings or [])]
+            # EL FALLO QUE NADIE VEIA
+            # -----------------------
+            # Si la API devuelve menos vectores de los que se pidieron, los
+            # textos que se quedaron sin vector acababan mas abajo con un
+            # vector de ceros, y un vector de ceros no se parece a nada: la
+            # ficha entra al indice y NUNCA sale en una busqueda. El agente
+            # decia "no tengo informacion" sobre documentos que estaban
+            # perfectamente indexados.
+            #
+            # Se midio cuando ya habia pasado: 12.218 de 14.532 fichas, el
+            # 84% del indice, guardadas en ceros. Nada lo avisaba porque
+            # nada lo comprobaba. Esta linea es esa comprobacion.
+            if len(vectores) != len(lote):
+                raise RuntimeError(
+                    f"se pidieron {len(lote)} vectores y la API devolvio "
+                    f"{len(vectores)}")
+            return vectores
         except Exception as exc:
             ultimo_error = exc
             if not _es_cuota(exc):
                 raise
-            # Se anade una pizca de azar para que varios procesos que reintentan
-            # a la vez no vuelvan a chocar en el mismo instante.
-            time.sleep(espera + random.uniform(0, 1.5))
+            if intento < len(esperas):
+                # Se anade una pizca de azar para que varios procesos que reintentan
+                # a la vez no vuelvan a chocar en el mismo instante.
+                time.sleep(espera + random.uniform(0, 1.5))
 
     # No se afirma "sin cuota": esta funcion reintenta ante CUALQUIER fallo
     # pasajero, y la mayoria de las veces no es la cuota sino un corte de red.
@@ -531,6 +642,38 @@ def _embeber_lote(cliente, lote: list, config, reintentar: bool = True) -> list:
         f"La API de embeddings no respondio tras {len(esperas)} intentos. "
         f"Ultimo error: {ultimo_error}"
     )
+
+
+def _como_documentos(lote: list) -> list:
+    """
+    Envuelve cada texto para que la API lo trate como un documento aparte.
+
+    POR QUE NO SE MANDAN LAS CADENAS A SECAS
+    ----------------------------------------
+    Porque el cliente de Gemini NO interpreta una lista de cadenas como una
+    lista de documentos: la interpreta como UN documento partido en trozos.
+    Se le mandaban 32 fichas y devolvia un vector -- el de las 32 pegadas --
+    sin dar ningun error.
+
+    El efecto era doble y los dos lados eran silenciosos. La ficha que si
+    recibia vector recibia el equivocado, y las otras 31 acababan con un
+    vector de ceros, que no se parece a ninguna consulta y por tanto no
+    aparece jamas en una busqueda. El indice crecia, los numeros cuadraban y
+    el agente seguia diciendo que no encontraba nada.
+
+    Envolviendo cada texto en su propio `Content` la API devuelve tantos
+    vectores como textos. Se comprueba ademas en `_embeber_lote`, porque de
+    esto no se vuelve a uno fiar.
+
+    Args:
+        lote: Textos del lote.
+
+    Returns:
+        Lista de contenidos, uno por texto.
+    """
+    from google.genai import types
+
+    return [types.Content(parts=[types.Part(text=t)]) for t in lote]
 
 
 #: Senales de un fallo PASAJERO, que se arregla volviendo a intentarlo.
@@ -674,6 +817,74 @@ def _tirar_coleccion(cliente, nombre: str) -> None:
         pass
 
 
+def _asegurar_indices(cliente, nombre: str) -> None:
+    """
+    Crea los indices de payload que necesita la coleccion.
+
+    Se llama SIEMPRE, exista ya la coleccion o no: crear un indice
+    que ya esta no cuesta nada, y no crearlo cuesta la busqueda.
+
+    Args:
+        cliente: Cliente de Qdrant.
+        nombre: Nombre de la coleccion.
+    """
+    from qdrant_client import models
+
+    # El modo embebido los ignora y avisa por consola, asi que solo se
+    # crean cuando hay servidor detras.
+    if not en_servidor():
+        return
+
+    # UN INDICE DE TEXTO SOBRE `texto`, QUE ES LO QUE SALVA LOS DIAS SIN CUOTA
+    # -------------------------------------------------------------------------
+    # Buscar por significado cuesta una llamada a la API por pregunta. Cuando
+    # la cuota diaria se agota, el agente deja de poder consultar su propio
+    # indice: puede tener miles de fichas dentro y contestar "no se encontro
+    # nada". Con este indice se puede buscar por palabras, que no cuesta nada
+    # y no depende de nadie.
+    try:
+        cliente.create_payload_index(
+            collection_name=nombre, field_name="texto",
+            field_schema=models.TextIndexParams(
+                type=models.TextIndexType.TEXT,
+                tokenizer=models.TokenizerType.MULTILINGUAL,
+                min_token_len=3, max_token_len=30, lowercase=True))
+    except Exception:
+        # Si esta version de Qdrant no admite el tokenizador multilingue, se
+        # intenta con el sencillo antes de rendirse.
+        try:
+            cliente.create_payload_index(
+                collection_name=nombre, field_name="texto",
+                field_schema=models.TextIndexParams(
+                    type=models.TextIndexType.TEXT,
+                    tokenizer=models.TokenizerType.WORD,
+                    min_token_len=3, max_token_len=30, lowercase=True))
+        except Exception:
+            pass  # ya existia, o esta version no lo admite
+
+    for campo in ("documento", "clave", "huella", "categoria"):
+        try:
+            cliente.create_payload_index(
+                collection_name=nombre, field_name=campo,
+                field_schema=models.PayloadSchemaType.KEYWORD)
+        except Exception:
+            pass  # ya existia
+
+    # La fecha va como DATETIME, no como KEYWORD: `order_by` de Qdrant exige
+    # un indice de rango, y con uno de texto devuelve los puntos en un orden
+    # cualquiera sin quejarse. Se crea aqui, junto a los demas, porque al
+    # vaciar y recrear la coleccion se perdia y nadie lo notaba hasta que una
+    # consulta ordenada por fecha devolvia cualquier cosa.
+    for campo, tipo in (("fecha_indexado", models.PayloadSchemaType.DATETIME),
+                        ("indexado_unix", models.PayloadSchemaType.INTEGER)):
+        try:
+            cliente.create_payload_index(
+                collection_name=nombre, field_name=campo, field_schema=tipo)
+        except Exception:
+            pass  # ya existia
+
+
+
 def asegurar_coleccion(cliente=None) -> None:
     """
     Crea la coleccion de Qdrant si todavia no existe.
@@ -697,6 +908,14 @@ def asegurar_coleccion(cliente=None) -> None:
         guardada = _firma_guardada(cliente, nombre)
 
         if guardada == _firma_actual():
+            # LOS INDICES SE REVISAN AUNQUE LA COLECCION YA ESTE BIEN
+            # -------------------------------------------------------
+            # Esto salia por aqui y no miraba los indices de payload. El dia
+            # que se anadio el indice de texto -- el que permite buscar sin
+            # gastar cuota -- no se creo en ninguna coleccion existente, que
+            # son justamente todas. Crear un indice que ya esta no cuesta
+            # nada; no crearlo cuesta la busqueda entera.
+            _asegurar_indices(cliente, nombre)
             return
 
         if guardada is None:
@@ -726,33 +945,7 @@ def asegurar_coleccion(cliente=None) -> None:
             },
         )
     _guardar_firma(cliente, nombre)
-
-    # Sin indice sobre `documento` el borrado por documento recorre la
-    # coleccion entera, y el reindexado incremental deja de ser incremental.
-    # El modo embebido los ignora y avisa por consola, asi que solo se crean
-    # cuando hay servidor detras.
-    if not en_servidor():
-        return
-    for campo in ("documento", "huella", "categoria"):
-        try:
-            cliente.create_payload_index(
-                collection_name=nombre, field_name=campo,
-                field_schema=models.PayloadSchemaType.KEYWORD)
-        except Exception:
-            pass  # ya existia
-
-    # La fecha va como DATETIME, no como KEYWORD: `order_by` de Qdrant exige
-    # un indice de rango, y con uno de texto devuelve los puntos en un orden
-    # cualquiera sin quejarse. Se crea aqui, junto a los demas, porque al
-    # vaciar y recrear la coleccion se perdia y nadie lo notaba hasta que una
-    # consulta ordenada por fecha devolvia cualquier cosa.
-    for campo, tipo in (("fecha_indexado", models.PayloadSchemaType.DATETIME),
-                        ("indexado_unix", models.PayloadSchemaType.INTEGER)):
-        try:
-            cliente.create_payload_index(
-                collection_name=nombre, field_name=campo, field_schema=tipo)
-        except Exception:
-            pass  # ya existia
+    _asegurar_indices(cliente, nombre)
 
 
 def _ahora_iso() -> str:
@@ -779,6 +972,94 @@ def _ahora_iso() -> str:
         "%Y-%m-%dT%H:%M:%SZ")
 
 
+def clave_de_documento(doc: dict) -> str:
+    """
+    Devuelve lo que identifica a un documento DE FORMA UNICA en el indice.
+
+    POR QUE EL NOMBRE NO BASTA
+    --------------------------
+    El indice identificaba cada documento por su nombre de archivo, y en el
+    Drive del proyecto hay 14 nombres repetidos en carpetas distintas:
+    "6. Plantas y mariposas Jardin Botanico Medellin.pdf" esta en dos sitios,
+    "PLAN DE ACCION POLINIZADORES_C Gutierrez.pdf" tambien, y asi hasta
+    catorce.
+
+    Con el nombre como identidad pasaban tres cosas, las tres en silencio:
+
+      - Los identificadores de sus fichas chocaban, asi que el segundo
+        documento escribia ENCIMA de las fichas del primero.
+      - Antes de guardar, cada documento borra las fichas del que se llame
+        igual: el segundo borraba las del primero a proposito.
+      - El registro de huellas tambien iba por nombre, asi que el sistema
+        creia que los dos estaban indexados cuando solo quedaba uno.
+
+    Resultado: catorce documentos que estan en Drive, que se bajaron, que se
+    leyeron y que costaron su cuota de vectores, y que el agente no podia
+    encontrar. Nadie se enteraba, porque el recuento salia bien.
+
+    La carpeta no es un adorno: es parte de donde vive el documento. Dos
+    archivos con el mismo nombre en carpetas distintas son dos documentos.
+
+    Args:
+        doc: Documento de la fuente, con `nombre` y `categoria`.
+
+    Returns:
+        Cadena del tipo "1_NORMATIVIDAD/Decreto 1076 de 2015.pdf".
+    """
+    categoria = (doc.get("categoria") or "").strip() or "(raiz)"
+    return f"{categoria}/{doc.get('nombre') or ''}"
+
+
+def _quitar_claves_repetidas(documentos: list) -> tuple:
+    """
+    Deja un solo documento por clave, y dice cuales venian repetidos.
+
+    DRIVE ADMITE DOS ARCHIVOS CON EL MISMO NOMBRE EN LA MISMA CARPETA
+    ----------------------------------------------------------------
+    No es un caso de laboratorio: en "5. CATALAGOS MARIPOSAS" hay dos
+    `Libro_Mariposas_Cornare.pdf`, con identificadores distintos en Drive y
+    EL MISMO md5. Son la misma subida hecha dos veces.
+
+    Para el indice son el mismo documento, y debe serlo: vectorizar dos
+    veces el mismo texto gasta el doble de cuota y hace que cada busqueda
+    devuelva el mismo parrafo dos veces, como si dos fuentes distintas lo
+    confirmaran.
+
+    Lo que NO puede pasar en silencio es el otro caso: mismo sitio, mismo
+    nombre y contenido DISTINTO. Ahi no hay forma de distinguirlos por su
+    clave, cada pasada veria una huella distinta y se reindexarian el uno
+    sobre el otro para siempre. Eso se dice.
+
+    Args:
+        documentos: Lo que devolvio la fuente.
+
+    Returns:
+        Tupla `(documentos_sin_repetir, repetidos)`, donde `repetidos` es
+        una lista de diccionarios con `clave`, `cuantos` y `mismo_contenido`.
+    """
+    por_clave = {}
+    orden = []
+    for doc in documentos:
+        clave = clave_de_documento(doc)
+        if clave not in por_clave:
+            por_clave[clave] = []
+            orden.append(clave)
+        por_clave[clave].append(doc)
+
+    limpios, repetidos = [], []
+    for clave in orden:
+        grupo = por_clave[clave]
+        limpios.append(grupo[0])
+        if len(grupo) > 1:
+            huellas = {d.get("huella") for d in grupo}
+            repetidos.append({
+                "clave": clave,
+                "cuantos": len(grupo),
+                "mismo_contenido": len(huellas) == 1,
+            })
+    return limpios, repetidos
+
+
 def _id_de_ficha(documento: str, indice: int) -> str:
     """
     Calcula un identificador estable para una ficha.
@@ -787,7 +1068,10 @@ def _id_de_ficha(documento: str, indice: int) -> str:
     propios puntos en vez de duplicarlos.
 
     Args:
-        documento: Nombre del documento de origen.
+        documento: CLAVE del documento de origen (ver `clave_de_documento`),
+            no su nombre a secas: dos archivos con el mismo nombre en
+            carpetas distintas daban el mismo identificador y se pisaban las
+            fichas el uno al otro.
         indice: Posicion de la ficha dentro del documento.
 
     Returns:
@@ -894,8 +1178,14 @@ def huellas_indexadas(cliente=None) -> dict:
     Args:
         cliente: Cliente de Qdrant ya abierto.
 
+    Se indexa por CLAVE, no por nombre: ver `clave_de_documento`. Un punto
+    sin clave es de antes de ese cambio, y se ignora a proposito. Asi su
+    documento vuelve a entrar con la identidad buena, y el punto viejo se va
+    por el camino de los sobrantes en vez de quedarse como un fantasma al
+    que nadie puede llegar.
+
     Returns:
-        Diccionario `{nombre_documento: huella}`.
+        Diccionario `{clave_documento: huella}`.
     """
     cliente = cliente or _cliente_qdrant()
     nombre = settings.coleccion_qdrant()
@@ -907,15 +1197,84 @@ def huellas_indexadas(cliente=None) -> dict:
     while True:
         puntos, siguiente = cliente.scroll(
             collection_name=nombre, limit=1000, offset=siguiente,
-            with_payload=["documento", "huella"], with_vectors=False)
+            with_payload=["clave", "documento", "huella"], with_vectors=False)
         for p in puntos:
             carga = p.payload or {}
-            doc = carga.get("documento")
-            if doc and doc != "__firma__":
-                encontradas[doc] = carga.get("huella", "")
+            if carga.get("documento") == "__firma__":
+                continue
+            clave = carga.get("clave")
+            if clave:
+                encontradas[clave] = carga.get("huella", "")
         if siguiente is None:
             break
     return encontradas
+
+
+#: Cada cuantos segundos mira el vigilante la carpeta de descargas.
+SEGUNDOS_ENTRE_VIGILANCIAS = 15
+
+#: Cuanta caida se considera una desaparicion y no un borrado normal. Un
+#: estudio no borra archivos mientras trabaja, asi que cualquier bajada
+#: brusca es alguien de fuera.
+CAIDA_SOSPECHOSA = 0.5
+
+
+def _vigilar_la_carpeta():
+    """
+    Vigila la carpeta de descargas mientras dura el estudio.
+
+    POR QUE HACE FALTA MIRAR, Y NO SOLO AGUANTAR
+    --------------------------------------------
+    Tres pasadas seguidas acabaron diciendo que trescientos y pico
+    documentos "no llegaron a bajarse" cuando se habian bajado los 3,2 GB:
+    algo vacio la carpeta a mitad, entre la descarga y la lectura. El
+    estudio ya sabe recuperarse -- vuelve a pedir el documento que no
+    encuentra --, pero recuperarse no es lo mismo que saber que paso.
+
+    Esto no impide nada: solo deja constancia de CUANDO se vacio y de
+    cuantos archivos habia justo antes. Con esa hora se puede cruzar con lo
+    que estuviera corriendo en ese momento, que es la unica forma de cerrar
+    el caso en vez de seguir sospechando.
+
+    Returns:
+        Tupla `(hilo, parar, registro)`. El hilo ya esta en marcha; `parar`
+        es el evento que lo detiene; `registro` se va rellenando y trae
+        `maximo` y `desapariciones`.
+    """
+    import threading
+
+    registro = {"maximo": 0, "desapariciones": []}
+    parar = threading.Event()
+
+    try:
+        carpeta = fuentes.obtener().carpeta_temporal()
+    except Exception:
+        # Sin carpeta que vigilar no se monta nada. Vigilar es util, no
+        # imprescindible: un fallo aqui no puede costar el estudio.
+        return None, parar, registro
+
+    def _cuantos_hay():
+        try:
+            return sum(len(a) for _, _, a in os.walk(carpeta))
+        except OSError:
+            return 0
+
+    def _mirar():
+        anterior = _cuantos_hay()
+        while not parar.wait(SEGUNDOS_ENTRE_VIGILANCIAS):
+            ahora = _cuantos_hay()
+            registro["maximo"] = max(registro["maximo"], ahora, anterior)
+            if anterior and ahora < anterior * CAIDA_SOSPECHOSA:
+                registro["desapariciones"].append({
+                    "cuando": _ahora_iso(),
+                    "habia": anterior,
+                    "quedan": ahora,
+                })
+            anterior = ahora
+
+    hilo = threading.Thread(target=_mirar, daemon=True)
+    hilo.start()
+    return hilo, parar, registro
 
 
 def limpiar_descargas(fuente=None) -> dict:
@@ -1013,6 +1372,24 @@ def texto_de_catalogo(descartado: dict) -> str:
     return "\n".join(lineas)
 
 
+def _clave_de_catalogo(descartado: dict) -> str:
+    """
+    Clave unica de la ficha de una capa que no se leyo entera.
+
+    Va aparte de `clave_de_documento` porque en el indice estas fichas
+    llevan `categoria = CATEGORIA_CAPA`, que es una etiqueta, no la carpeta
+    donde vive el archivo. Para identificarlo hace falta su carpeta de
+    verdad.
+
+    Args:
+        descartado: Entrada de `fuente.descartados`.
+
+    Returns:
+        Cadena del tipo "5. CATALAGOS MARIPOSAS/capa_enorme.csv".
+    """
+    return clave_de_documento(descartado)
+
+
 def _huella_de_catalogo(descartado: dict) -> str:
     """
     Huella de la ficha de una capa, para saber si hay que rehacerla.
@@ -1051,7 +1428,8 @@ def _indexar_catalogos(cliente, nombre: str, descartados: list,
     # Rehacer una ficha identica cuesta un embedding y no aporta nada. Si el
     # archivo no ha cambiado de tamano ni de columnas, su ficha sigue valiendo.
     conservar = [d for d in conservar
-                 if ya_estan.get(d["nombre"]) != _huella_de_catalogo(d)]
+                 if ya_estan.get(_clave_de_catalogo(d))
+                 != _huella_de_catalogo(d)]
     if not conservar:
         return
 
@@ -1085,9 +1463,10 @@ def _indexar_catalogos(cliente, nombre: str, descartados: list,
         if vector is None:
             continue
         puntos.append(models.PointStruct(
-            id=_id_de_ficha(ficha["nombre"], numero),
+            id=_id_de_ficha(_clave_de_catalogo(ficha), numero),
             vector={NOMBRE_VECTOR: vector},
             payload={
+                "clave": _clave_de_catalogo(ficha),
                 "documento": ficha["nombre"],
                 "categoria": CATEGORIA_CAPA,
                 "pagina": None,
@@ -1131,14 +1510,33 @@ def _indexar_todo(forzar: bool = False, progreso=None) -> dict:
     if not listo:
         raise RuntimeError(f"La fuente documental no esta lista: {motivo}")
 
-    documentos = fuente.documentos()
+    # 1. Obtenemos inventario SIN descargar archivos de Google Drive
+    documentos = fuente.documentos(descargar=False)
+    documentos, _repetidos = _quitar_claves_repetidas(documentos)
     ya_estan = {} if forzar else huellas_indexadas(cliente)
     # Desde aqui ya puede haber archivos bajados. Lo que siga va envuelto para
     # que el borrado ocurra tambien si algo falla.
 
     pendientes = [d for d in documentos
-                  if ya_estan.get(d["nombre"]) != d["huella"]]
-    nuevos = sum(1 for d in pendientes if d["nombre"] not in ya_estan)
+                  if ya_estan.get(clave_de_documento(d)) != d["huella"]]
+
+    # Priorizar carpetas de Google Drive segun arquitectura del agente
+    def _prioridad_cat(doc):
+        cat = str(doc.get("categoria", "")).lower()
+        if "agente" in cat or "documentos de agente" in cat: return 1
+        if "catalago" in cat or "catalogo" in cat or "monitoreo" in cat or "mariposa" in cat: return 2
+        if "hospedera" in cat or "viviero" in cat or "vivero" in cat or "planta" in cat: return 3
+        if "ciclo" in cat or "anatomia" in cat or "morfologia" in cat: return 4
+        if "ecologica" in cat or "bioindicador" in cat: return 5
+        if "normatividad" in cat or "metodologia" in cat or "eia" in cat: return 6
+        if "zoocria" in cat or "mariposario" in cat: return 7
+        if "plan de negocio" in cat or "exportacion" in cat or "artesania" in cat or "trazabilidad" in cat: return 8
+        if "sanitario" in cat: return 9
+        return 6
+
+    pendientes.sort(key=_prioridad_cat)
+    nuevos = sum(1 for d in pendientes
+                 if clave_de_documento(d) not in ya_estan)
     resumen = {
         "nuevos": nuevos,
         "actualizados": len(pendientes) - nuevos,
@@ -1149,21 +1547,39 @@ def _indexar_todo(forzar: bool = False, progreso=None) -> dict:
         "segundos": 0.0,
     }
 
+    # Lo que venia repetido se declara. Una copia identica subida dos veces
+    # se indexa una sola vez y punto; dos archivos distintos con el mismo
+    # nombre en la misma carpeta son un problema que hay que ver, porque el
+    # indice no puede distinguirlos y uno de los dos nunca se leera.
+    if _repetidos:
+        resumen["repetidos"] = _repetidos
+        _chocan = [r for r in _repetidos if not r["mismo_contenido"]]
+        if _chocan:
+            resumen.setdefault("fallidos", []).extend(
+                {"documento": r["clave"],
+                 "motivo": (f"hay {r['cuantos']} archivos con este mismo "
+                            f"nombre en la misma carpeta y con CONTENIDO "
+                            f"DISTINTO. El indice no puede distinguirlos: "
+                            f"solo se lee uno. Renombra uno de los dos en "
+                            f"Drive.")}
+                for r in _chocan)
+
     # --- Documentos que ya no estan en la fuente ------------------------------
     # Las capas grandes tambien estan EN la fuente, aunque no se lean enteras:
     # cuentan como vigentes. Sin esto, sus fichas de catalogo se borraban al
     # principio de cada pasada y se volvian a crear al final, y el resumen
     # decia "4 borrados" en todas las sincronizaciones aunque no hubiera
     # cambiado nada. Ademas gastaba cuatro embeddings cada vez.
-    vigentes = {d["nombre"] for d in documentos}
-    vigentes |= {d["nombre"] for d in getattr(fuente, "descartados", [])}
-    sobrantes = [n for n in ya_estan if n not in vigentes]
+    vigentes = {clave_de_documento(d) for d in documentos}
+    vigentes |= {_clave_de_catalogo(d)
+                 for d in getattr(fuente, "descartados", [])}
+    sobrantes = [c for c in ya_estan if c not in vigentes]
     if sobrantes:
         cliente.delete(
             collection_name=nombre,
             points_selector=models.FilterSelector(filter=models.Filter(
                 must=[models.FieldCondition(
-                    key="documento",
+                    key="clave",
                     match=models.MatchAny(any=sobrantes))])))
         resumen["borrados"] = len(sobrantes)
 
@@ -1174,7 +1590,8 @@ def _indexar_todo(forzar: bool = False, progreso=None) -> dict:
         if progreso:
             progreso(f"{puesto} {doc['nombre'][:46]}", resumen["_fraccion"])
         try:
-            _indexar_documento(cliente, nombre, doc, resumen, progreso, puesto)
+            _indexar_documento(cliente, nombre, doc, resumen, progreso,
+                               puesto, fuente)
         except Exception as exc:
             # Un documento ilegible, un PDF corrupto o un fallo que no cedio a
             # los reintentos no pueden tumbar un trabajo de dos horas. Se anota
@@ -1223,9 +1640,20 @@ def indexar(forzar: bool = False, progreso=None) -> dict:
         el error suba.
     """
     limpieza = None
+    # Se cuelga el cartel ANTES de bajar nada: a partir de aqui, la carpeta
+    # de descargas es de este estudio y nadie mas puede vaciarla. Se retira
+    # justo antes de limpiar, para que la limpieza propia -- la unica que
+    # debe ocurrir -- no se bloquee a si misma.
+    fuentes.empezar_estudio()
+    olvidar_el_mal_dia()   # cada pasada estrena cuota: ayer no cuenta
+    _vigilante, _parar, _vigilancia = _vigilar_la_carpeta()
     try:
         resumen = _indexar_todo(forzar=forzar, progreso=progreso)
     finally:
+        _parar.set()
+        if _vigilante is not None:
+            _vigilante.join(timeout=5)
+        fuentes.terminar_estudio()
         limpieza = limpiar_descargas()
         # Despues de sincronizar SI ha podido cambiar lo que hay en la fuente,
         # asi que el estado guardado deja de valer.
@@ -1234,6 +1662,9 @@ def indexar(forzar: bool = False, progreso=None) -> dict:
         except Exception:
             pass
     resumen["limpieza"] = limpieza
+    if _vigilancia.get("desapariciones"):
+        resumen["desapariciones"] = _vigilancia["desapariciones"]
+    resumen["maximo_en_disco"] = _vigilancia.get("maximo", 0)
     return resumen
 
 
@@ -1352,7 +1783,7 @@ def _conviene_resumir(ruta: str) -> bool:
 
 
 def _indexar_documento(cliente, nombre: str, doc: dict, resumen: dict,
-                       progreso=None, puesto: str = "") -> None:
+                       progreso=None, puesto: str = "", fuente=None) -> None:
     """
     Trocea, embebe y guarda un documento en el indice.
 
@@ -1365,6 +1796,13 @@ def _indexar_documento(cliente, nombre: str, doc: dict, resumen: dict,
         puesto: Posicion del documento en la tanda, del tipo "12/134".
     """
     from qdrant_client import models
+
+    
+    # Descargar bajo demanda UNICAMENTE este documento si aun no esta en disco
+    if fuente is not None and hasattr(fuente, "asegurar_descargado"):
+        ruta_doc = doc.get("ruta", "")
+        if not ruta_doc or not os.path.exists(ruta_doc) or os.path.getsize(ruta_doc) == 0:
+            fuente.asegurar_descargado(doc)
 
     fichas = []
 
@@ -1410,6 +1848,60 @@ def _indexar_documento(cliente, nombre: str, doc: dict, resumen: dict,
                      f"{len(fichas)} fichas de resumen",
                      resumen.get("_fraccion", 0.0))
     else:
+        # NO ESTAR Y NO DECIR NADA SON DOS COSAS DISTINTAS
+        # ------------------------------------------------
+        # Se contaban juntas bajo "no dio texto", y no se parecen en nada:
+        # un PDF escaneado hay que pasarlo por OCR, y un archivo que no
+        # llego al disco hay que volver a bajarlo. Se midio una pasada
+        # entera en la que 355 de 358 documentos "sin texto" sencillamente
+        # no existian en la carpeta, y el informe decia que no daban texto.
+        # Dos horas buscando un problema de lectura que era de descarga.
+        if not os.path.exists(doc["ruta"]):
+            # SE VUELVE A PEDIR ANTES DE DARLO POR PERDIDO
+            # ---------------------------------------------
+            # Entre que se baja un documento y que le llega el turno de
+            # leerse pueden pasar cuarenta minutos, y en esos cuarenta
+            # minutos la carpeta puede desaparecer: tres veces en dos dias.
+            # Antes eso se anotaba y se seguia, y la pasada terminaba
+            # diciendo "387 de 425 no llegaron a bajarse" con 3,2 GB ya
+            # gastados en bajarlos.
+            #
+            # Perseguir a quien borra es una cosa; no depender de ello es
+            # otra, y es la que hace que el estudio llegue al final. Bajarlo
+            # otra vez cuesta una peticion; perder la pasada cuesta horas.
+            if fuente is not None and hasattr(fuente, "asegurar_descargado"):
+                try:
+                    fuente.asegurar_descargado(doc)
+                    if os.path.exists(doc["ruta"]):
+                        resumen["rebajados"] = resumen.get("rebajados", 0) + 1
+                        if progreso:
+                            progreso(f"{puesto} {doc['nombre'][:42]} — habia "
+                                     f"desaparecido del equipo; se baja otra "
+                                     f"vez", resumen.get("_fraccion", 0.0))
+                except Exception as _exc:
+                    doc = dict(doc)
+                    doc["no_se_pudo_bajar"] = (
+                        f"{type(_exc).__name__}: {str(_exc)[:140]}")
+
+        # Si despues de volver a pedirlo sigue sin estar, ahora si se da por
+        # perdido, con su motivo.
+        if not os.path.exists(doc["ruta"]):
+            # Si la fuente sabe POR QUE no bajo, se guarda su motivo. No es
+            # lo mismo "Drive devolvio 403" que "alguien borro la carpeta a
+            # mitad": lo primero se arregla con permisos y lo segundo
+            # relanzando. Sin el motivo, las dos se leian igual.
+            _por_que = doc.get("no_se_pudo_bajar") or ""
+            resumen.setdefault("sin_descargar", []).append({
+                "documento": doc["nombre"],
+                "ruta": doc["ruta"],
+                "motivo": _por_que or "no estaba en el equipo al ir a leerlo",
+            })
+            if progreso:
+                progreso(f"{puesto} {doc['nombre'][:42]} — no se pudo bajar"
+                         + (f": {_por_que[:60]}" if _por_que else ""),
+                         resumen.get("_fraccion", 0.0))
+            return
+
         for pagina, texto in corpus.leer_documento(doc["ruta"]):
             for trozo in corpus.trocear(texto):
                 if merece_vector(trozo):
@@ -1475,18 +1967,66 @@ def _indexar_documento(cliente, nombre: str, doc: dict, resumen: dict,
             progreso(f"{puesto} {doc['nombre'][:42]} — {hechas}/{total} fichas",
                      resumen.get("_fraccion", 0.0))
 
+    # SE PIDE PODER QUEDARSE CON LO QUE HAYA
+    # ---------------------------------------
+    # Casi todas las fichas de un documento ya leido otro dia estan en la
+    # cache local y no cuestan cuota. Si el documento cambio un poco, las
+    # pocas fichas nuevas si la cuestan -- y con la cuota agotada el
+    # documento ENTERO se perdia, incluidas las que eran gratis.
+    #
+    # Ahora se indexa lo que se consiguio y se declara lo que falta. Una
+    # ficha ausente no engana a nadie; una ficha con vector de ceros si, y
+    # eso se sigue sin hacer.
     vectores = embeber([t for _, t in fichas], "RETRIEVAL_DOCUMENT",
-                       progreso=_dentro)
+                       progreso=_dentro, permitir_huecos=True)
+
+    _sin_vector = sum(1 for v in vectores if v is None)
+    if _sin_vector:
+        enteras = [(f, v) for f, v in zip(fichas, vectores) if v is not None]
+        fichas = [f for f, _ in enteras]
+        vectores = [v for _, v in enteras]
+        resumen.setdefault("incompletos", []).append({
+            "documento": doc["nombre"],
+            "indexadas": len(fichas),
+            "sin_vector": _sin_vector,
+        })
+        if progreso:
+            progreso(f"{puesto} {doc['nombre'][:42]} — entra con "
+                     f"{len(fichas)} fichas; {_sin_vector} se quedaron sin "
+                     f"vector (cuota)", resumen.get("_fraccion", 0.0))
+
+    _clave = clave_de_documento(doc)
 
     # Se borran primero los puntos viejos del documento: si la version nueva
     # tiene menos fichas, las sobrantes quedarian huerfanas apuntando a un
     # texto que ya no existe.
+    #
+    # Y JUSTO AQUI, NO ANTES, SE RETIRA LO DEL FORMATO VIEJO
+    # ------------------------------------------------------
+    # Los puntos de antes de que un documento se identificara por su sitio no
+    # llevan `clave`, asi que ni `huellas_indexadas` los ve ni el reparto de
+    # sobrantes los alcanza: se quedarian para siempre.
+    #
+    # La tentacion es barrerlos todos al empezar la pasada. Seria un error:
+    # si la pasada se queda sin cuota a la tercera ficha -- que es lo que
+    # esta pasando estos dias --, el indice se habria quedado VACIO a cambio
+    # de nada. Asi que cada documento se lleva los suyos en el momento en que
+    # va a escribir los nuevos, que es el unico instante en que borrarlos no
+    # cuesta informacion.
     cliente.delete(
         collection_name=nombre,
-        points_selector=models.FilterSelector(filter=models.Filter(
-            must=[models.FieldCondition(
-                key="documento",
-                match=models.MatchValue(value=doc["nombre"]))])))
+        points_selector=models.FilterSelector(filter=models.Filter(should=[
+            models.Filter(must=[models.FieldCondition(
+                key="clave",
+                match=models.MatchValue(value=_clave))]),
+            models.Filter(must=[
+                models.FieldCondition(
+                    key="documento",
+                    match=models.MatchValue(value=doc["nombre"])),
+                models.IsEmptyCondition(
+                    is_empty=models.PayloadField(key="clave")),
+            ]),
+        ])))
 
     # Momento en que esta ficha entra al indice. Se calcula UNA vez para todo
     # el documento: asi todas sus fichas comparten marca y se puede responder
@@ -1501,9 +2041,14 @@ def _indexar_documento(cliente, nombre: str, doc: dict, resumen: dict,
         collection_name=nombre,
         points=[
             models.PointStruct(
-                id=_id_de_ficha(doc["nombre"], i),
+                id=_id_de_ficha(_clave, i),
                 vector={NOMBRE_VECTOR: vec},
                 payload={
+                    # `documento` es lo que se LEE en una cita, y por eso
+                    # sigue siendo el nombre a secas. `clave` es lo que
+                    # IDENTIFICA, y lleva la carpeta pegada para que dos
+                    # archivos con el mismo nombre no sean el mismo punto.
+                    "clave": _clave,
                     "documento": doc["nombre"],
                     "categoria": doc["categoria"],
                     "pagina": pagina,
@@ -1569,6 +2114,66 @@ def contar_fichas(cliente=None, nombre: str = None) -> int:
         return 0
     return cliente.count(nombre, exact=True,
                          count_filter=_filtro_sin_firma()).count
+
+
+#: Ultimo recuento de documentos, con el numero de fichas que habia
+#: cuando se hizo. Ver `contar_documentos_indexados`.
+_DOCUMENTOS_CONTADOS = {"fichas": None, "documentos": 0}
+
+
+def contar_documentos_indexados(cliente=None, nombre: str = None) -> int:
+    """
+    Cuenta cuantos DOCUMENTOS distintos hay en el indice.
+
+    EN QUE SE DIFERENCIA DE CONTAR FICHAS, Y POR QUE IMPORTA
+    -------------------------------------------------------
+    Hasta ahora el agente decia "los 425 documentos del corpus" usando el
+    numero que ve la FUENTE, no el que ha leido. Con el indice a medio
+    construir eso es una mentira con forma de dato: contesto "no se
+    encontraron menciones al genero Pyrrhopyge dentro de los 425 documentos"
+    sobre una guia de Hesperiidae de 229 paginas que esta en el Drive, que
+    si menciona ese genero, y que simplemente todavia no le habia tocado el
+    turno.
+
+    "No lo he leido" y "no existe" son cosas distintas. Para poder decir la
+    primera hay que saber cuantos se han leido de verdad.
+
+    Args:
+        cliente: Cliente de Qdrant ya abierto.
+        nombre: Coleccion a mirar. Por defecto, la configurada.
+
+    Returns:
+        Cuantos documentos distintos tienen al menos una ficha en el indice.
+    """
+    cliente = cliente or _cliente_qdrant()
+    nombre = nombre or settings.coleccion_qdrant()
+    if not cliente.collection_exists(nombre):
+        return 0
+    # CONTAR DOCUMENTOS CUESTA RECORRER LA COLECCION ENTERA
+    # -----------------------------------------------------
+    # Qdrant sabe contar puntos de una, pero no documentos distintos: hay
+    # que recorrerlos y agrupar. Con 700 fichas son 20 ms y no se nota; con
+    # las 15.000 de un indice completo serian varias decimas, y esto lo
+    # llaman varias herramientas en cada turno del chat.
+    #
+    # El recuento solo cambia cuando cambia el indice, y eso se nota en el
+    # numero de fichas, que SI es barato de preguntar. Asi que se guarda el
+    # resultado y se reutiliza mientras las fichas sigan siendo las mismas.
+    try:
+        # `cuantas` y `cuantos` a una letra de distancia es una trampa para
+        # quien lea esto dentro de un ano. Se nombran enteros.
+        fichas_ahora = contar_fichas(cliente, nombre)
+        if _DOCUMENTOS_CONTADOS.get("fichas") == fichas_ahora:
+            return _DOCUMENTOS_CONTADOS["documentos"]
+        documentos_ahora = len(huellas_indexadas(cliente))
+        _DOCUMENTOS_CONTADOS["fichas"] = fichas_ahora
+        _DOCUMENTOS_CONTADOS["documentos"] = documentos_ahora
+        return documentos_ahora
+    except Exception:
+        # Contar es util, no imprescindible. Si Qdrant no deja recorrer la
+        # coleccion, se devuelve 0 y quien llama lo tratara como "no se sabe"
+        # en vez de quedarse sin responder.
+        return 0
 
 
 def disponible() -> tuple:
@@ -1664,10 +2269,16 @@ def buscar_semantico(consulta: str, limite: int = 8,
             key="documento", match=models.MatchValue(value="__firma__"))]
         filtro = models.Filter(must_not=condiciones)
         if categoria:
-            filtro = models.Filter(
-                must=[models.FieldCondition(
-                    key="categoria", match=models.MatchValue(value=categoria))],
-                must_not=condiciones)
+            if isinstance(categoria, (list, tuple, set)):
+                filtro = models.Filter(
+                    must=[models.FieldCondition(
+                        key="categoria", match=models.MatchAny(any=list(categoria)))],
+                    must_not=condiciones)
+            else:
+                filtro = models.Filter(
+                    must=[models.FieldCondition(
+                        key="categoria", match=models.MatchValue(value=str(categoria)))],
+                    must_not=condiciones)
 
         encontrados = cliente.query_points(
             collection_name=nombre,
@@ -1695,6 +2306,175 @@ def buscar_semantico(consulta: str, limite: int = 8,
         return []
 
 
+#: Palabras que no distinguen nada y solo ensucian una busqueda por texto.
+VACIAS = {
+    "que", "cual", "cuales", "como", "donde", "cuando", "quien", "para",
+    "por", "con", "sin", "del", "las", "los", "una", "uno", "unos", "unas",
+    "esta", "este", "esto", "esos", "esas", "sus", "the", "and", "for",
+    "sobre", "entre", "desde", "hasta", "tiene", "tienen", "hay", "son",
+    "dice", "dicen", "documento", "documentos", "archivo", "bibliografia",
+    "corpus", "aparece", "literalmente", "genero", "especie",
+}
+
+
+def buscar_por_texto(consulta: str, limite: int = 8,
+                     categoria: str = None) -> list:
+    """
+    Busca en el indice por PALABRAS, sin gastar ni una llamada a la API.
+
+    POR QUE HACE FALTA, Y POR QUE NO BASTABA LO QUE HABIA
+    ------------------------------------------------------
+    La busqueda por significado necesita convertir la pregunta en un vector,
+    y eso es una llamada a la API de embeddings. Con la cuota diaria agotada
+    esa llamada falla, y entonces el agente NO PUEDE CONSULTAR SU PROPIO
+    INDICE: puede tener 2.600 fichas dentro y contestar "no se encontro
+    nada".
+
+    El respaldo que habia era BM25 sobre la carpeta local, y con Drive esa
+    carpeta esta vacia por diseno -- los documentos se borran en cuanto se
+    leen --, asi que no respaldaba nada.
+
+    Esto busca sobre el texto que ya vive en el indice. No entiende de
+    sinonimos ni de significado, asi que no sustituye a la busqueda
+    semantica: la sustituye el dia que la semantica no se puede pagar, que
+    es exactamente cuando hace falta un respaldo.
+
+    Args:
+        consulta: Pregunta del usuario.
+        limite: Cuantas fichas devolver.
+        categoria: Restringe a una coleccion tematica.
+
+    Returns:
+        Fichas con la misma forma que `buscar_semantico`, ordenadas por
+        cuantas palabras de la pregunta aparecen en cada una.
+    """
+    import re
+
+    from qdrant_client import models
+
+    palabras = [p.lower() for p in re.findall(r"[\wáéíóúüñÁÉÍÓÚÜÑ]{3,}", consulta or "")]
+    palabras = [p for p in dict.fromkeys(palabras) if p not in VACIAS]
+    if not palabras:
+        return []
+
+    try:
+        cliente = _cliente_qdrant()
+        nombre = settings.coleccion_qdrant()
+        if not cliente.collection_exists(nombre):
+            return []
+
+        fuera = [models.FieldCondition(
+            key="documento", match=models.MatchValue(value="__firma__"))]
+
+        # Se pregunta palabra a palabra y se cuenta en cuantas coincide cada
+        # ficha. Qdrant filtra, no puntua, asi que el orden lo pone esto:
+        # cuantas palabras distintas de la pregunta aparecen dentro.
+        hallazgos = {}
+        for palabra in palabras[:6]:
+            debe = [models.FieldCondition(
+                key="texto", match=models.MatchText(text=palabra))]
+            if categoria:
+                if isinstance(categoria, (list, tuple, set)):
+                    debe.append(models.FieldCondition(
+                        key="categoria",
+                        match=models.MatchAny(any=list(categoria))))
+                else:
+                    debe.append(models.FieldCondition(
+                        key="categoria",
+                        match=models.MatchValue(value=str(categoria))))
+            try:
+                puntos, _ = cliente.scroll(
+                    collection_name=nombre,
+                    scroll_filter=models.Filter(must=debe, must_not=fuera),
+                    limit=limite * 6, with_payload=True, with_vectors=False)
+            except Exception:
+                # Sin indice de texto sobre `texto`, Qdrant se niega. No es
+                # motivo para tumbar la respuesta: se devuelve lo reunido.
+                break
+            for p in puntos:
+                carga = p.payload or {}
+                anterior = hallazgos.get(p.id)
+                if anterior is None:
+                    hallazgos[p.id] = {"carga": carga, "aciertos": 1}
+                else:
+                    anterior["aciertos"] += 1
+
+        if not hallazgos:
+            return []
+
+        ordenadas = sorted(hallazgos.values(),
+                           key=lambda h: (-h["aciertos"],
+                                          len(h["carga"].get("texto", ""))))
+        return [{
+            "documento": h["carga"].get("documento", ""),
+            "categoria": h["carga"].get("categoria", ""),
+            "pagina": h["carga"].get("pagina"),
+            "paginada": h["carga"].get("pagina") is not None,
+            "texto": h["carga"].get("texto", ""),
+            "fecha_indexado": h["carga"].get("fecha_indexado", ""),
+            # El puntaje NO es comparable con el del coseno, y se dice: aqui
+            # es "cuantas palabras de la pregunta salen en esta ficha".
+            "puntaje": float(h["aciertos"]),
+            "por_palabras": True,
+        } for h in ordenadas[:limite]]
+    except Exception as exc:
+        _anotar_fallo_de_busqueda(exc)
+        return []
+
+
+
+# ==============================================================================
+# ENRUTAMIENTO INTELIGENTE DE CARPETAS DE GOOGLE DRIVE POR TAREA
+# ==============================================================================
+
+MAPA_CARPETAS_TAREA = {
+    ("qgis", "capa", "shapefile", "geopackage", "gpkg", "mapa", "coordenada", "geodatabase", "pomca", "area de estudio", "espacial", "cartografia"): [
+        "DOCUMENTOS DE AGENTE", "2. Metodología EIA", "GENERAL"
+    ],
+    ("mariposa", "lepidoptera", "especie", "genero", "catalogo", "catalago", "monitoreo", "ala", "morfologia", "nombre cientifico", "identificar", "foto", "observacion", "fauna"): [
+        "5. CATALAGOS MARIPOSAS", "13. MONITOREO DE MARIPOSAS", "7. ANATOMIA Y MORFOLOGIA"
+    ],
+    ("planta", "hospedera", "nectarifera", "larval", "hoja", "flor", "passiflora", "aristolochia", "vivero", "viviero", "vegetacion", "flora", "alimento"): [
+        "3_PLANTAS HOSPEDERAS", "4. VIVIERO"
+    ],
+    ("ciclo", "huevo", "larva", "oruga", "pupa", "crisalida", "imago", "metamorfosis", "estadio", "desarrollo"): [
+        "6. CICLO DE VIDA", "7. ANATOMIA Y MORFOLOGIA"
+    ],
+    ("ecologia", "bioindicador", "ecosistema", "bosque", "quebrada", "ribera", "altitud", "clima", "conservacion"): [
+        "3.1 FUNCION ECOLOGICA-BIOINDICADORES", "13. MONITOREO DE MARIPOSAS"
+    ],
+    ("zoocria", "cria", "cautiverio", "reproduccion", "mariposario", "copula", "apareamiento", "jaula", "fecundidad"): [
+        "8_ ZOOCRIA DE MARIPOSAS", "9_ MARIPOSARIO", "10_ SANITARIOS"
+    ],
+    ("norma", "ley", "decreto", "resolucion", "cites", "permiso", "amenaza", "libro rojo", "0126", "uicn", "juridico"): [
+        "1_NORMATIVIDAD", "2. Metodología EIA"
+    ],
+    ("conesa", "impacto", "matriz", "severidad", "importancia", "mitigacion"): [
+        "2. Metodología EIA", "1_NORMATIVIDAD"
+    ],
+    ("negocio", "bioeconomia", "exportacion", "artesania", "mercado", "costo", "trazabilidad", "cadena"): [
+        "11. PLAN DE NEGOCIO", "12_ EXPORTACION", "14. ARTESANIAS", "TRAZABILIDAD DE LA CADENA"
+    ],
+}
+
+
+def detectar_carpetas_relevantes(texto: str) -> list:
+    """
+    Identifica de forma inteligente las carpetas de Google Drive mas pertinentes
+    segun las palabras clave y la intencion de la consulta o tarea.
+    """
+    if not texto:
+        return []
+    texto_l = texto.lower()
+    carpetas = []
+    for claves, lista_carpetas in MAPA_CARPETAS_TAREA.items():
+        if any(c in texto_l for c in claves):
+            for carp in lista_carpetas:
+                if carp not in carpetas:
+                    carpetas.append(carp)
+    return carpetas
+
+
 def buscar_hibrido(consulta: str, limite: int = 8,
                    categoria: str = None) -> list:
     """
@@ -1718,6 +2498,14 @@ def buscar_hibrido(consulta: str, limite: int = 8,
         devuelve exactamente lo que daria `corpus.buscar`, de modo que el
         sistema siga funcionando sin Qdrant.
     """
+    # Si no se indico categoria explicita, detectamos las carpetas prioritarias de Drive
+    if not categoria:
+        carpetas_prioritarias = detectar_carpetas_relevantes(consulta)
+        if carpetas_prioritarias:
+            fichas_pri = buscar_semantico(consulta, limite=limite, categoria=carpetas_prioritarias)
+            if len(fichas_pri) >= min(3, limite):
+                return fichas_pri[:limite]
+
     lexicas = corpus.buscar(consulta, limite=limite * 3, categoria=categoria)
 
     # Las fichas de indice ("Morpho peleides . . . . . 834") son coincidencias
@@ -1730,6 +2518,17 @@ def buscar_hibrido(consulta: str, limite: int = 8,
     semanticas = buscar_semantico(consulta, limite=limite * 2,
                                   categoria=categoria)
     if not semanticas:
+        # SIN SEMANTICA Y SIN CARPETA LOCAL NO QUEDABA NADA
+        # --------------------------------------------------
+        # `corpus.buscar` lee la carpeta del corpus, y con Drive esa carpeta
+        # esta vacia por diseno. Asi que el dia que la cuota se agota el
+        # respaldo no respaldaba: el agente contestaba "no se encontro nada"
+        # con el indice lleno delante.
+        #
+        # Se busca por palabras DENTRO del indice, que no cuesta cuota.
+        if not lexicas:
+            return buscar_por_texto(consulta, limite=limite,
+                                    categoria=categoria)
         return lexicas[:limite]
 
     K = 60  # amortiguador habitual del metodo; evita que el primer puesto arrase

@@ -35,6 +35,7 @@ from database.gdb_connector import GDBConnector
 from core import catalogo
 from core import corpus
 from core import informes
+from core import inaturalist
 
 
 # ==============================================================================
@@ -420,6 +421,26 @@ def revisar_datos_de_campo(ruta_archivo: str) -> str:
         "",
     ]
 
+    # LO QUE SALIO DE AQUI NO SE JUZGA
+    # --------------------------------
+    # `sirve` tiene tres valores, no dos. Cuando lo que se revisa es el
+    # paquete de QGIS que entrega este mismo sistema, no hay veredicto que
+    # dar: comprobarlo contra el area de estudio es el sistema midiendose
+    # consigo mismo. Con un `if veredicto["sirve"]` a secas, ese caso caia
+    # en el `else` y el agente anunciaba que los datos NO se pueden usar,
+    # sobre un archivo que el mismo acababa de generar.
+    if veredicto.get("propio"):
+        return (f"{nombre} ({peso:.1f} MB) no es una salida de campo: es el "
+                f"paquete de QGIS que genera este mismo sistema, con "
+                f"{resumen.get('capas', 0)} capas y "
+                f"{resumen.get('puntos', 0)} geometrias puntuales.\n\n"
+                f"No hay nada que validar en el: todo lo que lleva salio de "
+                f"aqui. Esta revision es para lo que VUELVE del campo, asi "
+                f"que lo que hay que subir es el .zip que exporta QField, o "
+                f"un .gpkg, .xlsx o .csv con las coordenadas recogidas.\n\n"
+                f"El paquete en si esta bien: se abre con doble clic en su "
+                f"proyecto.qgs.")
+
     if veredicto["sirve"]:
         lineas.append("VEREDICTO: los datos SIRVEN. No hay nada que impida "
                       "usarlos.")
@@ -434,7 +455,13 @@ def revisar_datos_de_campo(ruta_archivo: str) -> str:
     ]
     if resumen.get("hay_area"):
         lineas.append(f"  Dentro del area     : {resumen.get('dentro', 0)}")
-        lineas.append(f"  Fuera del area      : {resumen.get('fuera', 0)}")
+        # Se nombran aparte porque no significan lo mismo. Un recorrido que
+        # nace fuera del area y entra despues es un cauce normal; una ficha
+        # tomada fuera es un dato que hay que mirar. Sumados en una sola
+        # cifra, el agente los contaba todos como problemas.
+        lineas.append(f"  Recorridos que entran: "
+                      f"{resumen.get('recorridos_fuera', 0)}")
+        lineas.append(f"  Fichas fuera del area: {resumen.get('fuera', 0)}")
     else:
         lineas.append("  No hay area de estudio fijada, asi que no se pudo "
                       "comprobar si los puntos caen dentro.")
@@ -676,14 +703,19 @@ def _panorama() -> dict:
     try:
         se_puede, motivo = vectorial.disponible()
         fichas = vectorial.contar_fichas()
+        leidos = vectorial.contar_documentos_indexados()
     except Exception as exc:
-        se_puede, motivo, fichas = False, str(exc)[:160], 0
+        se_puede, motivo, fichas, leidos = False, str(exc)[:160], 0, 0
 
     return {
         "fuente": fuente.get("fuente", "?"),
         "listo": bool(fuente.get("listo")),
         "motivo_fuente": fuente.get("motivo", ""),
+        # Lo que VE la fuente y lo que se ha LEIDO son dos numeros distintos,
+        # y confundirlos es lo que hacia que el agente negara documentos que
+        # estaban en el Drive esperando turno.
         "documentos": fuente.get("documentos", 0),
+        "documentos_indexados": leidos,
         "por_categoria": fuente.get("por_categoria", []),
         "capas": list(fuente.get("descartados") or []),
         "fichas_indice": fichas,
@@ -692,13 +724,262 @@ def _panorama() -> dict:
         "local": fuente.get("en_el_equipo", True),
     }
 
+#: Cuantas lineas como mucho devuelve el inventario del Drive.
+#:
+#: Con 425 archivos la lista entera son unas 480 lineas, que caben de
+#: sobra. El tope existe para una carpeta de miles: antes de llenar la
+#: conversacion con una lista que nadie va a leer, se corta y se dice como
+#: filtrar.
+MAXIMO_LINEAS_INVENTARIO = 700
+
+
+def leer_documento_drive(nombre_o_patron: str, paginas: int = 6) -> str:
+    """
+    Lee directamente el contenido real de un documento o archivo especifico de Google Drive.
+
+    USALA SIEMPRE que el usuario pregunte '¿sabes que dice este documento?', '¿que dice el archivo X?',
+    o mencione un documento concreto del Drive (ejemplo: 'Lista de Chequeo de Mariposas de Colombia',
+    'Decreto 2820 de 2010', 'Decreto 1076 de 2015', 'Manual de Plagas', etc.).
+
+    Args:
+        nombre_o_patron: Nombre completo o palabras clave del titulo del archivo a leer.
+        paginas: Numero de paginas iniciales o relevantes a extraer (por defecto 6).
+
+    Returns:
+        Texto completo de las paginas, indice, presentacion y contenido del documento con su cita.
+    """
+    import os
+    import re
+    from core import fuentes, corpus
+
+    if not nombre_o_patron or not nombre_o_patron.strip():
+        return "Indique el nombre o titulo del documento que desea leer."
+
+    f = fuentes.obtener()
+    docs = f.documentos(descargar=False)
+    terminos = [p.lower() for p in re.findall(r"\w+", nombre_o_patron) if len(p) >= 3]
+
+    candidatos = []
+    for d in docs:
+        nom_l = d.get("nombre", "").lower()
+        coincidencias = sum(1 for t in terminos if t in nom_l)
+        if coincidencias > 0:
+            candidatos.append((coincidencias, d))
+
+    if not candidatos:
+        return f"No se encontro ningun archivo en Drive que coincida con '{nombre_o_patron}'."
+
+    candidatos.sort(key=lambda x: x[0], reverse=True)
+    doc_elegido = candidatos[0][1]
+
+    ruta = f.asegurar_descargado(doc_elegido) if hasattr(f, "asegurar_descargado") else doc_elegido.get("ruta")
+    if not ruta or not os.path.exists(ruta):
+        return f"El archivo '{doc_elegido['nombre']}' se localizo en Drive pero no se pudo descargar en este momento."
+
+    paginas_extraidas = list(corpus.leer_documento(ruta))
+    if not paginas_extraidas:
+        return f"El archivo '{doc_elegido['nombre']}' no contiene texto extraible (puede ser una imagen o escaneo)."
+
+    total_pags = len(paginas_extraidas)
+    lineas = [
+        f"DOCUMENTO ENCONTRADO EN DRIVE: {doc_elegido['nombre']} ({total_pags} paginas)",
+        f"Carpeta / Categoria: {doc_elegido.get('categoria', 'General')}",
+        f"Fuente: {doc_elegido['nombre']}, p. 1-{min(paginas, total_pags)} [{doc_elegido.get('categoria', 'General')}]",
+        "",
+        "CONTENIDO PRINCIPAL Y PRESENTACION DEL DOCUMENTO:",
+        "",
+    ]
+
+    for p_num, txt in paginas_extraidas[:paginas]:
+        limpio = txt.strip()
+        if limpio:
+            lineas.append(f"--- [Pagina {p_num}] ---")
+            lineas.append(limpio)
+            lineas.append("")
+
+    return "\n".join(lineas)
+
+
+
+def inventario_de_la_fuente(buscar: str = "", carpeta: str = "") -> str:
+    """
+    Lista TODO lo que hay en el Drive conectado, carpeta por carpeta.
+
+    USALA SIEMPRE que pregunten que documentos tienes, que hay en el Drive,
+    que archivos ves, que carpetas hay, si existe tal documento, o cuando
+    alguien dude de que hayas mirado algo. Tambien antes de decir que un
+    archivo no existe.
+
+    EN QUE SE DIFERENCIA DE `estado_del_corpus`
+    -------------------------------------------
+    `estado_del_corpus` da el RESUMEN de lo indexado: cuantos documentos,
+    cuantas fichas, repartidos por categoria. Esta herramienta da la LISTA
+    REAL de la carpeta de Drive, archivo por archivo y con su ruta, este o
+    no indexado todavia.
+
+    La diferencia importa y es la razon de que exista. Un documento puede
+    estar en el Drive y no estar todavia en el indice -- porque el estudio
+    va por la mitad, porque es muy grande, porque su formato no se sabe
+    leer. Contestando solo con lo indexado, el agente dice "no tengo ese
+    documento" de un archivo que esta ahi, y quien pregunta se queda sin
+    saber si falta subirlo o solo falta estudiarlo. Son dos problemas
+    distintos con dos soluciones distintas.
+
+    Cada archivo sale marcado:
+
+        [disponible] esta en el Drive y su formato se sabe leer
+        [sin lector] esta, pero su formato no se sabe abrir
+
+    LO QUE ESTA MARCA NO DICE, Y ES DELIBERADO
+    ------------------------------------------
+    No dice si el documento ya entro al indice. Decirlo exigiria preguntar
+    al indice archivo por archivo, y esta herramienta existe para contestar
+    deprisa "que hay en el Drive". Antes la marca era [estudiado] frente a
+    [pendiente], y era una promesa que el recuento no podia cumplir: se
+    calculaba por la extension del archivo, no por lo que hubiera en el
+    indice. Un documento se marcaba como estudiado por llamarse .pdf.
+
+    "Disponible" si es cierto: ese archivo se puede abrir y analizar ahora
+    mismo con `leer_documento_drive`, haya pasado o no por el estudio.
+
+    Args:
+        buscar: Si se da, solo salen los archivos y carpetas cuyo nombre o
+            ruta lo contengan. Sirve para "tienes algo de normatividad?" o
+            "esta la resolucion 1402?". No distingue mayusculas ni tildes.
+        carpeta: Si se da, solo se lista esa carpeta y lo que cuelga de
+            ella. Se escribe como aparece en la lista, por ejemplo
+            "1_NORMATIVIDAD".
+
+    Returns:
+        El arbol de carpetas con sus archivos, el estado de cada uno y el
+        recuento. Si el Drive no esta conectado, dice por que.
+    """
+    import unicodedata
+
+    from core import fuentes, vectorial
+
+    def plano(texto):
+        """
+        Deja un texto comparable: sin tildes y en minusculas.
+
+        Args:
+            texto: Lo que se va a comparar.
+
+        Returns:
+            El texto normalizado.
+        """
+        crudo = unicodedata.normalize("NFKD", str(texto or ""))
+        return "".join(c for c in crudo
+                       if not unicodedata.combining(c)).lower()
+
+    try:
+        fuente = fuentes.obtener()
+    except Exception as exc:
+        return f"No hay ninguna fuente configurada: {exc}"
+
+    listo, motivo = fuente.disponible()
+    if not listo:
+        return (f"No puedo mirar la fuente ahora mismo: {motivo}"
+                + chr(10) * 2
+                + "Hasta que no este conectada no puedo decir que hay "
+                  "dentro, y no voy a adivinarlo.")
+
+    arbol = fuente.inventario()
+    if arbol.get("error"):
+        return (f"No pude recorrer la carpeta: {arbol['error']}"
+                + chr(10) * 2
+                + "Lo que sigue puede estar incompleto.")
+
+    archivos = arbol.get("archivos") or []
+    if not archivos:
+        return "La carpeta conectada no tiene ningun archivo dentro."
+
+    # Que esta ya en el indice. Se compara por nombre de archivo, que es
+    # con lo que se indexa y con lo que se cita.
+    try:
+        indexados = set(vectorial.huellas_indexadas())
+    except Exception:
+        indexados = set()
+
+    # Y que se aparto, con su motivo, para no llamarlo "pendiente" cuando
+    # en realidad no va a entrar nunca.
+    apartados = {}
+    for descartado in (getattr(fuente, "descartados", None) or []):
+        apartados[descartado.get("nombre", "")] = descartado.get("motivo", "")
+
+    from core import corpus as _corpus
+
+    filtro = plano(buscar)
+    raiz = plano(carpeta).strip("/")
+    elegidos = []
+    for archivo in archivos:
+        ruta = plano(archivo["ruta"])
+        if raiz and raiz not in ruta:
+            continue
+        if filtro and filtro not in ruta:
+            continue
+        elegidos.append(archivo)
+
+    if not elegidos:
+        que = " y ".join(x for x in (f"'{buscar}'" if buscar else "",
+                                     f"la carpeta '{carpeta}'"
+                                     if carpeta else "") if x)
+        return (f"En el Drive hay {len(archivos)} archivos en "
+                f"{len(arbol.get('carpetas') or [])} carpetas, pero ninguno "
+                f"coincide con {que}." + chr(10) * 2
+                + "Pidelo sin filtro para ver la lista entera.")
+
+    por_carpeta = {}
+    for archivo in elegidos:
+        por_carpeta.setdefault(archivo["carpeta"], []).append(archivo)
+
+    cuenta = {"disponible": 0, "sin lector": 0}
+    lineas = [f"TODO LO QUE HAY EN EL DRIVE CONECTADO",
+              f"{len(archivos)} archivos en "
+              f"{len(arbol.get('carpetas') or [])} carpetas."]
+    if buscar or carpeta:
+        lineas.append(f"Mostrando {len(elegidos)} que coinciden con el "
+                      f"filtro.")
+    lineas.append("")
+
+    cortado = False
+    for nombre_carpeta in sorted(por_carpeta):
+        dentro = por_carpeta[nombre_carpeta]
+        lineas.append(f"{nombre_carpeta or '/'}  ({len(dentro)})")
+        for archivo in dentro:
+            if archivo["nombre"] in apartados:
+                marca = "sin lector"
+            elif archivo["extension"] not in _corpus.EXTENSIONES_LEIBLES:
+                marca = "sin lector"
+            else:
+                marca = "disponible"
+            cuenta[marca] += 1
+            if len(lineas) < MAXIMO_LINEAS_INVENTARIO:
+                lineas.append(f"   [{marca:<10}] {archivo['nombre']}  "
+                              f"({archivo['mb']} MB)")
+            else:
+                cortado = True
+        lineas.append("")
+
+    lineas.append(f"De los {len(elegidos)} mostrados: {cuenta.get('disponible', 0)} disponibles en Drive para lectura y analisis, {cuenta.get('sin lector', 0)} sin lector.")
+    lineas.append("Todos los documentos marcados como [disponible] pueden ser leidos y analizados de inmediato con leer_documento_drive o consultar_corpus.")
+    if cortado:
+        lineas.append(f"La lista se corto en {MAXIMO_LINEAS_INVENTARIO} lineas. Usa el filtro `buscar` o `carpeta` para ver el resto.")
+    return chr(10).join(lineas)
+
+
 def estado_del_corpus() -> str:
     """
     Informa de que bibliografia tiene cargada el sistema.
 
-    Usala cuando el usuario pregunte que documentos conoces, de que fuentes
-    dispones, o cuando una consulta al corpus no devuelva nada y convenga
-    explicar por que.
+    Usala para el RESUMEN de lo indexado: cuantos documentos, cuantas
+    fichas y como se reparten por categoria.
+
+    Si lo que piden es la LISTA de archivos -- "que documentos tienes",
+    "que hay en el Drive", "esta tal informe" --, usa el inventario de la
+    fuente en vez de esta. Esta solo sabe de lo que ya esta indexado, y
+    contestar con ella hace negar archivos que estan en el Drive esperando
+    a ser leidos.
 
     Returns:
         Resumen con la carpeta, la version del corpus, el numero de documentos
@@ -715,13 +996,32 @@ def estado_del_corpus() -> str:
             "apareceran aqui."
         )
 
+    _en_la_fuente = vista["documentos"]
+    _leidos = vista.get("documentos_indexados", 0)
     lineas = [
         "LO QUE TENGO ESTUDIADO",
         f"  Fuente      : {vista['fuente']}",
-        f"  Documentos  : {vista['documentos']} leidos enteros",
+        f"  En la fuente: {_en_la_fuente} documentos",
+        f"  Leidos      : {_leidos} de esos {_en_la_fuente} estan en el "
+        f"indice",
         f"  Fichas      : {vista['fichas_indice']} en el indice, que es lo "
         f"que puedo consultar",
     ]
+
+    # EL AVISO QUE EVITA NEGAR LO QUE SI EXISTE
+    # -----------------------------------------
+    # Con el indice a medias, "no lo encuentro" se parece mucho a "no
+    # existe" y no es lo mismo. Se dice aqui, con numeros, para que la
+    # respuesta lo pueda decir tambien.
+    if _en_la_fuente and _leidos < _en_la_fuente:
+        _faltan = _en_la_fuente - _leidos
+        lineas.append("")
+        lineas.append(
+            f"  OJO: el indice esta INCOMPLETO. Faltan {_faltan} documentos "
+            f"por leer de los {_en_la_fuente} que hay en la fuente.")
+        lineas.append(
+            "  Si algo no aparece en una busqueda, NO digas que no existe "
+            "en el corpus: di que todavia no se ha leido y cuantos faltan.")
     if not vista["local"]:
         lineas.append("  Los documentos se leen de la fuente y se borran del "
                       "equipo; lo que queda aqui es el indice.")
@@ -1017,19 +1317,46 @@ def datos_para_qgis() -> str:
     # y la que peor se responde callando: quien pregunta por veredas
     # merece un "no las hay y de donde sacarlas", no una lista de otras
     # cosas que si estan.
+    # SE BUSCA LA CAPA, NO SE CUENTAN POLIGONOS
+    # -----------------------------------------
+    # Antes esto decia "faltan las veredas" cuando habia un solo poligono en
+    # todo el sistema. Funcionaba por casualidad: el unico poligono era el
+    # limite municipal. En cuanto entraron las areas protegidas y las
+    # unidades geologicas hubo 581 poligonos, la condicion dejo de cumplirse
+    # y el aviso desaparecio -- sin que hubiera aparecido ni una vereda.
+    #
+    # Dejar de avisar de algo que sigue faltando es peor que no haber
+    # avisado nunca: quien lea el inventario entendera que ya esta resuelto.
+    def hay_poligono_de(*palabras):
+        """
+        Dice si existe una capa de poligonos sobre alguno de esos temas.
+
+        Args:
+            *palabras: Terminos a buscar en el nombre de la capa.
+
+        Returns:
+            True si alguna capa de poligonos los nombra.
+        """
+        for capa in capas:
+            if not any(t.endswith("Polygon") for t in capa["tipos"]):
+                continue
+            nombre = capa["nombre"].lower()
+            if any(palabra in nombre for palabra in palabras):
+                return True
+        return False
+
     faltan = []
-    campos_todos = " ".join(c["nombre"].lower() for c in capas)
-    if poligonos <= 1:
+    if not hay_poligono_de("vereda"):
         faltan.append(
             "  - Poligonos de VEREDA. Las veredas solo existen como nombres "
-            "en capas de puntos, no como superficies. La capa de veredas de "
-            "Colombia la publican el DANE y el IGAC.")
-    if "cuenca" not in campos_todos:
+            "en tablas y en capas de puntos, no como superficies. La capa de "
+            "veredas de Colombia la publican el DANE y el IGAC.")
+    if not hay_poligono_de("cuenca", "pomca", "hidrograf"):
         faltan.append(
-            "  - El poligono de la CUENCA. El unico poligono que hay es el "
-            "limite municipal. No son lo mismo: la cuenca son unos 702 km2 "
-            "y el municipio 720,77. La cuenca sale del POMCA o de la "
-            "zonificacion hidrografica del IDEAM.")
+            "  - El poligono de la CUENCA. El limite municipal SI esta, pero "
+            "no son lo mismo: la cuenca son unos 702 km2 y el municipio "
+            "720,77. La cuenca sale del POMCA o de la zonificacion "
+            "hidrografica del IDEAM.")
     if faltan:
         lineas += ["", "LO QUE NO HAY, Y HACE FALTA CONSEGUIR:"] + faltan
         lineas += [
@@ -1041,45 +1368,165 @@ def datos_para_qgis() -> str:
     return "\n".join(lineas)
 
 
-def consultar_corpus(pregunta: str) -> str:
+def _buscar_directo_en_documentos(pregunta: str, limite: int = 6, carpeta: str = None) -> list:
     """
-    Busca en la bibliografia cargada y devuelve los fragmentos pertinentes.
+    Busca de forma directa en todos los documentos descargados de Drive cuando el
+    indice vectorial aun no contiene el documento o la consulta no tuvo coincidencia.
 
-    Usala para CUALQUIER pregunta cuya respuesta deba salir de la bibliografia
-    cargada, sea cual sea su tema: el corpus se cambia sin tocar el codigo, asi
-    que no des por hecho de que trata. Si no sabes que contiene, consulta antes
-    el estado del corpus. Cada fragmento viene con el documento y la pagina:
-    cita siempre esa procedencia en tu respuesta y no anadas afirmaciones que no
-    aparezcan en los fragmentos.
+    Permite que el agente responda INMEDIATAMENTE sobre cualquier archivo de Drive
+    (decretos, normas, guias, catalogos) sin depender exclusivamente de que la
+    vectorizacion en segundo plano haya terminado. Permite priorizar por carpeta.
+    """
+    import os
+    import re
+    from core import fuentes, corpus
+
+    try:
+        f = fuentes.obtener()
+        docs = f.documentos(descargar=False)
+    except Exception:
+        return []
+
+    # Extraer terminos de busqueda significativos
+    palabras = [
+        p.lower() for p in re.findall(r"\w+", pregunta)
+        if len(p) >= 3 and p.lower() not in (
+            "que", "dice", "del", "los", "las", "por", "con", "para", "una",
+            "uno", "sobre", "como", "cual", "cuales", "esta", "este", "tiene",
+            "documento", "archivo"
+        )
+    ]
+    if not palabras:
+        return []
+
+    # Manejar filtro de carpeta (puede ser cadena o lista)
+    carpetas_target = set()
+    if carpeta:
+        if isinstance(carpeta, (list, tuple, set)):
+            carpetas_target = {str(c).lower().strip() for c in carpeta}
+        else:
+            carpetas_target = {str(carpeta).lower().strip()}
+
+    # 1. Puntuacion de documentos por coincidencia en nombre o categoria
+    candidatos = []
+    for d in docs:
+        nom_l = d.get("nombre", "").lower()
+        cat_l = d.get("categoria", "").lower()
+        coincidencias = 0
+
+        # Bonificacion si pertenece a la carpeta solicitada
+        if carpetas_target:
+            if any(target in cat_l for target in carpetas_target):
+                coincidencias += 10
+
+        for p in palabras:
+            if p in nom_l:
+                coincidencias += 4  # Mayor peso al nombre de archivo
+            elif p in cat_l:
+                coincidencias += 1
+        if coincidencias > 0:
+            candidatos.append((coincidencias, d))
+
+    # Ordenar por mayor coincidencia
+    candidatos.sort(key=lambda x: x[0], reverse=True)
+
+    fichas = []
+    # Solo se inspeccionan documentos descargados localmente
+    for _, d in candidatos[:8]:
+        ruta = d.get("ruta")
+        if not ruta or not os.path.exists(ruta):
+            continue
+        try:
+            for pag_num, texto in corpus.leer_documento(ruta):
+                txt_l = texto.lower()
+                if any(p in txt_l for p in palabras):
+                    for trozo in corpus.trocear(texto):
+                        trozo_l = trozo.lower()
+                        coincidencias_trozo = sum(1 for p in palabras if p in trozo_l)
+                        if coincidencias_trozo > 0:
+                            fichas.append({
+                                "documento": d["nombre"],
+                                "categoria": d.get("categoria", "General"),
+                                "pagina": pag_num,
+                                "paginada": True,
+                                "texto": trozo.strip(),
+                                "_c": coincidencias_trozo,
+                            })
+                            if len(fichas) >= limite * 2:
+                                break
+                if len(fichas) >= limite * 2:
+                    break
+        except Exception:
+            continue
+
+    if not fichas:
+        return []
+
+    fichas.sort(key=lambda x: x.get("_c", 0), reverse=True)
+    return fichas[:limite]
+
+
+def consultar_corpus(pregunta: str, carpeta: str = None) -> str:
+    """
+    Busca en la bibliografia cargada de Google Drive y devuelve los fragmentos pertinentes.
+
+    Permite consultar directamente el corpus de conocimiento sin re-analizar archivos ni
+    descargar datos innecesarios. Usala para cualquier duda sobre mariposas, taxonomía,
+    plantas hospederas, plantas nectaríferas, ciclo de vida, zoocría, normativa ambiental,
+    metodología EIA Conesa o documentos de soporte.
 
     Args:
-        pregunta: La consulta en lenguaje natural, tal como la hizo el usuario.
+        pregunta: Consulta en lenguaje natural o terminos clave.
+        carpeta: Opcional. Filtra la busqueda a una de las carpetas especializadas de Google Drive:
+                 - "DOCUMENTOS DE AGENTE": Informes de base, capas QGIS y especificaciones del agente.
+                 - "5. CATALAGOS MARIPOSAS": Listas de chequeo de mariposas de Colombia y catalogos taxonomicos.
+                 - "13. MONITOREO DE MARIPOSAS": Registros de monitoreo de campo, transectos y abundancia.
+                 - "3_PLANTAS HOSPEDERAS": Plantas hospederas larvales (herbáceas, arbustos, árboles).
+                 - "6. CICLO DE VIDA": Huevo, larva, estadios (L1-L5), pupa y adulto.
+                 - "8_ ZOOCRIA DE MARIPOSAS": Zoocría, reproducción ex situ, dietas y jaulas de vuelo.
+                 - "9_ MARIPOSARIO": Manejo de mariposarios, enriquecimiento y visitantes.
+                 - "3.1 FUNCION ECOLOGICA-BIOINDICADORES": Ecología, bioindicación y redes tróficas.
+                 - "1_NORMATIVIDAD": CITES, Resolución 0126 de 2024, Libro Rojo Invertebrados, Ley 611 de 2000.
+                 - "2. Metodología EIA": Metodología Conesa, matrices de impacto y evaluación.
+                 - "7. ANATOMIA Y MORFOLOGIA": Morfología alar, nervaduras, piezas bucales y genitales.
+                 - "10_ SANITARIOS": Sanidad biológica, patógenos (virus, bacterias, hongos) y cuarentena.
+                 - "11. PLAN DE NEGOCIO": Bioeconomía y modelos de negocio sostenibles.
+                 - "12_ EXPORTACION": Comercio internacional y requisitos ICA/CITES.
+                 - "14. ARTESANIAS": Uso de alas y biocomercio de especímenes no vivos.
+                 - "4. VIVIERO": Propagación de flora nativa y plantas hospederas.
+                 - "TRAZABILIDAD DE LA CADENA": Trazabilidad zootécnica y cadena de valor.
+                 Si no se especifica, el sistema detecta de forma inteligente la carpeta mas adecuada.
 
     Returns:
-        Los fragmentos encontrados con su fuente, o una explicacion de por que
+        Los fragmentos encontrados con su fuente y categoria, o una explicacion de por que
         no se encontro nada.
     """
     if not pregunta or not pregunta.strip():
         return "Indique que desea consultar en la bibliografia."
 
-    # Lo que decide si se puede buscar es el INDICE, no la carpeta local.
-    # Antes se miraba `corpus.resumen()["disponible"]`, y con Drive esa
-    # carpeta queda vacia a proposito: bastaba borrar el ultimo archivo suelto
-    # para que el agente se negara a buscar con 268 fichas indexadas delante.
     vista = _panorama()
     if not vista["se_puede_buscar"]:
         return estado_del_corpus()
 
-    # Busqueda hibrida: palabras (BM25) mezcladas con significado (Qdrant).
-    # Si el indice vectorial no esta construido o Qdrant no responde, la
-    # funcion devuelve exactamente lo que daria `corpus.buscar`, de modo que
-    # el agente sigue contestando sin base vectorial.
-    #
-    # OJO: esto NO afecta a `buscar_especie_exacta`, que sigue siendo literal.
-    # Un vector no distingue `Polites otho` de `Polites vibex`, y ese fue el
-    # fallo que obligo a crear la busqueda por binomio.
     from core import vectorial
-    fichas = vectorial.buscar_hibrido(pregunta, limite=6)
+
+    # Deteccion inteligente de carpetas relevantes si no se paso explicitamente
+    carpeta_filtro = carpeta
+    if not carpeta_filtro:
+        detectadas = vectorial.detectar_carpetas_relevantes(pregunta)
+        if detectadas:
+            carpeta_filtro = detectadas
+
+    # Busqueda hibrida (Qdrant + BM25) con filtrado selectivo por carpeta
+    fichas = vectorial.buscar_hibrido(pregunta, limite=6, categoria=carpeta_filtro)
+    if not fichas and carpeta_filtro:
+        # Fallback sin filtro si el filtro acotado no arrojo resultados
+        fichas = vectorial.buscar_hibrido(pregunta, limite=6)
+
+    if not fichas:
+        # Si aun no esta en Qdrant o es un archivo recien subido, busqueda directa
+        fichas = _buscar_directo_en_documentos(pregunta, limite=6, carpeta=carpeta_filtro)
+
     if not fichas:
         aviso = ""
         if vista["capas"]:
@@ -1093,13 +1540,37 @@ def consultar_corpus(pregunta: str) -> str:
                 + ". Si lo que busca esta dentro de una de ellas, no puedo "
                 "verlo desde aqui."
             )
+        # NO SE CUENTAN LOS DOCUMENTOS QUE NO SE HAN LEIDO
+        # -------------------------------------------------
+        # Esto decia "en lo estudiado (425 documentos...)" usando el numero
+        # que ve la FUENTE, no el que se ha leido. Con el indice a medio
+        # construir, eso convierte un "todavia no le ha tocado el turno" en
+        # un "no existe en el corpus", que es una afirmacion mucho mas
+        # fuerte y, encima, falsa.
+        #
+        # Paso con la guia de Hesperiidae del Neotropico: 229 paginas, en el
+        # Drive, con el genero Pyrrhopyge escrito dentro. La respuesta fue
+        # "no se encontraron menciones explicitas al genero Pyrrhopyge
+        # dentro de los 425 documentos indexados del proyecto".
+        _en_fuente = vista["documentos"]
+        _leidos = vista.get("documentos_indexados", 0)
+        if _en_fuente and _leidos < _en_fuente:
+            incompleto = (
+                f"\n\nIMPORTANTE: el indice esta INCOMPLETO. De los "
+                f"{_en_fuente} documentos de la fuente solo hay {_leidos} "
+                f"leidos, asi que esto NO permite afirmar que el dato no "
+                f"exista en el corpus: faltan {_en_fuente - _leidos} "
+                f"documentos por leer. Dilo asi en la respuesta, sin "
+                f"presentar la ausencia como una comprobacion hecha.")
+        else:
+            incompleto = (
+                "\n\nNo se trata de que el dato no exista en el mundo: es "
+                "que los documentos estudiados no lo tratan. Puede "
+                "consultarse otra formulacion o anadir la fuente que falte.")
         return (
             f"No se encontro nada sobre esa consulta en lo estudiado "
-            f"({vista['documentos']} documentos de {vista['fuente']}, "
-            f"{vista['fichas_indice']} fichas).\n\n"
-            "No se trata de que el dato no exista: es que los documentos "
-            "estudiados no lo tratan. Puede consultarse otra formulacion o "
-            "anadir la fuente que falte." + aviso
+            f"({_leidos} documentos leidos de {vista['fuente']}, "
+            f"{vista['fichas_indice']} fichas)." + incompleto + aviso
         )
 
     lineas = [f"Encontrado en lo estudiado ({vista['fuente']}):", ""]
@@ -1141,8 +1612,25 @@ def buscar_especie_exacta(nombre_cientifico: str) -> str:
     # exactamente la clase de certeza que esta herramienta existe para dar, y
     # darla sin haber mirado nada la vuelve peligrosa. Mejor decir que no se
     # pudo comprobar.
-    hay_texto_local = corpus.resumen().get("fichas", 0) > 0
-    if not hay_texto_local:
+    #
+    # SE DECIDE SIN TOCAR EL DISCO, Y ESO NO ES UN DETALLE
+    # -----------------------------------------------------
+    # Antes esta linea era `corpus.resumen(reconstruir=True)`, que RECONSTRUYE
+    # el corpus local: abre y trocea todos los documentos de la carpeta. Y la
+    # carpeta del corpus y la de descargas de Drive son LA MISMA
+    # (`data/copiloto_drive`), asi que mientras hay un estudio en marcha esa
+    # llamada se pone a leer los 3,2 GB recien bajados.
+    #
+    # Medido: mas de 400 segundos sin terminar, dentro del turno del chat.
+    # Preguntar "y esas como se llaman?" sobre una foto disparaba esto, y la
+    # pantalla se quedaba en "Pensando... 53 s" subiendo.
+    #
+    # Y no hacia falta leer nada: lo que decide la respuesta es si la fuente
+    # conserva los documentos en el equipo o no, y eso se sabe de antemano.
+    # Con Drive -- la unica fuente que queda -- la respuesta es siempre que
+    # no. Leer gigabytes para confirmarlo es pagar por una certeza que ya se
+    # tenia.
+    if not vista.get("local"):
         return (
             f"No puedo comprobar literalmente '{nombre_cientifico}'.\n\n"
             f"La comprobacion literal necesita el texto de los documentos en "
@@ -1233,6 +1721,26 @@ def informe_cientifico_tema(tema: str) -> str:
 
 #: Lista de herramientas que se le entregan al modelo. Tenerla aqui evita que
 #: `chatbot.py` y `test_gemini.py` mantengan copias distintas del conjunto.
+def consultar_inaturalist(termino_o_especie: str = "") -> str:
+    """
+    Consulta en vivo la API de iNaturalist para buscar observaciones reales, fotos
+    y taxonomia de mariposas (Lepidoptera) y fauna/flora en San Carlos, Antioquia.
+
+    Usala siempre que el usuario pregunte por mariposas o biodiversidad en San Carlos,
+    validacion de nombres cientificos/comunes, fotos de referencia o cuando se analice
+    una fotografia pegada en el chat para cotejarla con observaciones reales de campo.
+
+    Args:
+        termino_o_especie: Nombre cientifico, genero o nombre comun a buscar (por ejemplo
+            'Heliconius', 'Morpho', 'Danaus', 'mariposa buho'). Si se deja vacio, devuelve
+            las observaciones de mariposas registradas en San Carlos.
+
+    Returns:
+        Registros de campo en San Carlos con su validacion cientifica, fotos y taxonomia.
+    """
+    return inaturalist.consultar_resumen(termino=termino_o_especie, solo_san_carlos=True)
+
+
 HERRAMIENTAS = [
     consultar_linea_base,
     calcular_impacto_conesa,
@@ -1241,6 +1749,8 @@ HERRAMIENTAS = [
     describir_area_de_estudio,
     revisar_datos_de_campo,
     estado_del_corpus,
+    inventario_de_la_fuente,
+    leer_documento_drive,
     datos_para_qgis,
     entregar_paquete_qgis,
     entregar_script_qgis,
@@ -1249,4 +1759,5 @@ HERRAMIENTAS = [
     reporte_taxonomico_especie,
     ficha_de_campo,
     informe_cientifico_tema,
+    consultar_inaturalist,
 ]

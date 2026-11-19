@@ -59,6 +59,17 @@ services:
     env_file:
       - .env
     environment:
+      # LA HORA DE LOS CONTENEDORES ES LA DEL RELOJ DE QUIEN MIRA
+      # ---------------------------------------------------------
+      # Sin esto, api y app corren en UTC mientras n8n ya corria en la zona
+      # de aqui. El mismo estudio salia fechado a las 11:10 en n8n y a las
+      # 16:41 en el registro de la API: cinco horas de diferencia sobre el
+      # mismo hecho. Costo una hora larga de investigacion creer que eran
+      # dos ejecuciones distintas.
+      #
+      # Se puede cambiar desde el .env; el valor por defecto es el del
+      # servicio de n8n, para que las tres pantallas digan lo mismo.
+      TZ: ${TZ:-America/Bogota}
       # Dentro de la red de compose, Qdrant responde por su nombre de servicio.
       QDRANT_URL: http://qdrant:6333
       FUENTE_CORPUS: ${FUENTE_CORPUS:-local}
@@ -107,6 +118,8 @@ services:
     env_file:
       - .env
     environment:
+      # Misma zona horaria que la API y que n8n: ver la nota del servicio api.
+      TZ: ${TZ:-America/Bogota}
       QDRANT_URL: http://qdrant:6333
       API_URL: http://api:8000
       # La direccion que usa el NAVEGADOR, no Streamlit. "api" solo existe
@@ -145,8 +158,8 @@ services:
     ports:
       - "5678:5678"
     environment:
-      GENERIC_TIMEZONE: America/Bogota
-      TZ: America/Bogota
+      GENERIC_TIMEZONE: ${TZ:-America/Bogota}
+      TZ: ${TZ:-America/Bogota}
       # Sin autenticacion para desarrollo local. ANTES DE EXPONERLO A INTERNET
       # hay que activar N8N_BASIC_AUTH_ACTIVE y poner usuario y clave.
       N8N_SECURE_COOKIE: "false"

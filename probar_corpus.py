@@ -592,6 +592,210 @@ try:
 finally:
     shutil.rmtree(_carpeta_sig, ignore_errors=True)
 
+
+# ==============================================================================
+print("")
+print("FORMATOS QUE ANTES SE APARTABAN")
+# ------------------------------------------------------------------------------
+# En la carpeta de Drive habia siete archivos que el sistema veia y no leia, y
+# los listaba como "no hay lector para '.ris'". Dos de ellos resultaron ser
+# documentos de 157 y 255 paginas: un manual para crear mariposarios y una
+# tesis entera. Se iban a la basura por como estaba escrito su nombre.
+import zipfile as _zp_f
+
+_banco_f = tempfile.mkdtemp(prefix="formatos_")
+try:
+    # --- Una presentacion -----------------------------------------------
+    # Se arma a mano: un .pptx es un ZIP con un XML por diapositiva, igual
+    # que un .docx. Por eso no hace falta python-pptx.
+    _NS = 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"'
+
+    def _diapositiva(*parrafos):
+        """
+        Arma el XML de una diapositiva con los parrafos dados.
+
+        Args:
+            *parrafos: Textos, uno por parrafo.
+
+        Returns:
+            El XML como cadena.
+        """
+        cuerpo = "".join(
+            f"<a:p><a:r><a:t>{t}</a:t></a:r></a:p>" for t in parrafos)
+        return f"<sld {_NS}><a:txBody>{cuerpo}</a:txBody></sld>"
+
+    _pptx = os.path.join(_banco_f, "catalogo.pptx")
+    with _zp_f.ZipFile(_pptx, "w") as _z:
+        _z.writestr("ppt/slides/slide1.xml",
+                    _diapositiva("Catalogo de mariposas", "Morpho peleides"))
+        # La 10 antes que la 2, a proposito: es el orden en que un ZIP
+        # devuelve los nombres y el que haria citar mal la diapositiva.
+        _z.writestr("ppt/slides/slide10.xml", _diapositiva("Decima lamina"))
+        _z.writestr("ppt/slides/slide2.xml",
+                    _diapositiva("Planta hospedera: Passiflora"))
+        _z.writestr("ppt/notesSlides/notesSlide2.xml",
+                    _diapositiva("Nota: confirmado en la vereda El Jardin"))
+
+    _paginas = corpus.leer_documento(_pptx)
+    comprobar("una presentacion .pptx se lee sin instalar nada",
+              len(_paginas) == 3,
+              f"{len(_paginas)} diapositivas")
+    comprobar("cada diapositiva es su propia pagina, para poder citarla",
+              [p[0] for p in _paginas] == [1, 2, 10],
+              "ordenadas 1, 2, 10: el ZIP las devuelve 1, 10, 2")
+    _todo = chr(10).join(p[1] for p in _paginas)
+    comprobar("el texto de las laminas entra entero",
+              "Morpho peleides" in _todo and "Passiflora" in _todo,
+              "titulo y contenido")
+    comprobar("y las notas del ponente tambien, marcadas aparte",
+              "Notas de la diapositiva 2" in _todo
+              and "vereda El Jardin" in _todo,
+              "ahi suele estar el nombre cientifico que no cabe en la lamina")
+
+    # --- Una referencia bibliografica -----------------------------------
+    _ris = os.path.join(_banco_f, "citation-1.ris")
+    with open(_ris, "w", encoding="utf-8") as _fh:
+        _fh.write(chr(10).join([
+            "TY  - JOUR",
+            "AU  - Andrade, Miguel",
+            "TI  - Biodiversidad de las mariposas de Colombia",
+            "PY  - 2011",
+            "AB  - Se revisa el estado del conocimiento de los",
+            "      lepidopteros diurnos del pais.",
+            "DO  - 10.1000/ejemplo",
+            "ER  - ",
+        ]))
+    _paginas = corpus.leer_documento(_ris)
+    _texto = chr(10).join(p[1] for p in _paginas)
+    comprobar("un .ris deja de ser un archivo de cero kilobytes ilegible",
+              len(_paginas) == 1 and "Andrade" in _texto,
+              "es la ficha completa de un articulo")
+    comprobar("las etiquetas se traducen a palabras que alguien buscaria",
+              "Titulo:" in _texto and "Ano: 2011" in _texto
+              and "TY  -" not in _texto,
+              "'Titulo', no 'TI'")
+    comprobar("un resumen partido en varias lineas se junta",
+              "lepidopteros diurnos del pais" in _texto,
+              "la continuacion no se pierde")
+
+    # --- Un archivo cuyo nombre no dice lo que es -----------------------
+    # Es lo que deja Chrome cuando una descarga no se cierra del todo. En
+    # la carpeta habia dos, de 8 MB y 26,8 MB, y los dos eran PDF enteros.
+    _docx = os.path.join(_banco_f, "informe.docx")
+    _NW = ('xmlns:w="http://schemas.openxmlformats.org/'
+           'wordprocessingml/2006/main"')
+    with _zp_f.ZipFile(_docx, "w") as _z:
+        _z.writestr("word/document.xml",
+                    f"<document {_NW}><w:body><w:p><w:r><w:t>"
+                    f"Resolucion 1402 de 2018</w:t></w:r></w:p>"
+                    f"</w:body></document>")
+    _disfrazado = os.path.join(_banco_f, "descarga_a_medias.crdownload")
+    shutil.copy(_docx, _disfrazado)
+
+    comprobar("se reconoce el formato por dentro, no por el nombre",
+              corpus._formato_por_dentro(_disfrazado) == ".docx",
+              "mirando los primeros bytes y lo que lleva el ZIP")
+
+    _paginas = corpus.leer_documento(_disfrazado)
+    _texto = chr(10).join(p[1] for p in _paginas)
+    comprobar("y se lee igual, aunque se llame .crdownload",
+              "Resolucion 1402 de 2018" in _texto,
+              "el contenido estaba entero; lo raro era el nombre")
+    comprobar("pero se DICE que el nombre no correspondia",
+              "no lleva extension util" in _texto,
+              "quien lea la cita vera un .crdownload y tiene que saber por que")
+
+    _basura = os.path.join(_banco_f, "ni_idea.crdownload")
+    with open(_basura, "wb") as _fh:
+        _fh.write(b"\x00\x01\x02 esto no es ningun formato conocido")
+    comprobar("lo que no se reconoce ni por dentro se declara, no se traga",
+              corpus.leer_documento(_basura) == []
+              and any("ni_idea" in k for k in corpus.FALLOS_DE_LECTURA),
+              "queda anotado en los fallos de lectura")
+
+    comprobar("un nombre sin extension tambien se olfatea",
+              corpus.LECTORES.get("") is corpus._leer_lo_que_sea,
+              "el filtro de la fuente ya no lo aparta antes de bajarlo")
+finally:
+    shutil.rmtree(_banco_f, ignore_errors=True)
+
+# ---------------------------------------------------------------- ESTADO
+# Preguntar como va el corpus no puede costar leerselo entero. Durante un
+# estudio con Drive la carpeta tiene 3,26 GB y cambia cada pocos segundos:
+# `resumen()` reconstruia el indice en cada llamada, la API dejaba de
+# contestar y la interfaz se quedaba cargando con la pagina en blanco.
+print("")
+print("ESTADO - informar del corpus no puede costar leerlo entero")
+
+_base_e = montar("estado", [
+    ("Leyes", "ley.md", "El articulo primero regula el uso del suelo. " * 20),
+    ("Leyes", "decreto.md", "El decreto desarrolla la ley anterior. " * 20),
+    ("Guias", "guia.md", "La guia describe el muestreo en campo. " * 20),
+])
+
+_abiertos = []
+_abrir_de_verdad = open
+
+
+def _abrir_contando(ruta, *a, **k):
+    """Abre como siempre, dejando constancia de que documento se leyo."""
+    if str(ruta).endswith((".md", ".pdf", ".docx", ".xlsx")):
+        _abiertos.append(os.path.basename(str(ruta)))
+    return _abrir_de_verdad(ruta, *a, **k)
+
+
+import builtins  # noqa: E402
+
+builtins.open = _abrir_contando
+try:
+    corpus.olvidar()
+    _abiertos.clear()
+    _r = corpus.resumen()
+    comprobar("resumen() no abre ni un documento",
+              _abiertos == [], f"abrio {len(_abiertos)}")
+    comprobar("y aun asi dice cuantos hay y como se reparten",
+              _r["documentos"] == 3 and dict(_r["categorias"])["Leyes"] == 2,
+              f"{_r['documentos']} documentos")
+    comprobar("las fichas que no se han contado se declaran sin contar",
+              _r["fichas"] == 0 and _r["fichas_contadas"] is False,
+              "cero fichas y 'no se han contado' no son lo mismo")
+
+    _abiertos.clear()
+    _r = corpus.resumen(reconstruir=True)
+    comprobar("quien necesita las fichas las pide, y entonces si se lee",
+              _r["fichas"] > 0 and _r["fichas_contadas"] is True
+              and set(_abiertos) == {"ley.md", "decreto.md", "guia.md"},
+              f"{_r['fichas']} fichas tras abrir "
+              f"{len(set(_abiertos))} documentos distintos")
+
+    _r = corpus.resumen()
+    comprobar("y una vez leido, el resumen barato ya sabe el numero",
+              _r["fichas"] > 0 and _r["fichas_contadas"] is True,
+              "sale de lo que ya esta en memoria")
+
+    # --- La huella no se recalcula sobre archivos que no han cambiado ---
+    corpus._HUELLAS.clear()
+    _abiertos.clear()
+    _v1 = corpus.version_corpus()
+    _leidos_la_primera = len(_abiertos)
+    _abiertos.clear()
+    _v2 = corpus.version_corpus()
+    comprobar("la huella se calcula leyendo los documentos la primera vez",
+              _v1 == _v2 and _leidos_la_primera == 3,
+              f"{_leidos_la_primera} leidos, huella {_v1}")
+    comprobar("y la segunda vez no se vuelve a leer ninguno",
+              _abiertos == [], f"abrio {len(_abiertos)}")
+
+    with _abrir_de_verdad(os.path.join(_base_e, "Guias", "guia.md"),
+                          "a", encoding="utf-8") as _fh:
+        _fh.write("Se anade una linea que cambia el archivo. " * 20)
+    _abiertos.clear()
+    comprobar("pero si un archivo cambia, la huella cambia con el",
+              corpus.version_corpus() != _v1 and _abiertos,
+              "el que cambio se vuelve a leer")
+finally:
+    builtins.open = _abrir_de_verdad
+
 # ---------------------------------------------------------------- limpieza
 shutil.rmtree(TEMPORAL, ignore_errors=True)
 
